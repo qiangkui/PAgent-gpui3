@@ -966,10 +966,9 @@ pub(crate) struct Banner {
 impl Banner {
     /// A failure worth interrupting for.
     pub(crate) fn error(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            error: true,
-        }
+        let text = text.into();
+        crate::logging::error(&text);
+        Self { text, error: true }
     }
 }
 
@@ -1353,6 +1352,8 @@ pub struct DshFlowApp {
     maintenance_note: String,
     /// True when that outcome was a failure, so the page can paint it red.
     maintenance_failed: bool,
+    /// True after the first press of "恢复最近备份".
+    restore_armed: bool,
     /// The answer whose changed-file list is open, if any.
     changes_open: Option<usize>,
     /// Block of the settings page on show.
@@ -1449,6 +1450,25 @@ impl DshFlowApp {
     /// Build the window from what is on disk: conversations, sidebar, settings.
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let ai = AiSettings::load();
+        let home = AiSettings::home();
+        // A restore planned in the previous session runs before any record is
+        // read, so the window opens on the restored files and no stale state can
+        // overwrite them. Config keeps the current connection/path settings.
+        let restore_notice = match crate::backup::apply_pending_restore(&home, &ai.data_dir()) {
+            Ok(Some(report)) => Some((
+                format!(
+                    "已从 {} 恢复记录；恢复前的状态保存在 {}。",
+                    report.source.display(),
+                    report.safety.display()
+                ),
+                false,
+            )),
+            Ok(None) => None,
+            Err(error) => Some((format!("恢复备份失败：{error}"), true)),
+        };
+        if let Some((text, error)) = &restore_notice {
+            crate::logging::log_line(if *error { "ERROR" } else { "INFO" }, text);
+        }
         // Every provider call runs in a child process; a configured proxy is
         // handed to those children instead of touching this process' own
         // environment.
@@ -1613,6 +1633,7 @@ impl DshFlowApp {
             node_version,
             maintenance_note: String::new(),
             maintenance_failed: false,
+            restore_armed: false,
             changes_open: None,
             settings_tab: SettingsTab::Interface,
             instructions: TextField::new(cx),
@@ -1668,6 +1689,9 @@ impl DshFlowApp {
             fitted: false,
             scale_factor: 1.,
         };
+        if let Some((text, error)) = restore_notice {
+            app.banner = Some(Banner { text, error });
+        }
         if !app.engine_ready {
             app.banner = Some(Banner::error(format!(
                 "找不到引擎：{}\n设置 DSH_FLOW_HOME 指向 dsh-flow 目录后重启界面。",

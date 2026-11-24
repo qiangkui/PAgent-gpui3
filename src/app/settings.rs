@@ -570,6 +570,8 @@ impl DshFlowApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let home = AiSettings::home();
+        let latest_restore = crate::backup::latest_backup(&home);
+        let restore_pending = crate::backup::pending_restore(&home);
         let node = self.node_version.clone();
         let healthy = node.is_some() && self.engine_ready;
         let mut environment: Vec<AnyElement> = vec![
@@ -611,6 +613,13 @@ impl DshFlowApp {
                 } else {
                     self.ai.proxy.clone()
                 },
+                SettingsTone::Normal,
+                palette,
+            ),
+            settings_text_row(
+                "日志",
+                crate::logging::path()
+                    .map_or_else(|| "未初始化".to_string(), |path| path.display().to_string()),
                 SettingsTone::Normal,
                 palette,
             ),
@@ -700,8 +709,9 @@ impl DshFlowApp {
 
         let mut backup = settings_card("备份与导出", palette)
             .child(settings_note(
-                "备份复制 data、技能、插件、MCP 与 config.json 到 backups/（不含体积可能很大的 \
-                 workspace）；导出把当前对话写成 Markdown 到 exports/。",
+                "备份复制当前 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；\
+                 恢复会在下次启动时替换 data 与附加组件，并先自动备份当前状态；\
+                 导出把当前对话写成 Markdown 到 exports/。",
                 palette,
             ))
             .child(
@@ -739,6 +749,38 @@ impl DshFlowApp {
                             let _ = open_path(&crate::backup::backup_root(&AiSettings::home()));
                         })),
                     )
+                    .when(latest_restore.is_some(), |this| {
+                        this.child(
+                            settings_button(
+                                "restore-backup",
+                                if self.restore_armed {
+                                    "确认恢复最近备份"
+                                } else {
+                                    "恢复最近备份"
+                                },
+                                if self.restore_armed {
+                                    SettingsButton::Danger
+                                } else {
+                                    SettingsButton::Secondary
+                                },
+                                palette,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| view.restore_latest(cx))),
+                        )
+                    })
+                    .when(restore_pending.is_some(), |this| {
+                        this.child(
+                            settings_button(
+                                "cancel-restore",
+                                "取消恢复计划",
+                                SettingsButton::Secondary,
+                                palette,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.cancel_restore_plan(cx)
+                            })),
+                        )
+                    })
                     .child(
                         settings_button(
                             "open-exports",
@@ -748,6 +790,20 @@ impl DshFlowApp {
                         )
                         .on_click(cx.listener(|_, _, _, _| {
                             let _ = open_path(&crate::backup::export_root(&AiSettings::home()));
+                        })),
+                    )
+                    .child(
+                        settings_button(
+                            "open-logs",
+                            "打开日志目录",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(|_, _, _, _| {
+                            let dir = crate::logging::path()
+                                .and_then(|path| path.parent().map(Path::to_path_buf))
+                                .unwrap_or_else(|| AiSettings::home().join("logs"));
+                            let _ = open_path(&dir);
                         })),
                     ),
             );
@@ -865,10 +921,58 @@ impl DshFlowApp {
 
     /// Copy the records into `backups/` and say where they went.
     pub(crate) fn run_backup(&mut self, cx: &mut Context<Self>) {
-        let result = crate::backup::backup(&AiSettings::home());
+        self.restore_armed = false;
+        let result = crate::backup::backup(&AiSettings::home(), &self.ai.data_dir());
         self.maintenance_failed = result.is_err();
         self.maintenance_note = match result {
             Ok(path) => format!("已备份到 {}", path.display()),
+            Err(error) => error,
+        };
+        cx.notify();
+    }
+
+    /// Plan the newest backup for the next launch; the first press only warns.
+    pub(crate) fn restore_latest(&mut self, cx: &mut Context<Self>) {
+        let home = AiSettings::home();
+        if !self.restore_armed {
+            match crate::backup::latest_backup(&home) {
+                Some(source) => {
+                    self.restore_armed = true;
+                    self.maintenance_failed = false;
+                    self.maintenance_note = format!(
+                        "再次点击将计划恢复 {}：下次启动时替换 data 与插件/技能/MCP，并先自动备份当前状态。",
+                        source.display()
+                    );
+                }
+                None => {
+                    self.restore_armed = false;
+                    self.maintenance_failed = true;
+                    self.maintenance_note = "还没有可恢复的备份".to_string();
+                }
+            }
+            cx.notify();
+            return;
+        }
+        self.restore_armed = false;
+        let result = crate::backup::plan_restore(&home);
+        self.maintenance_failed = result.is_err();
+        self.maintenance_note = match result {
+            Ok(source) => format!(
+                "已计划从 {} 恢复；关闭并重新启动应用后生效。",
+                source.display()
+            ),
+            Err(error) => error,
+        };
+        cx.notify();
+    }
+
+    /// Forget a restore planned for the next launch.
+    pub(crate) fn cancel_restore_plan(&mut self, cx: &mut Context<Self>) {
+        let result = crate::backup::cancel_restore(&AiSettings::home());
+        self.restore_armed = false;
+        self.maintenance_failed = result.is_err();
+        self.maintenance_note = match result {
+            Ok(()) => "已取消下次启动的恢复计划".to_string(),
             Err(error) => error,
         };
         cx.notify();
@@ -927,6 +1031,15 @@ impl DshFlowApp {
         }
         for (id, message) in &self.mcp_errors {
             text.push_str(&format!("mcp {id}: {message}\n"));
+        }
+        if let Some(path) = crate::logging::path() {
+            text.push_str(&format!("log: {}\n", path.display()));
+            let tail = crate::logging::tail();
+            if !tail.is_empty() {
+                text.push_str("--- log tail ---\n");
+                text.push_str(&tail);
+                text.push('\n');
+            }
         }
         text
     }

@@ -26,6 +26,7 @@ mod json;
 mod manifest;
 mod markdown;
 mod mcp;
+mod logging;
 mod secrets;
 mod select_text;
 mod sidebar_store;
@@ -78,6 +79,7 @@ fn main() {
             return;
         }
     };
+    logging::init();
     gpui_platform::application()
         .with_assets(assets::Assets)
         .run(|cx: &mut App| {

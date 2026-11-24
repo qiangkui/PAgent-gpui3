@@ -7,3 +7,5 @@
 - 后台任务：结束进程前比较任务记录的启动时间与进程创建时间，避免 PID 复用误杀。
 - 引擎：修复插件/MCP 工具在 allow-list 下被误拒绝的问题；shell 输出按行解码混合 UTF-8/GBK；补齐 6 个失败测试。
 - 工程：恢复 `tsc --noEmit` 检查；新增根 README、LICENSE、Git 忽略规则、CI 与 `scripts/release.ps1`。
+- 备份：按当前 `dataDir` 备份（支持外部数据目录）；新增两步确认的“恢复最近备份”，在下次启动时先自动备份当前状态再替换记录。
+- 日志：新增 `logs/paagent.log`（2 MB 轮转）与 panic 崩溃报告；诊断页可打开日志目录，并附带日志尾部。

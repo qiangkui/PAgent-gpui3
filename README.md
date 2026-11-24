@@ -70,7 +70,9 @@ powershell -ExecutionPolicy Bypass -File .\scripts\release.ps1
 - 配置与凭据：`config.json` + Windows 凭据管理器；数据目录由设置中的 `dataDir` 决定。
 - 对话：`<dataDir>/chats/<dir>/chat.json`，请求明细在 `requests.jsonl`。
 - 后台任务：`<dataDir>/chats/<dir>/.dsh-flow/tasks/`。
-- 备份：`<home>/backups/`；导出：`<home>/exports/`。
+- 备份：`<home>/backups/`；导出：`<home>/exports/`；日志：`<home>/logs/paagent.log`。
+- 备份会复制**当前配置的 dataDir**（可以不在 home 下）以及技能、插件、MCP、config.json，但不复制 workspace。
+- “恢复最近备份”先在下次启动时执行：启动时会自动备份当前状态，再用备份替换 data 与附加组件；当前连接与路径设置（config.json）保持不变。
 - API Key 不写入 `config.json`（迁移后由 Windows Credential Manager 保存）。
 
 ## 约定
