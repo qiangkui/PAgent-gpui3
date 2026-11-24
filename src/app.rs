@@ -315,16 +315,19 @@ pub(crate) enum SettingsTab {
     Ai,
     /// Instructions that apply to the open conversation only.
     Instructions,
-    /// Paths, versions, backups and exports.
+    /// Data locations, backups, restores and exports.
+    Data,
+    /// Paths, versions and diagnostics.
     Maintenance,
 }
 
 impl SettingsTab {
     /// Every block, in the order the index shows them.
-    const ALL: [SettingsTab; 4] = [
+    const ALL: [SettingsTab; 5] = [
         SettingsTab::Interface,
         SettingsTab::Ai,
         SettingsTab::Instructions,
+        SettingsTab::Data,
         SettingsTab::Maintenance,
     ];
 
@@ -334,6 +337,7 @@ impl SettingsTab {
             SettingsTab::Interface => "界面",
             SettingsTab::Ai => "AI",
             SettingsTab::Instructions => "指令",
+            SettingsTab::Data => "数据",
             SettingsTab::Maintenance => "诊断",
         }
     }

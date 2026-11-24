@@ -38,6 +38,7 @@ impl DshFlowApp {
             SettingsTab::Interface => self.render_interface_settings(palette, cx),
             SettingsTab::Ai => self.render_ai_settings(palette, cx),
             SettingsTab::Instructions => self.render_instructions_settings(palette, cx),
+            SettingsTab::Data => self.render_data_settings(palette, cx),
             SettingsTab::Maintenance => self.render_maintenance_settings(palette, cx),
         };
 
@@ -562,6 +563,198 @@ impl DshFlowApp {
         }
     }
 
+    /// 数据: where the records live, and the backup / restore / export actions.
+    pub(crate) fn render_data_settings(
+        &self,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let home = AiSettings::home();
+        let data = self.ai.data_dir();
+        let workspace = self.ai.workspace_dir();
+        let backups = crate::backup::backup_root(&home);
+        let exports = crate::backup::export_root(&home);
+        let data_for_open = data.clone();
+        let workspace_for_open = workspace.clone();
+        let location = settings_card("数据位置", palette)
+            .child(settings_text_row(
+                "数据目录",
+                data.display().to_string(),
+                SettingsTone::Normal,
+                palette,
+            ))
+            .child(settings_text_row(
+                "工作区",
+                format!("{}（不参与备份）", workspace.display()),
+                SettingsTone::Normal,
+                palette,
+            ))
+            .child(settings_text_row(
+                "备份目录",
+                backups.display().to_string(),
+                SettingsTone::Normal,
+                palette,
+            ))
+            .child(settings_text_row(
+                "导出目录",
+                exports.display().to_string(),
+                SettingsTone::Normal,
+                palette,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .pt_1()
+                    .child(
+                        settings_button(
+                            "open-data",
+                            "打开数据目录",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(move |_, _, _, _| {
+                            let _ = open_path(&data_for_open);
+                        })),
+                    )
+                    .child(
+                        settings_button(
+                            "open-workspace",
+                            "打开工作区",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(move |_, _, _, _| {
+                            let _ = open_path(&workspace_for_open);
+                        })),
+                    ),
+            );
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(settings_page_header(
+                "数据",
+                "记录放在哪里，以及备份、恢复和导出当前对话。",
+                palette,
+            ))
+            .child(location)
+            .child(self.render_backup_card(palette, cx))
+    }
+
+    /// The backup/restore/export card shown by the 数据 page.
+    fn render_backup_card(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let home = AiSettings::home();
+        let latest_restore = crate::backup::latest_backup(&home);
+        let restore_pending = crate::backup::pending_restore(&home);
+        let mut card = settings_card("备份与导出", palette)
+            .child(settings_note(
+                "备份复制当前 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；\
+                 恢复会在下次启动时替换 data 与附加组件，并先自动备份当前状态；\
+                 导出把当前对话写成 Markdown 到 exports/。",
+                palette,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        settings_button("run-backup", "立即备份", SettingsButton::Primary, palette)
+                            .on_click(cx.listener(|view, _, _, cx| view.run_backup(cx))),
+                    )
+                    .child(
+                        settings_button(
+                            "export-chat",
+                            "导出当前对话",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(|view, _, _, cx| view.export_current_chat(cx))),
+                    )
+                    .child(
+                        settings_button(
+                            "open-backups",
+                            "打开备份目录",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(|_, _, _, _| {
+                            let _ = open_path(&crate::backup::backup_root(&AiSettings::home()));
+                        })),
+                    )
+                    .when(latest_restore.is_some(), |this| {
+                        this.child(
+                            settings_button(
+                                "restore-backup",
+                                if self.restore_armed {
+                                    "确认恢复最近备份"
+                                } else {
+                                    "恢复最近备份"
+                                },
+                                if self.restore_armed {
+                                    SettingsButton::Danger
+                                } else {
+                                    SettingsButton::Secondary
+                                },
+                                palette,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| view.restore_latest(cx))),
+                        )
+                    })
+                    .when(restore_pending.is_some(), |this| {
+                        this.child(
+                            settings_button(
+                                "cancel-restore",
+                                "取消恢复计划",
+                                SettingsButton::Secondary,
+                                palette,
+                            )
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.cancel_restore_plan(cx)
+                            })),
+                        )
+                    })
+                    .child(
+                        settings_button(
+                            "open-exports",
+                            "打开导出目录",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(|_, _, _, _| {
+                            let _ = open_path(&crate::backup::export_root(&AiSettings::home()));
+                        })),
+                    )
+                    .child(
+                        settings_button(
+                            "open-logs",
+                            "打开日志目录",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(|_, _, _, _| {
+                            let dir = crate::logging::path()
+                                .and_then(|path| path.parent().map(Path::to_path_buf))
+                                .unwrap_or_else(|| AiSettings::home().join("logs"));
+                            let _ = open_path(&dir);
+                        })),
+                    ),
+            );
+        if !self.maintenance_note.is_empty() {
+            card = card.child(settings_notice(
+                &self.maintenance_note,
+                self.maintenance_failed,
+                palette,
+            ));
+        }
+        card
+    }
+
     /// 诊断: where everything lives, what is missing, and the two copies worth
     /// having — a backup of the records and an export of one conversation.
     pub(crate) fn render_maintenance_settings(
@@ -570,8 +763,6 @@ impl DshFlowApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let home = AiSettings::home();
-        let latest_restore = crate::backup::latest_backup(&home);
-        let restore_pending = crate::backup::pending_restore(&home);
         let node = self.node_version.clone();
         let healthy = node.is_some() && self.engine_ready;
         let mut environment: Vec<AnyElement> = vec![
@@ -707,114 +898,6 @@ impl DshFlowApp {
                 .into_any_element(),
         );
 
-        let mut backup = settings_card("备份与导出", palette)
-            .child(settings_note(
-                "备份复制当前 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；\
-                 恢复会在下次启动时替换 data 与附加组件，并先自动备份当前状态；\
-                 导出把当前对话写成 Markdown 到 exports/。",
-                palette,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        settings_button(
-                            "run-backup",
-                            "立即备份",
-                            SettingsButton::Primary,
-                            palette,
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| view.run_backup(cx))),
-                    )
-                    .child(
-                        settings_button(
-                            "export-chat",
-                            "导出当前对话",
-                            SettingsButton::Secondary,
-                            palette,
-                        )
-                        .on_click(cx.listener(|view, _, _, cx| view.export_current_chat(cx))),
-                    )
-                    .child(
-                        settings_button(
-                            "open-backups",
-                            "打开备份目录",
-                            SettingsButton::Secondary,
-                            palette,
-                        )
-                        .on_click(cx.listener(|_, _, _, _| {
-                            let _ = open_path(&crate::backup::backup_root(&AiSettings::home()));
-                        })),
-                    )
-                    .when(latest_restore.is_some(), |this| {
-                        this.child(
-                            settings_button(
-                                "restore-backup",
-                                if self.restore_armed {
-                                    "确认恢复最近备份"
-                                } else {
-                                    "恢复最近备份"
-                                },
-                                if self.restore_armed {
-                                    SettingsButton::Danger
-                                } else {
-                                    SettingsButton::Secondary
-                                },
-                                palette,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| view.restore_latest(cx))),
-                        )
-                    })
-                    .when(restore_pending.is_some(), |this| {
-                        this.child(
-                            settings_button(
-                                "cancel-restore",
-                                "取消恢复计划",
-                                SettingsButton::Secondary,
-                                palette,
-                            )
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.cancel_restore_plan(cx)
-                            })),
-                        )
-                    })
-                    .child(
-                        settings_button(
-                            "open-exports",
-                            "打开导出目录",
-                            SettingsButton::Secondary,
-                            palette,
-                        )
-                        .on_click(cx.listener(|_, _, _, _| {
-                            let _ = open_path(&crate::backup::export_root(&AiSettings::home()));
-                        })),
-                    )
-                    .child(
-                        settings_button(
-                            "open-logs",
-                            "打开日志目录",
-                            SettingsButton::Secondary,
-                            palette,
-                        )
-                        .on_click(cx.listener(|_, _, _, _| {
-                            let dir = crate::logging::path()
-                                .and_then(|path| path.parent().map(Path::to_path_buf))
-                                .unwrap_or_else(|| AiSettings::home().join("logs"));
-                            let _ = open_path(&dir);
-                        })),
-                    ),
-            );
-        if !self.maintenance_note.is_empty() {
-            backup = backup.child(settings_notice(
-                &self.maintenance_note,
-                self.maintenance_failed,
-                palette,
-            ));
-        }
-
         // Snippets: one chip per file, inserted into the composer on click.
         let snippets_dir = crate::snippet::dir();
         let for_example = snippets_dir.clone();
@@ -869,13 +952,21 @@ impl DshFlowApp {
             snippet_card =
                 snippet_card.child(div().flex().flex_row().flex_wrap().gap_2().children(chips));
         }
+        if !self.maintenance_note.is_empty() {
+            // Snippet insertion still reports here; backup/restore notes live on
+            // the 数据 page, but showing the shared status here costs nothing.
+            snippet_card = snippet_card.child(settings_notice(
+                &self.maintenance_note,
+                self.maintenance_failed,
+                palette,
+            ));
+        }
 
         let mut cards: Vec<AnyElement> = vec![
             settings_card("运行环境", palette)
                 .children(environment)
                 .into_any_element(),
             settings_card("位置", palette).children(places).into_any_element(),
-            backup.into_any_element(),
             snippet_card.into_any_element(),
         ];
         if let Some(banner) = &self.banner {
