@@ -321,7 +321,7 @@ impl DshFlowApp {
         // task or context tab open on an empty conversation.
         self.chat_tab = ChatTab::Chat;
         let chat_index = self.active_chat;
-        let Some((dir, tools, read_only, full_access, max_rounds, max_calls)) =
+        let Some((dir, tools, read_only, full_access, max_rounds, max_calls, mode)) =
             self.chats.get(chat_index).map(|chat| {
                 (
                     chat.dir.clone(),
@@ -330,6 +330,7 @@ impl DshFlowApp {
                     chat.full_access,
                     chat.max_rounds,
                     chat.max_calls,
+                    chat.mode.clone(),
                 )
             })
         else {
@@ -414,7 +415,9 @@ impl DshFlowApp {
             return;
         }
 
-        let allowed = if tools { Some(&ALL_TOOLS[..]) } else { None };
+        let selection = self.ai.mode_selection(&mode);
+        let allowed_list = mode_tools(&selection);
+        let allowed = if tools { Some(&allowed_list[..]) } else { None };
         let system = joined_prompt(&blocks);
         // Images and PDFs travel as bytes with this request; their text is
         // already in the history above, so a retry can send the same files.
@@ -440,8 +443,8 @@ impl DshFlowApp {
         // The command sandbox allows the workspace only; there is no extra
         // allowlist any more.
         let plugin_dir = crate::config::AiSettings::plugin_dir();
-        let plugins = self.ai.plugins.clone();
-        let mcp_servers = crate::mcp::enabled(&self.ai);
+        let plugins = selection.plugins.clone();
+        let mcp_servers = crate::mcp::enabled_for(&self.ai, &selection.mcp_servers);
 
         match AiRequest::ask(
             &self.engine_dir,
@@ -491,6 +494,7 @@ impl DshFlowApp {
                         read_only_roots,
                         max_rounds,
                         max_calls,
+                        mode: mode.clone(),
                         attachments: files.clone(),
                         tried: vec![connection_key(&connection)],
                     },
@@ -1027,9 +1031,12 @@ impl DshFlowApp {
                             let key = connection_key(&connection);
                             let request = {
                                 let retry = &self.pending[slot].retry;
+                                let selection = self.ai.mode_selection(&retry.mode);
+                                let allowed_list = mode_tools(&selection);
+                                let plugins = selection.plugins.clone();
+                                let mcp_servers =
+                                    crate::mcp::enabled_for(&self.ai, &selection.mcp_servers);
                                 let plugin_dir = crate::config::AiSettings::plugin_dir();
-                                let plugins = self.ai.plugins.clone();
-                                let mcp_servers = crate::mcp::enabled(&self.ai);
                                 AiRequest::ask(
                                     &self.engine_dir,
                                     &retry.work_dir,
@@ -1039,7 +1046,7 @@ impl DshFlowApp {
                                     &connection,
                                     retry.tools,
                                     if retry.tools {
-                                        Some(&ALL_TOOLS[..])
+                                        Some(&allowed_list[..])
                                     } else {
                                         None
                                     },

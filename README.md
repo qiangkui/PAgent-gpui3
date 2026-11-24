@@ -46,7 +46,7 @@ node src/cli.ts run examples/repo-health/flow.yml --input repo=.
 
 ## 外部插件
 
-插件放在 `<home>/plugins/<id>/`，入口由 `plugin.json` 的 `main` 指定，必须导出 `activate(api)`。仓库里的 `plugins/win32-windows/` 是只读 Win32 窗口检查插件：
+插件放在 `<home>/plugins/<id>/`，入口由 `plugin.json` 的 `main` 指定，必须导出 `activate(api)`。设置页的“模式”决定每次对话向模型发送哪些外部插件、Skill 和 MCP：基础模式不带外部资源，全量模式带所有手动启用的资源，自定义模式按三个列表勾选；在各自页面关闭的资源始终不会发送。仓库里的 `plugins/win32-windows/` 是只读 Win32 窗口检查插件：
 
 - 需要 Python 在 PATH 中；
 - 可调用 `win32_list_windows` / `win32_window_info` 枚举 HWND；

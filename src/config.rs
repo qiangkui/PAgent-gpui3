@@ -400,6 +400,59 @@ pub fn scanned_plugins(dir: &Path) -> Vec<InstalledPlugin> {
     found
 }
 
+/// Highest number of custom modes the settings page keeps.
+pub const MAX_MODES: usize = 32;
+
+/// Built-in mode that sends only the engine's own tools.
+pub const MODE_BASIC: &str = "basic";
+/// Built-in mode that sends every globally enabled external plugin, skill and MCP server.
+pub const MODE_FULL: &str = "full";
+
+/// One named selection of external resources.
+///
+/// Built-in basic/full modes are implicit; only custom modes are stored. A mode
+/// keeps ids even when the resource is globally switched off: switching it back
+/// on restores it here, while the request builders intersect with the global
+/// enabled lists so an off resource is never sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatMode {
+    /// Stable id referenced by each conversation.
+    pub id: String,
+    /// Name shown in settings and the composer.
+    pub name: String,
+    /// External plugin folder ids.
+    pub plugins: Vec<String>,
+    /// Skill folder ids.
+    pub skills: Vec<String>,
+    /// MCP server ids.
+    pub mcp_servers: Vec<String>,
+}
+
+impl ChatMode {
+    /// A blank custom mode.
+    pub fn empty(id: String, name: String) -> Self {
+        Self {
+            id,
+            name,
+            plugins: Vec::new(),
+            skills: Vec::new(),
+            mcp_servers: Vec::new(),
+        }
+    }
+}
+
+/// The resources one request actually carries, after intersecting a mode with
+/// the user's global switches.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModeSelection {
+    /// Enabled external plugins to load.
+    pub plugins: Vec<String>,
+    /// Enabled skills whose instructions go into the system prompt.
+    pub skills: Vec<String>,
+    /// Enabled MCP servers to open.
+    pub mcp_servers: Vec<String>,
+}
+
 /// Every connection the window knows about, plus which one is in use.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AiSettings {
@@ -429,6 +482,8 @@ pub struct AiSettings {
     /// A skill is prompt text injected on every question, so it stays off until
     /// someone turns it on in the Skill page.
     pub skills: Vec<String>,
+    /// Custom modes, in the order the settings page shows them.
+    pub modes: Vec<ChatMode>,
     /// Tokens one conversation may spend before the status strip warns; zero
     /// leaves it unlimited.
     pub budget_tokens: u64,
@@ -447,6 +502,7 @@ impl Default for AiSettings {
             plugins: Vec::new(),
             mcp_servers: Vec::new(),
             skills: Vec::new(),
+            modes: Vec::new(),
             budget_tokens: 0,
             proxy: String::new(),
         }
@@ -686,6 +742,85 @@ impl AiSettings {
         before != self.plugins.len() || enabled
     }
 
+    /// Name of a built-in or custom mode.
+    pub fn mode_label(&self, id: &str) -> String {
+        if id == MODE_BASIC {
+            return "基础模式".to_string();
+        }
+        if id == MODE_FULL {
+            return "全量模式".to_string();
+        }
+        self.modes
+            .iter()
+            .find(|mode| mode.id == id)
+            .map_or_else(|| "全量模式".to_string(), |mode| mode.name.clone())
+    }
+
+    /// Whether a mode id is known. Unknown ids fall back to full mode.
+    pub fn mode_exists(&self, id: &str) -> bool {
+        id == MODE_BASIC || id == MODE_FULL || self.modes.iter().any(|mode| mode.id == id)
+    }
+
+    /// The selection a request with `mode_id` actually carries.
+    ///
+    /// The global switches are applied last: a resource the user turned off in
+    /// its own page is never sent, even if a custom mode still lists it.
+    pub fn mode_selection(&self, mode_id: &str) -> ModeSelection {
+        if mode_id == MODE_BASIC {
+            return ModeSelection::default();
+        }
+        let mode = self.modes.iter().find(|mode| mode.id == mode_id);
+        let plugins = mode.map_or_else(
+            || self.plugins.clone(),
+            |mode| {
+                self.plugins
+                    .iter()
+                    .filter(|id| mode.plugins.iter().any(|entry| entry == *id))
+                    .cloned()
+                    .collect()
+            },
+        );
+        let skills = mode.map_or_else(
+            || self.skills.clone(),
+            |mode| {
+                self.skills
+                    .iter()
+                    .filter(|id| mode.skills.iter().any(|entry| entry == *id))
+                    .cloned()
+                    .collect()
+            },
+        );
+        let mcp_servers = mode.map_or_else(
+            || self.mcp_servers.clone(),
+            |mode| {
+                self.mcp_servers
+                    .iter()
+                    .filter(|id| mode.mcp_servers.iter().any(|entry| entry == *id))
+                    .cloned()
+                    .collect()
+            },
+        );
+        ModeSelection {
+            plugins,
+            skills,
+            mcp_servers,
+        }
+    }
+
+    /// A custom mode id no other mode uses.
+    pub fn fresh_mode_id(&self) -> String {
+        let mut used: Vec<String> = vec![MODE_BASIC.to_string(), MODE_FULL.to_string()];
+        used.extend(self.modes.iter().map(|mode| mode.id.clone()));
+        let mut next = self.modes.len() + 1;
+        loop {
+            let candidate = format!("mode-{next}");
+            if !used.iter().any(|seen| seen == &candidate) {
+                return candidate;
+            }
+            next += 1;
+        }
+    }
+
     /// Switch a skill folder on or off.
     /// @returns true when the list changed.
     pub fn set_skill(&mut self, id: &str, enabled: bool) -> bool {
@@ -808,6 +943,52 @@ impl AiSettings {
                 .take(MAX_PLUGINS)
                 .collect();
             settings.skills = entries;
+        }
+        if let Some(list) = value.get("modes").and_then(|item| item.as_array()) {
+            let mut modes: Vec<ChatMode> = Vec::new();
+            for item in list.iter().take(MAX_MODES) {
+                let id = text_field(item, "id");
+                if !is_plugin_id(&id) || id == MODE_BASIC || id == MODE_FULL {
+                    continue;
+                }
+                if modes.iter().any(|mode| mode.id == id) {
+                    continue;
+                }
+                let name = text_field(item, "name");
+                let name = if name.is_empty() {
+                    format!("自定义模式 {}", modes.len() + 1)
+                } else {
+                    name
+                };
+                let ids = |key: &str, server: bool| -> Vec<String> {
+                    item.get(key)
+                        .and_then(|list| list.as_array())
+                        .map(|list| {
+                            list.iter()
+                                .filter_map(|entry| entry.as_str())
+                                .map(str::trim)
+                                .filter(|entry| {
+                                    if server {
+                                        crate::config::is_server_id(entry)
+                                    } else {
+                                        is_plugin_id(entry)
+                                    }
+                                })
+                                .map(str::to_string)
+                                .take(MAX_PLUGINS)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                modes.push(ChatMode {
+                    id,
+                    name,
+                    plugins: ids("plugins", false),
+                    skills: ids("skills", false),
+                    mcp_servers: ids("mcpServers", true),
+                });
+            }
+            settings.modes = modes;
         }
         if let Some(list) = value.get("connections").and_then(|item| item.as_array()) {
             let connections: Vec<Connection> = list
@@ -952,6 +1133,19 @@ impl AiSettings {
                 )
             })
             .collect();
+        let modes: Vec<serde_json::Value> = self
+            .modes
+            .iter()
+            .map(|mode| {
+                serde_json::json!({
+                    "id": mode.id,
+                    "name": mode.name,
+                    "plugins": mode.plugins,
+                    "skills": mode.skills,
+                    "mcpServers": mode.mcp_servers,
+                })
+            })
+            .collect();
         let value = serde_json::json!({
             "active": self.active,
             "theme": self.theme,
@@ -959,6 +1153,7 @@ impl AiSettings {
             "plugins": self.plugins,
             "mcpServers": self.mcp_servers,
             "skills": self.skills,
+            "modes": modes,
             "budgetTokens": self.budget_tokens,
             "proxy": self.proxy,
             "connections": connections,
@@ -1108,6 +1303,13 @@ mod tests {
             plugins: vec!["demo-plugin".to_string()],
             mcp_servers: vec!["demo-server".to_string()],
             skills: vec!["demo-skill".to_string()],
+            modes: vec![ChatMode {
+                id: "mode-1".to_string(),
+                name: "写作".to_string(),
+                plugins: vec!["demo-plugin".to_string()],
+                skills: vec!["demo-skill".to_string()],
+                mcp_servers: vec!["demo-server".to_string()],
+            }],
             budget_tokens: 250_000,
             proxy: "http://127.0.0.1:7890".to_string(),
         };
@@ -1120,6 +1322,9 @@ mod tests {
         assert_eq!(loaded.plugins, vec!["demo-plugin".to_string()]);
         assert_eq!(loaded.mcp_servers, vec!["demo-server".to_string()]);
         assert_eq!(loaded.skills, vec!["demo-skill".to_string()]);
+        assert_eq!(loaded.modes, settings.modes);
+        assert_eq!(loaded.mode_label("mode-1"), "写作");
+        assert_eq!(loaded.mode_selection("mode-1").plugins, vec!["demo-plugin".to_string()]);
         // The spending guard and the proxy survive a round trip too.
         assert_eq!(loaded.budget_tokens, 250_000);
         assert_eq!(loaded.proxy, "http://127.0.0.1:7890");
@@ -1520,5 +1725,52 @@ mod tests {
         assert!(found[0].problem.contains("plugin.json"));
         assert!(found[2].problem.contains("入口文件"));
         assert!(found[3].problem.contains("只支持"));
+    }
+#[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn modes_intersect_the_global_resource_switches() {
+        let mut settings = AiSettings::default();
+        settings.plugins = vec!["plugin-a".to_string(), "plugin-b".to_string()];
+        settings.skills = vec!["skill-a".to_string(), "skill-b".to_string()];
+        settings.mcp_servers = vec!["server-a".to_string(), "server-b".to_string()];
+        settings.modes = vec![ChatMode {
+            id: "mode-1".to_string(),
+            name: "写作".to_string(),
+            plugins: vec!["plugin-a".to_string(), "plugin-b".to_string()],
+            skills: vec!["skill-a".to_string()],
+            mcp_servers: vec!["server-a".to_string()],
+        }];
+
+        // Basic carries no external resource at all.
+        assert_eq!(
+            settings.mode_selection(crate::config::MODE_BASIC),
+            ModeSelection::default()
+        );
+        // Full carries everything that is globally enabled.
+        assert_eq!(
+            settings.mode_selection(crate::config::MODE_FULL),
+            ModeSelection {
+                plugins: vec!["plugin-a".to_string(), "plugin-b".to_string()],
+                skills: vec!["skill-a".to_string(), "skill-b".to_string()],
+                mcp_servers: vec!["server-a".to_string(), "server-b".to_string()],
+            }
+        );
+        // A custom mode narrows the lists, and a global off switch wins again.
+        settings.plugins.retain(|id| id != "plugin-b");
+        settings.skills.retain(|id| id != "skill-a");
+        settings.mcp_servers.retain(|id| id != "server-a");
+        assert_eq!(
+            settings.mode_selection("mode-1"),
+            ModeSelection {
+                plugins: vec!["plugin-a".to_string()],
+                skills: Vec::new(),
+                mcp_servers: Vec::new(),
+            }
+        );
+        // An unknown custom mode falls back to full rather than silently empty.
+        assert_eq!(
+            settings.mode_selection("deleted-mode"),
+            settings.mode_selection(crate::config::MODE_FULL)
+        );
     }
 }

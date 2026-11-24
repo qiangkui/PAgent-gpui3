@@ -54,6 +54,7 @@ impl DshFlowApp {
                 auto_actions: chat.auto_actions,
                 max_rounds: chat.max_rounds,
                 max_calls: chat.max_calls,
+                mode: chat.mode.clone(),
                 messages: chat
                     .messages
                     .iter()
@@ -818,6 +819,7 @@ pub(crate) fn load_saved(
             chat.auto_actions = stored.auto_actions;
             chat.max_rounds = stored.max_rounds;
             chat.max_calls = stored.max_calls;
+            chat.mode = stored.mode;
             chat.details = stored.details.into_iter().collect();
             chat.checks = stored.checks.into_iter().collect();
             chat

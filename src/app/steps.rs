@@ -225,6 +225,7 @@ impl DshFlowApp {
         self.model_menu = false;
         self.tools_menu = false;
         self.budget_menu = false;
+        self.mode_menu = false;
         self.attach_menu = false;
     }
 

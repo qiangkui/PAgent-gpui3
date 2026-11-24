@@ -784,7 +784,7 @@ async function commandAi(): Promise<number> {
         readOnlyRoots: request.readOnlyRoots,
         windowTokens: request.windowTokens,
         plugins: plugins.tools,
-        mcpTools: [...mcp.tools, ...(request.tools ? [mcp.gateway] : [])],
+        mcpTools: [...mcp.tools, ...(request.tools && (request.mcpServers?.length ?? 0) > 0 ? [mcp.gateway] : [])],
         promptInjections: plugins.prompts,
         approve,
         onApproval,

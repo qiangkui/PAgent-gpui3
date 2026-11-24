@@ -927,6 +927,7 @@ fn saved_conversations_come_back() {
             auto_actions: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
+mode: crate::config::MODE_FULL.to_string(),
             messages: vec![
                 crate::chats::StoredMessage {
                     role: "user".to_string(),
@@ -1021,6 +1022,7 @@ fn saved_conversations_come_back() {
             auto_actions: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
+mode: crate::config::MODE_FULL.to_string(),
             messages: Vec::new(),
         },
     ];
@@ -1058,6 +1060,7 @@ fn unsent_text_and_files_come_back_with_the_conversation() {
         auto_actions: false,
         max_rounds: crate::config::MAX_ROUNDS_CHOICE,
         max_calls: crate::config::MAX_CALLS_CHOICE,
+mode: crate::config::MODE_FULL.to_string(),
         messages: Vec::new(),
     };
     let (drafts, files) = drafts_of(std::slice::from_ref(&saved));
@@ -1128,6 +1131,7 @@ fn saved_conversations_keep_their_own_settings() {
         auto_actions: false,
         max_rounds: 12,
         max_calls: 40,
+mode: crate::config::MODE_FULL.to_string(),
         messages: Vec::new(),
     };
     let chats = load_saved(vec![saved], defaults);
@@ -1458,6 +1462,20 @@ fn a_finished_approval_says_what_happened() {
     assert_eq!(approval_hint("delete"), "允许后才会删除；删除后不能撤销");
     assert_eq!(approval_state("node", true), "已执行");
     assert_eq!(approval_state("python", false), "执行失败");
+}
+
+#[test]
+fn basic_mode_hides_the_mcp_gateway() {
+    let basic = crate::config::ModeSelection::default();
+    let tools = mode_tools(&basic);
+    assert!(!tools.contains(&"mcp"));
+    assert!(tools.contains(&"read"), "built-in tools stay available");
+
+    let with_mcp = crate::config::ModeSelection {
+        mcp_servers: vec!["server-a".to_string()],
+        ..crate::config::ModeSelection::default()
+    };
+    assert!(mode_tools(&with_mcp).contains(&"mcp"));
 }
 
 #[test]

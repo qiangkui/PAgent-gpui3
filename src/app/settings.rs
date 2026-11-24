@@ -37,6 +37,7 @@ impl DshFlowApp {
         let body = match self.settings_tab {
             SettingsTab::Interface => self.render_interface_settings(palette, cx),
             SettingsTab::Ai => self.render_ai_settings(palette, cx),
+            SettingsTab::Modes => self.render_modes_settings(palette, cx),
             SettingsTab::Instructions => self.render_instructions_settings(palette, cx),
             SettingsTab::Data => self.render_data_settings(palette, cx),
             SettingsTab::Maintenance => self.render_maintenance_settings(palette, cx),
@@ -105,6 +106,11 @@ impl DshFlowApp {
                     }
                     if tab == SettingsTab::Instructions {
                         view.load_instructions(cx);
+                    }
+                    if tab == SettingsTab::Modes {
+                        view.refresh_plugins(cx);
+                        view.refresh_skills(cx);
+                        view.refresh_mcp(cx);
                     }
                     cx.notify();
                 }))

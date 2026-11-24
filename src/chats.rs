@@ -96,6 +96,8 @@ pub struct StoredChat {
     pub max_rounds: u32,
     /// Tool calls one question may make.
     pub max_calls: u32,
+    /// Mode id selecting external plugins, skills and MCP servers.
+    pub mode: String,
 }
 
 /// One request's detail, as one line of `requests.jsonl`.
@@ -608,6 +610,14 @@ fn read_chat(value: &serde_json::Value) -> Option<StoredChat> {
         auto_actions,
         max_rounds,
         max_calls,
+        mode: {
+            let mode = text(value.get("mode"));
+            if mode.is_empty() {
+                crate::config::MODE_FULL.to_string()
+            } else {
+                mode
+            }
+        },
     })
 }
 
@@ -822,6 +832,7 @@ fn chat_value(chat: &StoredChat) -> serde_json::Value {
         "autoActions": chat.auto_actions,
         "maxRounds": chat.max_rounds,
         "maxCalls": chat.max_calls,
+        "mode": chat.mode,
         "messages": messages,
     })
 }
@@ -920,6 +931,7 @@ mod tests {
             auto_actions: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
+mode: crate::config::MODE_FULL.to_string(),
         }
     }
 
@@ -1101,6 +1113,7 @@ mod tests {
             auto_actions: false,
             max_rounds: 12,
             max_calls: 40,
+mode: crate::config::MODE_FULL.to_string(),
             messages: vec![
                 message("user", "你好", false),
                 {
@@ -1283,6 +1296,7 @@ mod tests {
             auto_actions: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
+mode: crate::config::MODE_FULL.to_string(),
         };
         save_to(&file, std::slice::from_ref(&chat)).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();

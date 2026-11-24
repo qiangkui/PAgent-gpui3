@@ -613,6 +613,16 @@ impl DshFlowApp {
                                 .child(self.render_budget_menu(palette, cx)),
                         )
                     })
+                    .when(self.mode_menu, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .bottom(relative(1.))
+                                .child(self.render_mode_menu(palette, cx)),
+                        )
+                    })
                     .when(self.model_menu, |this| {
                         this.child(
                             div()
@@ -688,6 +698,7 @@ impl DshFlowApp {
                                                 view.model_menu = false;
                                                 view.tools_menu = false;
                                                 view.budget_menu = false;
+                                                view.mode_menu = false;
                                                 view.attach_menu = !view.attach_menu;
                                                 cx.notify();
                                             }))
@@ -727,6 +738,7 @@ impl DshFlowApp {
                                             )
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.attach_menu = false;
+                                                view.mode_menu = false;
                                                 if view.ai.verified().is_empty() {
                                                     // Nothing has answered a test yet, so the
                                                     // picker would be empty: open the settings
@@ -804,6 +816,7 @@ impl DshFlowApp {
                                                 view.model_menu = false;
                                                 view.budget_menu = false;
                                                 view.attach_menu = false;
+                                                view.mode_menu = false;
                                                 view.tools_menu = !view.tools_menu;
                                                 cx.notify();
                                             }))
@@ -822,6 +835,52 @@ impl DshFlowApp {
                                                     .text_xs()
                                                     .text_color(rgb(palette.text))
                                                     .child(ToolMode::of(self.chat()).label()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(palette.muted))
+                                                    .child("▾"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("mode-chip")
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap_1()
+                                            .flex_shrink_0()
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                            )
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.model_menu = false;
+                                                view.tools_menu = false;
+                                                view.budget_menu = false;
+                                                view.attach_menu = false;
+                                                view.mode_menu = !view.mode_menu;
+                                                cx.notify();
+                                            }))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(palette.muted))
+                                                    .child("模式"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .max_w(px(120.))
+                                                    .truncate()
+                                                    .text_xs()
+                                                    .text_color(rgb(palette.text))
+                                                    .child(self.ai.mode_label(&self.chat().mode)),
                                             )
                                             .child(
                                                 div()
@@ -853,6 +912,7 @@ impl DshFlowApp {
                                                 view.model_menu = false;
                                                 view.tools_menu = false;
                                                 view.attach_menu = false;
+                                                view.mode_menu = false;
                                                 view.budget_menu = !view.budget_menu;
                                                 cx.notify();
                                             }))

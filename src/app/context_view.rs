@@ -994,9 +994,11 @@ impl DshFlowApp {
             text: project_rules(&self.ai.workspace_dir(), &workspace),
         });
         // Enabled skills are prompt text, so the window can add them without a
-        // round-trip to the engine. A broken folder is skipped rather than
-        // failing the question; the Skill page says why it cannot be used.
-        let skills = crate::skill::prompt_text(&self.ai);
+        // round-trip to the engine. The conversation's mode narrows which of the
+        // globally enabled skills this request carries; a broken folder is
+        // skipped rather than failing the question.
+        let selection = self.ai.mode_selection(&chat.mode);
+        let skills = crate::skill::prompt_text_for(&self.ai, &selection.skills);
         if !skills.is_empty() {
             blocks.push(PromptBlock {
                 kind: PromptKind::Skills,

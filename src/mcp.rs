@@ -306,6 +306,24 @@ fn read_skills(dir: &Path) -> std::collections::HashMap<String, Vec<McpSkill>> {
     found
 }
 
+/// Every enabled server in `allowed` that can be used, ready for the engine.
+pub fn enabled_for(settings: &AiSettings, allowed: &[String]) -> Vec<McpServer> {
+    if allowed.is_empty() {
+        return Vec::new();
+    }
+    let allowed: std::collections::HashSet<&str> =
+        allowed.iter().map(String::as_str).collect();
+    scanned(&locate_dir())
+        .into_iter()
+        .filter(|server| {
+            server.problem.is_empty()
+                && settings.mcp_server_enabled(&server.id)
+                && allowed.contains(server.id.as_str())
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
 /// Every enabled server that can be used, ready for the engine.
 pub fn enabled(settings: &AiSettings) -> Vec<McpServer> {
     scanned(&locate_dir())

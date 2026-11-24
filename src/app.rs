@@ -135,6 +135,18 @@ const ALL_TOOLS: [&str; 18] = [
     "symbols", "git", "shell", "task", "python", "node", "http", "mcp",
 ];
 
+/// The engine tools a request may use after its mode removed MCP.
+///
+/// The `mcp` tool is a gateway that can link a server at runtime, so it only
+/// belongs in a request that actually carries at least one MCP server.
+pub(crate) fn mode_tools(selection: &crate::config::ModeSelection) -> Vec<&'static str> {
+    ALL_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| *name != "mcp" || !selection.mcp_servers.is_empty())
+        .collect()
+}
+
 /// Added whenever the assistant answers: how to work, not only what it can use.
 const WORK_PROMPT: &str = "工作方式：动手前先看清结构（list / tree / glob / grep），需要时先写一个简短计划再执行；\
 改完代码要跑相关测试或构建，并把真实结果写进回答；没有运行过的验证不要声称通过。\
@@ -313,6 +325,8 @@ pub(crate) enum SettingsTab {
     Interface,
     /// Model connections.
     Ai,
+    /// Which external plugins, skills and MCP servers reach the model.
+    Modes,
     /// Instructions that apply to the open conversation only.
     Instructions,
     /// Data locations, backups, restores and exports.
@@ -323,9 +337,10 @@ pub(crate) enum SettingsTab {
 
 impl SettingsTab {
     /// Every block, in the order the index shows them.
-    const ALL: [SettingsTab; 5] = [
+    const ALL: [SettingsTab; 6] = [
         SettingsTab::Interface,
         SettingsTab::Ai,
+        SettingsTab::Modes,
         SettingsTab::Instructions,
         SettingsTab::Data,
         SettingsTab::Maintenance,
@@ -336,6 +351,7 @@ impl SettingsTab {
         match self {
             SettingsTab::Interface => "界面",
             SettingsTab::Ai => "AI",
+            SettingsTab::Modes => "模式",
             SettingsTab::Instructions => "指令",
             SettingsTab::Data => "数据",
             SettingsTab::Maintenance => "诊断",
@@ -612,6 +628,8 @@ pub(crate) struct Chat {
     pub(crate) max_rounds: u32,
     /// Tool calls one question may make.
     pub(crate) max_calls: u32,
+    /// Mode selecting external plugins, skills and MCP servers for this chat.
+    pub(crate) mode: String,
     /// Commands allowed for the rest of the session, as `tool\u{0}command`.
     pub(crate) allow_session: std::collections::HashSet<String>,
     /// Collapsible blocks the reader opened, as `(message, block)`.
@@ -641,6 +659,7 @@ impl Chat {
             auto_actions: false,
             max_rounds: defaults.max_rounds,
             max_calls: defaults.max_calls,
+            mode: crate::config::MODE_FULL.to_string(),
             allow_session: std::collections::HashSet::new(),
             details: std::collections::HashSet::new(),
             checks: std::collections::HashSet::new(),
@@ -846,6 +865,8 @@ pub(crate) struct RetryAsk {
     pub(crate) max_rounds: u32,
     /// Tool-call budget.
     pub(crate) max_calls: u32,
+    /// Mode id used by the original request.
+    pub(crate) mode: String,
     /// Files that went with the question, as the request carried them.
     pub(crate) attachments: Vec<crate::ai::AskAttachment>,
     /// Connections already tried, so a retry moves on.
@@ -1365,6 +1386,12 @@ pub struct DshFlowApp {
     changes_open: Option<usize>,
     /// Block of the settings page on show.
     settings_tab: SettingsTab,
+    /// Custom mode selected in settings; built-in ids are allowed.
+    mode_selected: String,
+    /// Note under the mode editor after a create/delete/toggle.
+    mode_note: String,
+    /// True while the composer's mode menu is open.
+    mode_menu: bool,
     /// The conversation-only instruction box.
     instructions: TextField,
     /// Folder the instruction box belongs to, so a switch reloads it.
@@ -1644,6 +1671,9 @@ impl DshFlowApp {
             restore_armed: false,
             changes_open: None,
             settings_tab: SettingsTab::Interface,
+            mode_selected: crate::config::MODE_FULL.to_string(),
+            mode_note: String::new(),
+            mode_menu: false,
             instructions: TextField::new(cx),
             instructions_chat: None,
             instructions_status: None,
@@ -1800,6 +1830,7 @@ mod instructions;
 mod mcp;
 mod message;
 mod metrics;
+mod modes;
 mod plugins;
 mod render;
 mod run_actions;
@@ -1819,7 +1850,7 @@ mod widgets;
 pub(crate) use {
     ai_actions::*, ai_settings::*, chat::*, chat_actions::*, compact::*, composer::*,
     context_view::*, conversations::*, datatable::*, fields::*, flow::*, input::*,
-    instructions::*, mcp::*, message::*, metrics::*, plugins::*, render::*, run_actions::*,
+    instructions::*, mcp::*, message::*, metrics::*, modes::*, plugins::*, render::*, run_actions::*,
     settings::*, settings_window::*, sidebar::*, skills::*, stats::*, steps::*, tasks::*, util::*,
     widgets::*,
 };

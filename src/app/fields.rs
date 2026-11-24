@@ -340,6 +340,8 @@ impl DshFlowApp {
                     self.tools_menu = false;
                 } else if self.budget_menu {
                     self.budget_menu = false;
+                } else if self.mode_menu {
+                    self.mode_menu = false;
                 } else if self.attach_menu {
                     self.attach_menu = false;
                 } else if self.chat_find_open {

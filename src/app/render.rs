@@ -111,7 +111,7 @@ impl Render for DshFlowApp {
                     }
                     // The composer's pickers close on a press outside them; the
                     // chips stop propagation, so this never toggles one twice.
-                    if view.model_menu || view.tools_menu || view.budget_menu || view.attach_menu {
+                    if view.model_menu || view.tools_menu || view.budget_menu || view.mode_menu || view.attach_menu {
                         view.close_composer_menus();
                         changed = true;
                     }

@@ -148,6 +148,24 @@ pub fn enabled_skills(settings: &AiSettings) -> Vec<InstalledSkill> {
         .collect()
 }
 
+/// The system-prompt block for the enabled skills in `allowed`.
+///
+/// A mode narrows what a request carries; the global Skill page still decides
+/// whether a skill may be used at all. An empty `allowed` means no skill.
+pub fn prompt_text_for(settings: &AiSettings, allowed: &[String]) -> String {
+    if allowed.is_empty() {
+        return String::new();
+    }
+    let allowed: std::collections::HashSet<&str> =
+        allowed.iter().map(String::as_str).collect();
+    let skills: Vec<InstalledSkill> = enabled_skills(settings)
+        .into_iter()
+        .filter(|skill| allowed.contains(skill.id.as_str()))
+        .collect();
+    join_instructions(&skills)
+}
+
+#[allow(dead_code)]
 /// The system-prompt block for every enabled skill, or an empty string.
 pub fn prompt_text(settings: &AiSettings) -> String {
     join_instructions(&enabled_skills(settings))
