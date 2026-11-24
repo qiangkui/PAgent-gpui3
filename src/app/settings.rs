@@ -762,7 +762,6 @@ impl DshFlowApp {
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> Div {
-        let home = AiSettings::home();
         let node = self.node_version.clone();
         let healthy = node.is_some() && self.engine_ready;
         let mut environment: Vec<AnyElement> = vec![
@@ -852,51 +851,7 @@ impl DshFlowApp {
                 .into_any_element(),
         );
 
-        // The paths are the part people paste into a bug report, so they are
-        // chips rather than prose.
-        let mut places: Vec<AnyElement> = vec![
-            settings_code_row("程序目录", home.display().to_string(), palette),
-            settings_code_row(
-                "配置",
-                home.join("config.json").display().to_string(),
-                palette,
-            ),
-            settings_code_row("数据", self.ai.data_dir().display().to_string(), palette),
-            settings_code_row(
-                "工作区",
-                self.ai.workspace_dir().display().to_string(),
-                palette,
-            ),
-            settings_code_row("技能", self.skills_dir.display().to_string(), palette),
-            settings_code_row(
-                "插件",
-                AiSettings::plugin_dir()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default(),
-                palette,
-            ),
-            settings_code_row("MCP", self.mcp_dir.display().to_string(), palette),
-        ];
-        let home_for_open = home.clone();
-        places.push(
-            div()
-                .flex()
-                .flex_row()
-                .gap_2()
-                .pt_1()
-                .child(
-                    settings_button(
-                        "open-home",
-                        "打开程序目录",
-                        SettingsButton::Secondary,
-                        palette,
-                    )
-                    .on_click(cx.listener(move |_, _, _, _| {
-                        let _ = open_path(&home_for_open);
-                    })),
-                )
-                .into_any_element(),
-        );
+        // The paths are no longer repeated here: the 数据 page owns them.
 
         // Snippets: one chip per file, inserted into the composer on click.
         let snippets_dir = crate::snippet::dir();
@@ -966,7 +921,6 @@ impl DshFlowApp {
             settings_card("运行环境", palette)
                 .children(environment)
                 .into_any_element(),
-            settings_card("位置", palette).children(places).into_any_element(),
             snippet_card.into_any_element(),
         ];
         if let Some(banner) = &self.banner {

@@ -268,11 +268,6 @@ pub(crate) fn settings_text_row(
     settings_row(label, text, palette)
 }
 
-/// A row whose value is a path or a command.
-pub(crate) fn settings_code_row(label: &str, value: String, palette: Palette) -> AnyElement {
-    settings_row(label, settings_code(value, palette), palette)
-}
-
 /// The look of a settings button; the caller adds the action.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsButton {
