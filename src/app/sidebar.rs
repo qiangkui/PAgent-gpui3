@@ -503,7 +503,7 @@ impl DshFlowApp {
                 div()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .gap_0p5()
                     .pt_3()
                     .pb_1()
                     .child(
@@ -536,8 +536,8 @@ impl DshFlowApp {
                             .child(
                                 svg()
                                     .path("icons/plus.svg")
-                                    .w(px(14.))
-                                    .h(px(14.))
+                                    .w(px(18.))
+                                    .h(px(18.))
                                     .text_color(rgb(palette.muted)),
                             )
                             .child(
@@ -818,7 +818,7 @@ impl DshFlowApp {
                 .flex_1()
                 .min_w(px(0.))
                 .truncate()
-                .text_sm()
+                .text_base()
                 .text_color(rgb(palette.strong))
                 .child(category.name.clone())
                 .into_any_element()
@@ -1414,7 +1414,7 @@ impl RunBadge {
 /// One sidebar navigation row: icon then label.
 ///
 /// 新建对话 and the 插件 / 统计 / MCP / Skill / 设置 links share this shape, so
-/// the block above 工作区 reads as one list: 34px rows, 14px icon, flat until
+/// the block above 工作区 reads as one list: 34px rows, 18px icon, flat until
 /// hovered. The conversation search lives under the 工作区 title instead.
 fn nav_row(
     id: &'static str,
@@ -1445,8 +1445,8 @@ fn nav_row(
         .child(
             svg()
                 .path(icon)
-                .w(px(14.))
-                .h(px(14.))
+                .w(px(18.))
+                .h(px(18.))
                 .text_color(rgb(if selected {
                     palette.accent
                 } else {
