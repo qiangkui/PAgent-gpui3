@@ -52,6 +52,8 @@ node src/cli.ts run examples/repo-health/flow.yml --input repo=.
 - 在“插件”页启用后可让模型调用 `win32_list_windows` / `win32_window_info`；
 - 只枚举窗口，不点击、不修改。
 
+另有 `plugins/win32-input/`：`win32_focus` / `win32_click` / `win32_scroll` / `win32_type` / `win32_keys`，用 `SendInput` 做鼠标点击、滚轮、Unicode 输入和按键组合。它默认不启用，所有操作都需审批，并支持 `dry_run` 先验证不执行。
+
 ## 测试
 
 ```powershell
