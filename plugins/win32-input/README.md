@@ -12,7 +12,28 @@
 { "handle": "0x201D2" }
 ```
 
-把指定窗口恢复并切到前台，返回是否成功。
+把指定窗口恢复并切到前台，返回是否成功。也可传 `snapshot` + `element`。
+
+### `win32_observe` + 元素操作
+
+先由 `win32-windows` 的 `win32_observe` 取得：
+
+```json
+{ "snapshot_id": "…", "elements": [{ "index": 3, "name": "确定", "control_type": "Button", "center": { "x": 500, "y": 300 } }] }
+```
+
+然后点击元素：
+
+```json
+{
+  "snapshot": "…",
+  "element": 3,
+  "button": "left",
+  "dry_run": true
+}
+```
+
+快照 45 秒过期后会拒绝操作；密码框不允许 `win32_type`，密码框点击需要 `confirm_password=true`，含删除/支付等危险词的目标需要 `confirm_dangerous=true`。
 
 ### `win32_click`
 
@@ -68,6 +89,23 @@
 ### `dry_run`
 
 所有操作工具都接受 `"dry_run": true`，只校验句柄/坐标/按键并返回计划，不实际移动或输入。建议模型第一次先 dry run，用户确认后再执行。
+
+### `win32_drag`
+
+```json
+{
+  "snapshot": "…",
+  "from_x": 300, "from_y": 240,
+  "to_x": 500, "to_y": 400,
+  "duration_ms": 350
+}
+```
+
+在新鲜观察快照窗口内拖拽；坐标与 observe 的屏幕物理像素一致。
+
+### `win32_wait`
+
+等待界面加载/动画完成，默认 1000ms，最大 60000ms。等待后应重新 observe。
 
 ## 限制
 

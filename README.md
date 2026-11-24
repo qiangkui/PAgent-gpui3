@@ -49,10 +49,11 @@ node src/cli.ts run examples/repo-health/flow.yml --input repo=.
 插件放在 `<home>/plugins/<id>/`，入口由 `plugin.json` 的 `main` 指定，必须导出 `activate(api)`。仓库里的 `plugins/win32-windows/` 是只读 Win32 窗口检查插件：
 
 - 需要 Python 在 PATH 中；
-- 在“插件”页启用后可让模型调用 `win32_list_windows` / `win32_window_info`；
-- 只枚举窗口，不点击、不修改。
+- 可调用 `win32_list_windows` / `win32_window_info` 枚举 HWND；
+- `win32_observe` 用 UI Automation 读取控件树，返回元素编号、名称、类型、中心坐标、密码框标记和 45 秒快照；
+- 只读，不点击、不修改。
 
-另有 `plugins/win32-input/`：`win32_focus` / `win32_click` / `win32_scroll` / `win32_type` / `win32_keys`，用 `SendInput` 做鼠标点击、滚轮、Unicode 输入和按键组合。它默认不启用，所有操作都需审批，并支持 `dry_run` 先验证不执行。
+另有 `plugins/win32-input/`：`win32_focus` / `win32_click` / `win32_scroll` / `win32_type` / `win32_keys` / `win32_drag` / `win32_wait`。优先接收 `win32_observe` 的 `snapshot` + `element`，拒绝过期快照和密码框输入；默认不启用，所有操作都需审批，并支持 `dry_run` 先验证不执行。
 
 ## 测试
 

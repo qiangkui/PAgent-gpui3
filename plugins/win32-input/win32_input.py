@@ -267,7 +267,7 @@ def click_events(button: str, double: bool) -> list[INPUT]:
     return events
 
 
-def resolve_point(handle: int, x, y) -> tuple[int, int] | None:
+def resolve_point(handle: int, x, y, screen: bool = False) -> tuple[int, int] | None:
     has_x = x is not None
     has_y = y is not None
     if not has_x and not has_y:
@@ -275,6 +275,8 @@ def resolve_point(handle: int, x, y) -> tuple[int, int] | None:
     if has_x != has_y:
         raise ValueError("x 和 y 必须同时提供")
     px, py = int(x), int(y)
+    if screen:
+        return (px, py)
     if handle:
         width, height = client_size(handle)
         if px < 0 or py < 0 or px >= width or py >= height:
@@ -312,7 +314,7 @@ def action_click(payload: dict) -> dict:
         raise ValueError(f"button 必须是 left / right / middle，收到 {button}")
     double = payload.get("double") is True
     activate = payload.get("activate") is True
-    point = resolve_point(handle, payload.get("x"), payload.get("y"))
+    point = resolve_point(handle, payload.get("x"), payload.get("y"), payload.get("screen") is True)
     if activate and handle and not dry_run(payload) and not focus_window(handle):
         raise RuntimeError("无法先激活目标窗口，点击没有执行")
     before = cursor_pos()
@@ -344,7 +346,7 @@ def action_scroll(payload: dict) -> dict:
     if clicks == 0 or abs(clicks) > 100:
         raise ValueError("clicks 必须在 -100 到 100 之间且不能为 0")
     horizontal = payload.get("horizontal") is True
-    point = resolve_point(handle, payload.get("x"), payload.get("y"))
+    point = resolve_point(handle, payload.get("x"), payload.get("y"), payload.get("screen") is True)
     if point and not dry_run(payload) and not user32.SetCursorPos(point[0], point[1]):
         raise RuntimeError("无法移动鼠标到滚动位置")
     if not dry_run(payload):
@@ -447,10 +449,17 @@ def action_type(payload: dict) -> dict:
     handle = handle_value(payload.get("handle"))
     if handle and not user32.IsWindow(handle):
         raise ValueError(f"不是有效窗口句柄：{payload.get('handle')}")
+    point = resolve_point(handle, payload.get("x"), payload.get("y"), payload.get("screen") is True)
     events = unicode_events(text)
     if not dry_run(payload):
         if handle and not focus_window(handle):
             raise RuntimeError("无法把目标窗口切到前台，文字没有输入")
+        if point:
+            if not user32.SetCursorPos(point[0], point[1]):
+                raise RuntimeError("无法移动到输入控件")
+            sent = send_inputs(click_events("left", False))
+            if sent != 2:
+                raise RuntimeError(f"SendInput 只接受 {sent}/2 个焦点事件，可能被 UIPI 阻止")
         send_in_chunks(events)
     return {
         "ok": True,
@@ -458,6 +467,53 @@ def action_type(payload: dict) -> dict:
         "dry_run": dry_run(payload),
         "characters": len(text),
         "events": len(events),
+        "position": {"x": point[0], "y": point[1]} if point else None,
+        "target": target_info(handle) if handle else None,
+    }
+
+
+def action_drag(payload: dict) -> dict:
+    handle = handle_value(payload.get("handle"))
+    if handle and not user32.IsWindow(handle):
+        raise ValueError(f"不是有效窗口句柄：{payload.get('handle')}")
+    from_x = int(payload.get("from_x"))
+    from_y = int(payload.get("from_y"))
+    to_x = int(payload.get("to_x"))
+    to_y = int(payload.get("to_y"))
+    duration = max(50, min(5000, int(payload.get("duration_ms", 350))))
+    if dry_run(payload):
+        return {
+            "ok": True,
+            "action": "drag",
+            "dry_run": True,
+            "from": {"x": from_x, "y": from_y},
+            "to": {"x": to_x, "y": to_y},
+            "duration_ms": duration,
+            "target": target_info(handle) if handle else None,
+        }
+    if handle and not focus_window(handle):
+        raise RuntimeError("无法把目标窗口切到前台，拖拽没有执行")
+    if not user32.SetCursorPos(from_x, from_y):
+        raise RuntimeError("无法移动到拖拽起点")
+    sent = send_inputs(click_events("left", False)[:1])
+    if sent != 1:
+        raise RuntimeError(f"SendInput 只接受 {sent}/1 个按下事件，可能被 UIPI 阻止")
+    steps = 20
+    try:
+        for step in range(1, steps + 1):
+            x = from_x + (to_x - from_x) * step // steps
+            y = from_y + (to_y - from_y) * step // steps
+            user32.SetCursorPos(x, y)
+            time.sleep(max(0.01, duration / steps / 1000))
+    finally:
+        send_inputs(click_events("left", False)[1:])
+    return {
+        "ok": True,
+        "action": "drag",
+        "dry_run": False,
+        "from": {"x": from_x, "y": from_y},
+        "to": {"x": to_x, "y": to_y},
+        "duration_ms": duration,
         "target": target_info(handle) if handle else None,
     }
 
@@ -511,6 +567,8 @@ def main() -> None:
             result = action_click(payload)
         elif action == "scroll":
             result = action_scroll(payload)
+        elif action == "drag":
+            result = action_drag(payload)
         elif action == "type":
             result = action_type(payload)
         elif action == "keys":

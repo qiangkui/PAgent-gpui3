@@ -32,6 +32,16 @@
 - DPI、是否前台窗口
 - 祖先链、后代数量
 
+### `win32_observe`
+
+用 Windows UI Automation 读取窗口内的控件树：
+
+```json
+{ "handle": "0x201D2", "depth": 3, "limit": 80, "include_offscreen": true }
+```
+
+返回元素编号、名称、控件类型、`automation_id`、屏幕矩形/中心点、是否密码框、可用模式，以及 `snapshot_id`。后续 `win32-input` 的点击/输入优先传 `snapshot=snapshot_id, element=元素编号`；快照 45 秒过期后必须重新观察。
+
 ## 使用顺序
 
 1. `win32_list_windows`（不带 parent，limit 50~100）；

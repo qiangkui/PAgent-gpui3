@@ -2,10 +2,16 @@ import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
+import { mkdir, readFile, readdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 
 const run = promisify(execFile)
 const here = dirname(fileURLToPath(import.meta.url))
 const script = join(here, 'win32_windows.py')
+const uiaScript = join(here, 'uia_tree.ps1')
+const snapshotDir = join(tmpdir(), 'pa-win32-snapshots')
+const SNAPSHOT_TTL_MS = 45_000
 
 /**
  * Windows 上的 Python 命令。`python` 可能是 Microsoft Store 别名，因此
@@ -80,6 +86,66 @@ function render(result) {
   return JSON.stringify(result, null, 2)
 }
 
+/**
+ * Read the UIA tree through the .NET automation client. PowerShell is used
+ * instead of a Python COM package so the plugin stays dependency-free.
+ */
+async function callUia(payload) {
+  const { stdout } = await run(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy', 'Bypass',
+      '-File', uiaScript,
+      JSON.stringify(payload)
+    ],
+    {
+      cwd: here,
+      windowsHide: true,
+      timeout: 30_000,
+      maxBuffer: 8 * 1024 * 1024,
+      encoding: 'utf8'
+    }
+  )
+  const text = stdout.trim()
+  if (text === '') throw new Error('UIA 脚本没有返回内容')
+  const parsed = JSON.parse(text)
+  if (!parsed || parsed.ok !== true) throw new Error(String(parsed?.error ?? 'UIA 读取失败'))
+  return parsed
+}
+
+/** Remove snapshots that are too old to be resolved anyway. */
+async function pruneSnapshots() {
+  await mkdir(snapshotDir, { recursive: true })
+  const now = Date.now()
+  const entries = await readdir(snapshotDir).catch(() => [])
+  for (const name of entries) {
+    const file = join(snapshotDir, name)
+    const info = await stat(file).catch(() => null)
+    if (info && now - info.mtimeMs > 10 * 60_000) await unlink(file).catch(() => {})
+  }
+}
+
+/**
+ * Persist one observation for the input plugin. The ID is a random UUID; the
+ * input plugin only accepts files in this directory, so a model cannot point it
+ * at an arbitrary path.
+ */
+async function saveSnapshot(window, elements) {
+  await pruneSnapshots()
+  const id = randomUUID()
+  const snapshot = {
+    id,
+    at: Date.now(),
+    ttl_ms: SNAPSHOT_TTL_MS,
+    window,
+    elements
+  }
+  await writeFile(join(snapshotDir, `${id}.json`), JSON.stringify(snapshot), 'utf8')
+  return id
+}
+
 export function activate(api) {
   api.registerTool(
     {
@@ -148,6 +214,73 @@ export function activate(api) {
       const handle = typeof args.handle === 'string' ? args.handle.trim() : ''
       if (handle === '') throw new Error('缺少 handle')
       return render(await callBridge({ action: 'info', handle }))
+    }
+  )
+api.registerTool(
+    {
+      name: 'win32_observe',
+      description:
+        '用 UI Automation 读取一个窗口的元素树（按钮、输入框、菜单等），返回元素编号、名称、控件类型、屏幕坐标/中心点、是否密码框和可用模式。会生成 snapshot_id，后续 win32-input 的点击/输入应传 snapshot + element，避免使用过期坐标。',
+      parameters: {
+        type: 'object',
+        properties: {
+          handle: {
+            type: 'string',
+            description: '目标窗口句柄，先用 win32_list_windows 获取'
+          },
+          depth: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 6,
+            description: 'UIA 树展开层数，默认 3'
+          },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 500,
+            description: '最多返回多少元素，默认 200'
+          },
+          include_offscreen: {
+            type: 'boolean',
+            description: '是否包含屏幕外元素，默认 false'
+          },
+          actionable_only: {
+            type: 'boolean',
+            description: '只返回可交互或带名称的元素，默认 true'
+          },
+          name_contains: {
+            type: 'string',
+            description: '元素名称包含的文字，不区分大小写'
+          },
+          type_contains: {
+            type: 'string',
+            description: '控件类型包含的文字，例如 Button / Edit'
+          }
+        },
+        required: ['handle'],
+        additionalProperties: false
+      }
+    },
+    async (args) => {
+      const handle = typeof args.handle === 'string' ? args.handle.trim() : ''
+      if (handle === '') throw new Error('缺少 handle')
+      const result = await callUia({
+        handle,
+        depth: Number.isFinite(Number(args.depth)) ? Number(args.depth) : 3,
+        limit: Number.isFinite(Number(args.limit)) ? Number(args.limit) : 200,
+        include_offscreen: args.include_offscreen === true,
+        actionable_only: args.actionable_only !== false,
+        name_contains: typeof args.name_contains === 'string' ? args.name_contains : '',
+        type_contains: typeof args.type_contains === 'string' ? args.type_contains : ''
+      })
+      const snapshot = await saveSnapshot(result.window, result.elements ?? [])
+      return render({
+        ...result,
+        snapshot_id: snapshot,
+        snapshot_ttl_ms: 45_000,
+        hint:
+          '下一步把 snapshot_id 和 element 编号传给 win32-input 的 click/type/scroll；超过 45 秒请重新 observe。'
+      })
     }
   )
 }
