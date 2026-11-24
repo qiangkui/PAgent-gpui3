@@ -574,12 +574,20 @@ impl DshFlowApp {
         let workspace = self.ai.workspace_dir();
         let backups = crate::backup::backup_root(&home);
         let exports = crate::backup::export_root(&home);
+        let stats = crate::stats_store::ledger_dir();
         let data_for_open = data.clone();
         let workspace_for_open = workspace.clone();
+        let stats_for_open = stats.clone();
         let location = settings_card("数据位置", palette)
             .child(settings_text_row(
                 "数据目录",
                 data.display().to_string(),
+                SettingsTone::Normal,
+                palette,
+            ))
+            .child(settings_text_row(
+                "统计账本",
+                format!("{}（明细 30 天，日汇总长期保留）", stats.display()),
                 SettingsTone::Normal,
                 palette,
             ))
@@ -629,6 +637,17 @@ impl DshFlowApp {
                         .on_click(cx.listener(move |_, _, _, _| {
                             let _ = open_path(&workspace_for_open);
                         })),
+                    )
+                    .child(
+                        settings_button(
+                            "open-stats",
+                            "打开统计账本",
+                            SettingsButton::Secondary,
+                            palette,
+                        )
+                        .on_click(cx.listener(move |_, _, _, _| {
+                            let _ = open_path(&stats_for_open);
+                        })),
                     ),
             );
 
@@ -652,7 +671,7 @@ impl DshFlowApp {
         let restore_pending = crate::backup::pending_restore(&home);
         let mut card = settings_card("备份与导出", palette)
             .child(settings_note(
-                "备份复制当前 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；\
+                "备份复制可执行文件同目录的 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；\
                  恢复会在下次启动时替换 data 与附加组件，并先自动备份当前状态；\
                  导出把当前对话写成 Markdown 到 exports/。",
                 palette,
@@ -1060,6 +1079,10 @@ impl DshFlowApp {
         ));
         text.push_str(&format!("config: {}\n", home.join("config.json").display()));
         text.push_str(&format!("data: {}\n", self.ai.data_dir().display()));
+        text.push_str(&format!(
+            "stats: {}\n",
+            crate::stats_store::ledger_dir().display()
+        ));
         text.push_str(&format!("workspace: {}\n", self.ai.workspace_dir().display()));
         text.push_str(&format!("skills: {}\n", self.skills_dir.display()));
         text.push_str(&format!("mcp: {}\n", self.mcp_dir.display()));

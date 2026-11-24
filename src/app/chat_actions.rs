@@ -943,16 +943,19 @@ impl DshFlowApp {
                         chat.touch();
                     }
                     self.pending.remove(slot);
-                    if let (Some((turn, tokens, context, calls)), Some(folder)) = (
+                    if let (Some((turn, tokens, context, calls)), Some((folder, title))) = (
                         done,
-                        self.chats.get(chat_index).map(|chat| chat.dir.clone()),
+                        self.chats
+                            .get(chat_index)
+                            .map(|chat| (chat.dir.clone(), chat.title.clone())),
                     ) {
+                        let at_ms = now_ms();
                         // A line per request: the transcript keeps the totals and
                         // the full text lives here, so the request can be opened
                         // again later without bloating `chat.json`.
                         let request = crate::chats::StoredRequest {
                             turn,
-                            at_ms: now_ms(),
+                            at_ms,
                             model,
                             tokens,
                             context,
@@ -971,6 +974,16 @@ impl DshFlowApp {
                             crate::chats::append_request(&self.ai.data_dir(), &folder, &request)
                         {
                             self.banner = Some(Banner::error(error));
+                        }
+                        // The statistics page reads this independent ledger, so a
+                        // conversation deleted later no longer removes its figures.
+                        let record = super::stats::ledger_record(&folder, &title, &request);
+                        if let Err(error) =
+                            crate::stats_store::append(&crate::stats_store::ledger_dir(), &record)
+                        {
+                            self.banner = Some(Banner::error(error));
+                        } else {
+                            self.stats_generation = self.stats_generation.saturating_add(1);
                         }
                     }
                     self.save_chats();

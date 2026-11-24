@@ -1312,8 +1312,11 @@ pub struct DshFlowApp {
     context_cache: RefCell<Option<((usize, u64, usize, usize, u64, usize), ContextReport)>>,
     /// The window the statistics page covers.
     stats_range: StatsRange,
-    /// The statistics report on show, with the conversation state and time
-    /// bucket it was built from, and the requests it read.
+    /// Bumped when a request reaches the permanent ledger, so the cached report
+    /// is rebuilt without consulting the conversation list.
+    stats_generation: u64,
+    /// The statistics report on show, with the ledger state and time bucket it
+    /// was built from, and the requests it read.
     stats_cache: RefCell<Option<(StatsKey, StatsReport, Rc<Vec<StatsPoint>>)>>,
     /// The statistics scan running in the background, and the state it was
     /// started for; `None` when nothing is being read.
@@ -1613,6 +1616,7 @@ impl DshFlowApp {
             skill_delete_confirm: None,
             context_cache: RefCell::new(None),
             stats_range: StatsRange::Week,
+            stats_generation: 0,
             stats_cache: RefCell::new(None),
             stats_loading: RefCell::new(None),
             stats_scroll: ScrollHandle::new(),
@@ -1701,6 +1705,14 @@ impl DshFlowApp {
                 "找不到引擎：{}\n设置 DSH_FLOW_HOME 指向 dsh-flow 目录后重启界面。",
                 app.engine_dir.join("src").join("cli.ts").display()
             )));
+        }
+        // Import the old per-conversation request history once. After this point
+        // the statistics page reads only the permanent ledger, so deleting a
+        // conversation cannot change past figures.
+        match app.migrate_stats() {
+            Ok(true) => app.stats_generation = app.stats_generation.saturating_add(1),
+            Ok(false) => {}
+            Err(error) => app.banner = Some(Banner::error(format!("统计迁移失败：{error}"))),
         }
         // What was typed but not sent comes back with the window.
         app.restore_draft(app.active_chat);

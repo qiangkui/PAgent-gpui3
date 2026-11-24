@@ -1,11 +1,10 @@
 //! The statistics page: what the assistant was asked over a chosen window.
 //!
-//! Every card reads from one series: the per-request lines in each
-//! conversation's `requests.jsonl`. Each line carries the time the answer
-//! arrived, the model that wrote it and the tokens the endpoint billed, which is
-//! exactly what "requests per day" and "tokens per hour" need. A conversation
-//! saved before that file existed falls back to its answers' totals at the time
-//! the conversation was last touched, so older work is not silently missing.
+//! Every card reads from the permanent statistics ledger in
+//! `<program>/data/stats`: request details for the last 30 days, plus one
+//! permanent aggregate per UTC day. Deleting a conversation never changes these
+//! figures. The one-time migration in `stats_store` imports the older
+//! per-conversation request files when the ledger is first created.
 
 use super::*;
 use std::collections::{HashMap, HashSet};
@@ -166,19 +165,15 @@ impl StatsRange {
     }
 }
 
-/// What a cached report was built from: the window, the conversations and the
-/// bucket `now` falls in. Any change to one of them rebuilds the report; a
-/// bucket boundary moves it forward on its own, without waiting for a request.
+/// What a cached report was built from: the window, the ledger generation and
+/// the bucket `now` falls in. It deliberately does not include the conversation
+/// list: deleting a conversation must leave the historical figures alone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StatsKey {
     /// Window on show.
     pub(crate) range: StatsRange,
-    /// How many conversations the report was built over.
-    pub(crate) chats: usize,
-    /// Sum of their last-change times, so a new answer invalidates it.
-    pub(crate) updated: u64,
-    /// Sum of their message counts, so an edit that keeps the time counts too.
-    pub(crate) messages: u64,
+    /// Bumped whenever a request is appended or the ledger is migrated.
+    pub(crate) generation: u64,
     /// Which bucket `now` fell in when the report was built.
     pub(crate) bucket: u64,
 }
@@ -189,6 +184,8 @@ pub(crate) struct StatsPoint {
     pub(crate) at_ms: u64,
     /// Folder of the conversation it belongs to.
     pub(crate) chat: String,
+    /// Conversation title at the time of the request.
+    pub(crate) title: String,
     /// Which question it was in that conversation, counting from one.
     pub(crate) turn: u64,
     /// What was asked, as the request list names it; empty when the save did
@@ -268,6 +265,8 @@ impl StatsReport {
 pub(crate) struct StatsJob {
     /// Folder of the conversation.
     pub(crate) dir: String,
+    /// Title shown in the sidebar, kept with the imported records.
+    pub(crate) title: String,
     /// When it last changed, in epoch milliseconds.
     pub(crate) updated_ms: u64,
     /// Its transcript, empty when the request file can answer for it.
@@ -285,6 +284,7 @@ pub(crate) fn stats_points(data_dir: &Path, chats: &[Chat], since_ms: u64) -> Ve
         .iter()
         .map(|chat| StatsJob {
             dir: chat.dir.clone(),
+            title: chat.title.clone(),
             updated_ms: chat.updated_ms,
             messages: chat.messages.clone(),
         })
@@ -380,6 +380,7 @@ pub(crate) fn stats_points_for(
                 points.push(StatsPoint {
                     at_ms: request.at_ms,
                     chat: chat.dir.clone(),
+                    title: chat.title.clone(),
                     turn: request.turn,
                     question: request_question(request),
                     model: request.model.clone(),
@@ -442,6 +443,7 @@ pub(crate) fn stats_points_for(
                     points.push(StatsPoint {
                         at_ms: chat.updated_ms,
                         chat: chat.dir.clone(),
+                        title: chat.title.clone(),
                         turn,
                         question: std::mem::take(&mut pending_question),
                         model,
@@ -526,6 +528,140 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
     });
     report
 }
+/// Turn a completed request into a permanent ledger record.
+pub(crate) fn ledger_record(
+    chat: &str,
+    title: &str,
+    request: &crate::chats::StoredRequest,
+) -> crate::stats_store::StatsRecord {
+    let tools = if request.calls > 0 {
+        request.calls
+    } else {
+        request
+            .items
+            .iter()
+            .filter(|item| item.kind == ContextKind::ToolResults.key())
+            .count() as u64
+    };
+    crate::stats_store::StatsRecord {
+        at_ms: request.at_ms,
+        chat: chat.to_string(),
+        title: title.to_string(),
+        turn: request.turn,
+        question: request_question(request),
+        model: request.model.clone(),
+        tokens: request.tokens,
+        context: request.context,
+        tools,
+        estimated: false,
+    }
+}
+
+/// Turn a persisted record into the row shape the page already renders.
+fn point_from_record(record: crate::stats_store::StatsRecord) -> StatsPoint {
+    StatsPoint {
+        at_ms: record.at_ms,
+        chat: record.chat,
+        title: record.title,
+        turn: record.turn,
+        question: record.question,
+        model: record.model,
+        tokens: record.tokens,
+        context: record.context,
+        tools: record.tools,
+        estimated: record.estimated,
+    }
+}
+
+/// Turn a request read from a conversation into a ledger record, used only for
+/// the one-time import of the old statistics model.
+fn record_from_point(point: StatsPoint) -> crate::stats_store::StatsRecord {
+    crate::stats_store::StatsRecord {
+        at_ms: point.at_ms,
+        chat: point.chat,
+        title: point.title,
+        turn: point.turn,
+        question: point.question,
+        model: point.model,
+        tokens: point.tokens,
+        context: point.context,
+        tools: point.tools,
+        estimated: point.estimated,
+    }
+}
+
+/// Build a report from permanent daily aggregates. Used for the 90-day window,
+/// whose first 60 days no longer have request details.
+fn report_from_daily(
+    days: &[crate::stats_store::DayRollup],
+    range: StatsRange,
+    now_ms: u64,
+) -> StatsReport {
+    let (start_ms, end_ms) = range.window(now_ms);
+    let count = range.buckets();
+    let mut buckets: Vec<StatsBucket> = (0..count).map(|_| StatsBucket::default()).collect();
+    let mut seen: Vec<HashSet<String>> = (0..count).map(|_| HashSet::new()).collect();
+    let mut chats: HashSet<String> = HashSet::new();
+    let mut models: HashMap<String, ModelShare> = HashMap::new();
+    let mut report = StatsReport {
+        buckets: Vec::new(),
+        requests: 0,
+        tokens: 0,
+        tools: 0,
+        prompt: 0,
+        chats: 0,
+        models: Vec::new(),
+        start_ms,
+        estimated: false,
+    };
+    for day in days {
+        if day.day_ms < start_ms || day.day_ms >= end_ms {
+            continue;
+        }
+        let Some(index) = range.bucket_of(day.day_ms, start_ms) else {
+            continue;
+        };
+        let bucket = &mut buckets[index];
+        bucket.requests = bucket.requests.saturating_add(day.requests);
+        bucket.tokens = bucket.tokens.saturating_add(day.tokens);
+        bucket.prompt = bucket.prompt.saturating_add(day.prompt);
+        for chat in &day.chats {
+            seen[index].insert(chat.clone());
+            chats.insert(chat.clone());
+        }
+        report.requests = report.requests.saturating_add(day.requests);
+        report.tokens = report.tokens.saturating_add(day.tokens);
+        report.tools = report.tools.saturating_add(day.tools);
+        report.prompt = report.prompt.saturating_add(day.prompt);
+        report.estimated |= day.estimated;
+        for (name, counts) in &day.models {
+            let name = name.trim();
+            let name = if name.is_empty() { "未知模型" } else { name };
+            let entry = models.entry(name.to_string()).or_insert(ModelShare {
+                model: name.to_string(),
+                requests: 0,
+                tokens: 0,
+            });
+            entry.requests = entry.requests.saturating_add(counts.requests);
+            entry.tokens = entry.tokens.saturating_add(counts.tokens);
+        }
+    }
+    for (index, filled) in seen.iter().enumerate() {
+        buckets[index].chats = filled.len() as u64;
+    }
+    report.buckets = buckets;
+    report.chats = chats.len() as u64;
+    report.models = models.into_values().collect();
+    report.models.sort_by(|left, right| {
+        right
+            .tokens
+            .cmp(&left.tokens)
+            .then_with(|| right.requests.cmp(&left.requests))
+            .then_with(|| left.model.cmp(&right.model))
+    });
+    report
+}
+
 impl DshFlowApp {
     /// Switch the window the page covers.
     pub(crate) fn set_stats_range(&mut self, range: StatsRange, cx: &mut Context<Self>) {
@@ -536,26 +672,16 @@ impl DshFlowApp {
         }
     }
 
-    /// The report for the window on show, rebuilt only when the conversations
-    /// or the bucket `now` falls in have changed.
+    /// The report for the window on show, rebuilt when the ledger or the bucket
+    /// `now` falls in have changed.
     ///
-    /// Building it reads every conversation's request file, which is far too
-    /// much to do on a repaint once the history has grown: the read happens on a
-    /// worker thread, and the page shows the previous report until it lands.
+    /// Reading the ledger is done on a worker thread; the page keeps showing the
+    /// previous report until the new one lands.
     pub(crate) fn stats_snapshot(&self, cx: &mut Context<Self>) -> StatsReport {
         let now = now_ms();
         let key = StatsKey {
             range: self.stats_range,
-            chats: self.chats.len(),
-            updated: self
-                .chats
-                .iter()
-                .fold(0u64, |sum, chat| sum.saturating_add(chat.updated_ms)),
-            messages: self
-                .chats
-                .iter()
-                .map(|chat| chat.messages.len() as u64)
-                .sum(),
+            generation: self.stats_generation,
             bucket: now / self.stats_range.bucket_ms(),
         };
         let cached = self.stats_cache.borrow().as_ref().cloned();
@@ -578,6 +704,7 @@ impl DshFlowApp {
             .iter()
             .map(|chat| StatsJob {
                 dir: chat.dir.clone(),
+                title: chat.title.clone(),
                 updated_ms: chat.updated_ms,
                 messages: if crate::chats::has_requests(data, &chat.dir) {
                     Vec::new()
@@ -588,16 +715,50 @@ impl DshFlowApp {
             .collect()
     }
 
-    /// Read the history on a worker thread and store the report when it arrives.
-    fn schedule_stats(&self, now: u64, key: StatsKey, cx: &mut Context<Self>) {
+    /// Import the old per-conversation request records into the permanent
+    /// ledger once. New requests are appended directly from `chat_actions`.
+    fn migration_records(&self) -> Vec<crate::stats_store::StatsRecord> {
         let data = self.ai.data_dir();
-        let chats = self.stats_jobs(&data);
+        let jobs = self.stats_jobs(&data);
+        stats_points_for(&data, &jobs, 0)
+            .into_iter()
+            .map(record_from_point)
+            .collect()
+    }
+
+    /// Run the one-time import if the ledger has not been initialized.
+    pub(crate) fn migrate_stats(&mut self) -> Result<bool, String> {
+        let dir = crate::stats_store::ledger_dir();
+        if crate::stats_store::initialized(&dir) {
+            crate::stats_store::prune_details(&dir)?;
+        }
+        crate::stats_store::migrate_if_needed(&dir, &self.migration_records())
+    }
+
+    /// Read the ledger on a worker thread and store the report when it arrives.
+    fn schedule_stats(&self, now: u64, key: StatsKey, cx: &mut Context<Self>) {
+        let dir = crate::stats_store::ledger_dir();
         let range = self.stats_range;
         let (sender, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let (start, _) = range.window(now);
-            let points = stats_points_for(&data, &chats, start);
-            let report = stats_report(&points, range, now);
+            let (start, end) = range.window(now);
+            let points: Vec<StatsPoint> = crate::stats_store::load_records(&dir, start, end)
+                .into_iter()
+                .map(point_from_record)
+                .collect();
+            // A quarter spans more than the 30-day detail window, so its cards
+            // come from the permanent daily rollups. The other ranges fit in the
+            // detail file and keep their exact request times.
+            let report = if range == StatsRange::Quarter {
+                let days = crate::stats_store::load_daily(&dir, start, end);
+                if days.is_empty() {
+                    stats_report(&points, range, now)
+                } else {
+                    report_from_daily(&days, range, now)
+                }
+            } else {
+                stats_report(&points, range, now)
+            };
             let _ = sender.send((report, points));
         });
         *self.stats_loading.borrow_mut() = Some(key);
@@ -685,7 +846,16 @@ impl DshFlowApp {
                 continue;
             }
             let found = self.chats.iter().find(|chat| chat.dir == point.chat);
-            let title = found.map_or_else(|| point.chat.clone(), |chat| chat.title.clone());
+            let title = found.map_or_else(
+                || {
+                    if point.title.trim().is_empty() {
+                        point.chat.clone()
+                    } else {
+                        point.title.clone()
+                    }
+                },
+                |chat| chat.title.clone(),
+            );
             let label = if point.estimated {
                 format!("≈ {}", ago(point.at_ms))
             } else {
@@ -737,7 +907,7 @@ impl DshFlowApp {
             .w_full()
             .child(card_heading(
                 "请求明细",
-                "点表头排序 · Shift 连选",
+                "最近 30 天 · 点表头排序 · Shift 连选",
                 palette,
             ))
             .child(table)
@@ -844,9 +1014,9 @@ impl DshFlowApp {
                 )
         });
         let note = if report.estimated {
-            "数据来自每个对话的 requests.jsonl；更早的对话没有请求明细，按对话最后更新时间估算，次数可能偏少。"
+            "数据来自持久统计账本；历史迁移记录按对话最后更新时间估算，次数可能偏少。请求明细保留 30 天，日汇总长期保留。"
         } else {
-            "数据来自每个对话的 requests.jsonl；时间取回答到达的那一刻，窗口按 UTC 对齐。"
+            "数据来自持久统计账本；时间取回答到达的那一刻，窗口按 UTC 对齐。请求明细保留 30 天，日汇总长期保留。"
         };
         let mut content = div()
             .w_full()
@@ -1512,6 +1682,7 @@ mod tests {
         StatsPoint {
             at_ms,
             chat: chat.to_string(),
+            title: chat.to_string(),
             turn: 0,
             question: String::new(),
             model: model.to_string(),
@@ -1751,5 +1922,52 @@ mod tests {
         assert_eq!(points[0].question, "第一个问题");
         assert_eq!(points[1].turn, 2);
         assert_eq!(points[1].question, "第二个问题");
+    }
+#[test]
+    fn daily_rollups_supply_quarter_cards() {
+        let now = 20_780 * DAY_MS + 12 * HOUR_MS;
+        let range = StatsRange::Quarter;
+        let (start, _) = range.window(now);
+        let mut first = crate::stats_store::DayRollup {
+            day_ms: start,
+            requests: 2,
+            tokens: 100,
+            prompt: 80,
+            tools: 3,
+            chats: vec!["chat-1".to_string()],
+            ..crate::stats_store::DayRollup::default()
+        };
+        first.models.insert(
+            "m1".to_string(),
+            crate::stats_store::ModelCount {
+                requests: 2,
+                tokens: 100,
+            },
+        );
+        let mut second = crate::stats_store::DayRollup {
+            day_ms: start + 2 * DAY_MS,
+            requests: 1,
+            tokens: 50,
+            prompt: 40,
+            tools: 1,
+            chats: vec!["chat-1".to_string(), "chat-2".to_string()],
+            ..crate::stats_store::DayRollup::default()
+        };
+        second.models.insert(
+            "m2".to_string(),
+            crate::stats_store::ModelCount {
+                requests: 1,
+                tokens: 50,
+            },
+        );
+        let report = report_from_daily(&[first, second], range, now);
+        assert_eq!(report.requests, 3);
+        assert_eq!(report.tokens, 150);
+        assert_eq!(report.prompt, 120);
+        assert_eq!(report.tools, 4);
+        assert_eq!(report.chats, 2);
+        assert_eq!(report.average_tokens(), 50);
+        assert_eq!(report.buckets[0].chats, 2);
+        assert_eq!(report.models.len(), 2);
     }
 }

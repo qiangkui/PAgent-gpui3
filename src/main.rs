@@ -33,6 +33,7 @@ mod sidebar_store;
 mod single_instance;
 mod skill;
 mod snippet;
+mod stats_store;
 mod store;
 mod text_input;
 mod theme;
