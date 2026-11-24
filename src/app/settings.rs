@@ -111,6 +111,7 @@ impl DshFlowApp {
                         view.refresh_plugins(cx);
                         view.refresh_skills(cx);
                         view.refresh_mcp(cx);
+                        view.sync_mode_name_field();
                     }
                     cx.notify();
                 }))

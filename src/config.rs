@@ -753,7 +753,13 @@ impl AiSettings {
         self.modes
             .iter()
             .find(|mode| mode.id == id)
-            .map_or_else(|| "全量模式".to_string(), |mode| mode.name.clone())
+            .map_or_else(|| "全量模式".to_string(), |mode| {
+                if mode.name.trim().is_empty() {
+                    "自定义模式".to_string()
+                } else {
+                    mode.name.clone()
+                }
+            })
     }
 
     /// Whether a mode id is known. Unknown ids fall back to full mode.

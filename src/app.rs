@@ -1036,6 +1036,8 @@ pub(crate) enum Field {
     ColorHex(usize),
     /// The HTTP proxy the engine's provider calls go through.
     Proxy,
+    /// Name of the custom mode selected in settings.
+    ModeName,
 }
 
 impl Field {
@@ -1390,6 +1392,8 @@ pub struct DshFlowApp {
     mode_selected: String,
     /// Note under the mode editor after a create/delete/toggle.
     mode_note: String,
+    /// Rename box for the selected custom mode.
+    mode_name: TextField,
     /// True while the composer's mode menu is open.
     mode_menu: bool,
     /// The conversation-only instruction box.
@@ -1673,6 +1677,7 @@ impl DshFlowApp {
             settings_tab: SettingsTab::Interface,
             mode_selected: crate::config::MODE_FULL.to_string(),
             mode_note: String::new(),
+            mode_name: TextField::new(cx),
             mode_menu: false,
             instructions: TextField::new(cx),
             instructions_chat: None,

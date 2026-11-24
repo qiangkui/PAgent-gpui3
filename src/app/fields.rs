@@ -77,6 +77,7 @@ impl DshFlowApp {
             Field::ChatInstructions => Some(&self.instructions),
             Field::ColorHex(index) => self.color_fields.get(index),
             Field::Proxy => Some(&self.proxy_field),
+            Field::ModeName => Some(&self.mode_name),
         }
     }
 
@@ -105,6 +106,7 @@ impl DshFlowApp {
             Field::ChatInstructions => Some(&mut self.instructions),
             Field::ColorHex(index) => self.color_fields.get_mut(index),
             Field::Proxy => Some(&mut self.proxy_field),
+            Field::ModeName => Some(&mut self.mode_name),
         }
     }
 
@@ -929,6 +931,7 @@ pub(crate) fn field_slot(slot: Field) -> usize {
         Field::ChatInstructions => 6000,
         Field::ColorHex(index) => 7000 + index,
         Field::Proxy => 8000,
+        Field::ModeName => 8001,
     }
 }
 

@@ -94,6 +94,19 @@ impl DshFlowApp {
                 .flex()
                 .flex_col()
                 .gap_4()
+                .child(
+                    settings_card("模式名称", palette)
+                        .child(settings_note(
+                            "修改后会立即保存，并同步到设置页和聊天输入框的模式按钮。",
+                            palette,
+                        ))
+                        .child(self.render_field(
+                            Field::ModeName,
+                            "例如：写作、代码审阅、只读分析",
+                            palette,
+                            cx,
+                        )),
+                )
                 .child(self.render_mode_plugins(mode, palette, cx))
                 .child(self.render_mode_skills(mode, palette, cx))
                 .child(self.render_mode_mcp(mode, palette, cx))
@@ -324,6 +337,54 @@ enum ModeResource {
     Mcp,
 }
 impl DshFlowApp {
+    /// Copy the selected custom mode's name into the rename box.
+    pub(crate) fn sync_mode_name_field(&mut self) {
+        let name = self
+            .ai
+            .modes
+            .iter()
+            .find(|mode| mode.id == self.mode_selected)
+            .map(|mode| mode.name.clone())
+            .unwrap_or_default();
+        if self.mode_name.text != name {
+            self.mode_name.set_text(name);
+        }
+    }
+
+    /// Save the rename box when it changes.
+    pub(crate) fn commit_mode_name(&mut self, cx: &mut Context<Self>) {
+        if self.mode_selected == crate::config::MODE_BASIC
+            || self.mode_selected == crate::config::MODE_FULL
+        {
+            return;
+        }
+        let name: String = self
+            .mode_name
+            .text
+            .trim()
+            .chars()
+            .take(80)
+            .collect::<String>();
+        if name.trim().is_empty() {
+            self.mode_note = "模式名称不能为空。".to_string();
+            cx.notify();
+            return;
+        }
+        let selected = self.mode_selected.clone();
+        let Some(mode) = self.ai.modes.iter_mut().find(|mode| mode.id == selected) else {
+            return;
+        };
+        if mode.name == name {
+            return;
+        }
+        mode.name = name;
+        self.mode_note = match self.ai.save() {
+            Ok(()) => "模式名称已保存。".to_string(),
+            Err(error) => error,
+        };
+        cx.notify();
+    }
+
     fn toggle_mode_resource(&mut self, kind: ModeResource, id: &str, cx: &mut Context<Self>) {
         if !self.ai.mode_exists(&self.mode_selected)
             || self.mode_selected == crate::config::MODE_BASIC
@@ -371,6 +432,7 @@ impl DshFlowApp {
             self.mode_note = "已新建模式，选择下方三个列表中的资源。".to_string();
         }
         self.mode_selected = id;
+        self.sync_mode_name_field();
         cx.notify();
     }
 
@@ -393,6 +455,7 @@ impl DshFlowApp {
         }
         if self.mode_selected == id {
             self.mode_selected = crate::config::MODE_FULL.to_string();
+            self.sync_mode_name_field();
         }
         self.mode_menu = false;
         cx.notify();
@@ -556,6 +619,7 @@ fn mode_row(
         .hover(move |style| style.bg(rgb(palette.panel_soft)))
         .on_click(cx.listener(move |view, _, _, cx| {
             view.mode_selected = select.clone();
+            view.sync_mode_name_field();
             view.mode_note.clear();
             cx.notify();
         }))

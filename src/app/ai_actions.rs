@@ -241,6 +241,10 @@ impl DshFlowApp {
             self.commit_color_edit(index, cx);
             return;
         }
+        if slot == Field::ModeName {
+            self.commit_mode_name(cx);
+            return;
+        }
         if slot == Field::Proxy {
             let proxy = self.proxy_field.text.trim().to_string();
             if proxy != self.ai.proxy {
