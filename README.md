@@ -44,6 +44,14 @@ node src/cli.ts run examples/repo-health/flow.yml --input repo=.
 
 界面查找引擎的顺序：`DSH_FLOW_HOME` → 项目/可执行文件附近的 `dsh-flow/` → 当前目录下的 `dsh-flow/`。便携发布包会把引擎放在 exe 旁边。
 
+## 外部插件
+
+插件放在 `<home>/plugins/<id>/`，入口由 `plugin.json` 的 `main` 指定，必须导出 `activate(api)`。仓库里的 `plugins/win32-windows/` 是只读 Win32 窗口检查插件：
+
+- 需要 Python 在 PATH 中；
+- 在“插件”页启用后可让模型调用 `win32_list_windows` / `win32_window_info`；
+- 只枚举窗口，不点击、不修改。
+
 ## 测试
 
 ```powershell
@@ -62,7 +70,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\release.ps1
 
 1. 跑 Rust 测试和引擎检查/测试（可用 `-SkipTests` 跳过）；
 2. 构建 release 可执行文件；
-3. 生成 `dist\PAgent-<version>-<stamp>\`，内含 exe、`dsh-flow/`、README、CHANGELOG 与 LICENSE；
+3. 生成 `dist\PAgent-<version>-<stamp>\`，内含 exe、`dsh-flow/`、`plugins/`、README、CHANGELOG 与 LICENSE；
 4. 打成 zip 并输出 SHA-256。
 
 ## 数据位置

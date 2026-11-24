@@ -1,0 +1,6 @@
+{
+  "name": "Win32 窗口检查",
+  "version": "1.0.0",
+  "api": 1,
+  "main": "index.js"
+}

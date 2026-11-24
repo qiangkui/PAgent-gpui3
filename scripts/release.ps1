@@ -48,6 +48,15 @@ Get-ChildItem -LiteralPath (Join-Path $root 'dsh-flow') -Force |
     Where-Object { $_.Name -notin @('node_modules', 'out', '.dsh-flow') } |
     Copy-Item -Destination $engine -Recurse -Force
 
+$plugins = Join-Path $root 'plugins'
+if (Test-Path -LiteralPath $plugins) {
+    $stagedPlugins = Join-Path $stage 'plugins'
+    New-Item -ItemType Directory -Force -Path $stagedPlugins | Out-Null
+    Get-ChildItem -LiteralPath $plugins -Force |
+        Where-Object { $_.Name -ne 'node_modules' } |
+        Copy-Item -Destination $stagedPlugins -Recurse -Force
+}
+
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -Force
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
 
