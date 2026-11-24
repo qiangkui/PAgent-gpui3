@@ -1,0 +1,29 @@
+name: repo-health
+description: Repo health check — fully deterministic, zero model calls
+version: 1
+
+inputs:
+  repo:
+    description: Repository directory to inspect
+    default: .
+  maxFiles:
+    description: Give up counting after this many files
+    default: 20000
+
+steps:
+  - id: tooling
+    desc: Record the interpreter versions used by later steps
+    run: [git, --version]
+    save: gitVersion
+
+  - id: counts
+    desc: Count tracked-looking files and their total size
+    run: [python, steps/count_files.py]
+    save: counts
+
+  - id: verdict
+    desc: Summarize without touching a model
+    when: "steps.counts.json.files > 0"
+    set:
+      summary: "{{ vars.counts.files }} files / {{ vars.counts.kib }} KiB · {{ vars.gitVersion | trim }}"
+    save: report

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A framed picture: the "图片" attachment option. -->
+  <g fill="#000">
+    <path fill-rule="evenodd" d="M6.5 2h11A2.5 2.5 0 0 1 20 4.5v15a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2zm0 2v11.1l3.3-3.3a1.5 1.5 0 0 1 2.1 0l2.3 2.3 1.6-1.6a1.5 1.5 0 0 1 2.2 0l2 2V4h-13z"/>
+    <circle cx="9" cy="8" r="1.8"/>
+  </g>
+</svg>

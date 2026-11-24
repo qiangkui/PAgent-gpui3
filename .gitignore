@@ -1,0 +1,19 @@
+# Build output
+/target/
+/dist/
+/backups/
+/out/
+
+# Runtime data and local traces
+/data/
+**/.dsh-flow/
+*.log
+
+# Node dependencies
+/dsh-flow/node_modules/
+
+# Editor / OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

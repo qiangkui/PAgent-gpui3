@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A magnifier: a ring with a diagonal handle, filled so the renderer can
+       tint it with the theme colour. -->
+  <g fill="#000">
+    <path fill-rule="evenodd" d="M10.5 3a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15zm0 2.6a4.9 4.9 0 1 1 0 9.8 4.9 4.9 0 0 1 0-9.8z"/>
+    <rect x="15.4" y="15.4" width="3.2" height="7.2" rx="1.6" transform="rotate(-45 17 19)"/>
+  </g>
+</svg>

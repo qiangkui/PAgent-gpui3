@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A page with text lines: the "文本" attachment option. Alpha only, so
+       the theme supplies the colour. -->
+  <g fill="#000">
+    <path fill-rule="evenodd" d="M6 2h8l4 4v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm0 2v16h10V9h-4V4H6z"/>
+    <path d="M8.5 11.4h7v1.6h-7zM8.5 15h7v1.6h-7zM8.5 18.4h4.6v1.6H8.5z"/>
+  </g>
+</svg>

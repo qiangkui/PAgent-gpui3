@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Three dots: the menu button at the end of a folder row. Alpha only, so
+       the theme supplies the colour. -->
+  <g fill="#000">
+    <circle cx="5" cy="12" r="2.1"/>
+    <circle cx="12" cy="12" r="2.1"/>
+    <circle cx="19" cy="12" r="2.1"/>
+  </g>
+</svg>

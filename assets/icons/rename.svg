@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A filled pencil: "rename". Filled shapes survive being drawn at 13px;
+       alpha only, so the theme supplies the colour. -->
+  <path d="M3.2 17.2V20.8h3.6L17.4 10.2l-3.6-3.6z" fill="#000"/>
+  <path d="M20.5 7.1a1 1 0 0 0 0-1.4l-2.2-2.2a1 1 0 0 0-1.4 0l-1.8 1.8 3.6 3.6z" fill="#000"/>
+</svg>

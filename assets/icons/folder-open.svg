@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- An opened folder: the tree row of an unfolded category. The back plate is a
+       complete folder (tab included), so the silhouette is never holey; the front
+       cover is drawn on top, pushed a little right and a little lower, so the step
+       on its right edge and its deeper bottom edge are what say "opened". -->
+  <g fill="#000">
+    <path d="M2.6 7.3A2.5 2.5 0 0 1 5.1 4.8h3.3c.66 0 1.28.27 1.72.75l.98 1.06c.23.25.56.39.9.39h5.5a2.5 2.5 0 0 1 2.5 2.5v9.9H2.6z"/>
+    <path d="M5.2 9.6h14.3a2 2 0 0 1 1.95 2.45l-1.33 6.1a2.5 2.5 0 0 1-2.44 1.95H4.4a2 2 0 0 1-1.95-2.45l1.33-6.1A2.5 2.5 0 0 1 5.2 9.6z"/>
+  </g>
+</svg>

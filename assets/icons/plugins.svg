@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Nudged right and up so the piece reads as centred in its 18px button. -->
+  <rect x="3.3" y="4.5" width="16" height="16" rx="2.2" fill="#000"/>
+  <circle cx="11.3" cy="4.5" r="3.4" fill="#000"/>
+  <circle cx="19.3" cy="12.5" r="3.4" fill="#000"/>
+</svg>

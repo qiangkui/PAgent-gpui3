@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Three bars plus a baseline: "statistics", drawn as filled shapes so the
+       renderer can tint it with the theme colour. -->
+  <g fill="#000">
+    <rect x="3.4" y="12.5" width="4.2" height="8.1" rx="1.1"/>
+    <rect x="9.9" y="7.4" width="4.2" height="13.2" rx="1.1"/>
+    <rect x="16.4" y="3.4" width="4.2" height="17.2" rx="1.1"/>
+  </g>
+</svg>

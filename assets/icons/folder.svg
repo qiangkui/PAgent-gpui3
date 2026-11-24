@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A closed folder: the tree row of a folded category. Filled and alpha
+       only, so the theme supplies the colour. -->
+  <path fill="#000" d="M3 7A2 2 0 0 1 5 5h3.7l2 2H19a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+</svg>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A thin, centred plus for the composer's round add button. Strokes only,
+       fully symmetric, so the glyph sits dead centre inside its circle. -->
+  <g fill="none" stroke="#000" stroke-width="1.5" stroke-linecap="round">
+    <path d="M12 4.8v14.4"/>
+    <path d="M4.8 12h14.4"/>
+  </g>
+</svg>

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Two sheets, both outlined so the shape still reads at 13px. Alpha only;
+       the theme supplies the colour. -->
+  <g fill="none" stroke="#000" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M8.6 5.6h8.2A1.6 1.6 0 0 1 18.4 7.2v8.4"/>
+    <rect x="5" y="9.4" width="9.6" height="9.6" rx="1.6"/>
+  </g>
+</svg>

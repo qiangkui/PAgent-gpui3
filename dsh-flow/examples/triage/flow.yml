@@ -1,0 +1,45 @@
+name: triage
+description: 把一条用户反馈归一化并归类 —— 整条流程只有一个判断点要问模型
+version: 1
+
+inputs:
+  note:
+    description: 用户反馈原文
+    default: 登录后页面白屏，控制台没有报错
+
+steps:
+  - id: normalize
+    desc: 折叠空白，得到可比较的正文
+    run: [python, steps/normalize.py]
+    save: note
+
+  - id: classify
+    desc: 归类并给出一句话理由（唯一需要模型的地方）
+    why: 自然语言反馈的归类无法用规则穷举，写死的关键词会把“白屏是不是 bug”判错
+    save: verdict
+    ai:
+      # backend / command 指向本地替身，示例因此不需要 API Key 也能跑通。
+      # 删掉这两行就会走真实模型（读 DEEPSEEK_API_KEY，或由界面里的接入点提供）。
+      backend: cli
+      command: [python, steps/classify.py]
+      temperature: 0
+      prompt: |
+        把下面的用户反馈归类为 bug / question / other，并给出不超过 20 字的理由。
+
+        反馈：{{ steps.normalize.json.note }}
+      schema:
+        type: object
+        required: [category, reason]
+        properties:
+          category:
+            type: string
+            enum: [bug, question, other]
+          reason:
+            type: string
+            maxLength: 40
+
+  - id: summarize
+    desc: 用分类结果拼一行摘要
+    set:
+      line: "{{ vars.verdict.category }} — {{ vars.verdict.reason }}"
+    save: summary

@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Rust tests
+        run: cargo test --release
+
+      - name: Rust clippy
+        run: cargo clippy --release --all-targets --message-format=short
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: dsh-flow/package-lock.json
+
+      - name: Engine dependencies
+        working-directory: dsh-flow
+        run: npm ci --ignore-scripts
+
+      - name: Engine type check
+        working-directory: dsh-flow
+        run: npm run check
+
+      - name: Engine tests
+        working-directory: dsh-flow
+        run: npm test

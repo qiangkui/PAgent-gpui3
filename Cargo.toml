@@ -1,0 +1,29 @@
+[package]
+name = "dsh-flow-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.14" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.14", features = ["font-kit"] }
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+# Clipboard screenshots arrive as a raw DIB; the crate turns it into PNG bytes an
+# image attachment can carry. Both formats are already in the dependency graph
+# through gpui, so this adds no new transitive crates.
+image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
+
+# Only for grabbing the native handle of the settings window, so Windows can
+# round its corners and drop the 1px frame border.
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+
+# A debug build is what `cargo build` produces, and GPUI apps are unusable
+# without optimised dependencies: text shaping, layout and painting live in
+# gpui, taffy and the font crates, not in this crate. Our own code only needs a
+# little optimisation to keep typing smooth, and staying at 1 keeps rebuilds
+# quick.
+[profile.dev]
+opt-level = 3
+
+[profile.dev.package."*"]
+opt-level = 3

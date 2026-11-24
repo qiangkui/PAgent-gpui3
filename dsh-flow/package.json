@@ -1,0 +1,23 @@
+{
+  "name": "dsh-flow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Deterministic-first workflow runner: manifests describe order and data flow, steps are real programs in any language",
+  "type": "module",
+  "bin": {
+    "dsh-flow": "./src/cli.ts"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "check": "tsc --noEmit",
+    "demo": "node src/cli.ts run examples/repo-health/flow.yml --input repo=."
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "typescript": "^5.9.3"
+  }
+}

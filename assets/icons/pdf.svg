@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- A page with a filled foot band: the "PDF" attachment option, kept
+       distinct from the text page at small sizes. -->
+  <g fill="#000">
+    <path fill-rule="evenodd" d="M6 2h8l4 4v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zm0 2v16h10V9h-4V4H6z"/>
+    <path d="M8.5 10.8h7v1.6h-7z"/>
+    <path d="M7.8 16.2h8.4a1.2 1.2 0 0 1 0 2.4H7.8a1.2 1.2 0 0 1 0-2.4z"/>
+  </g>
+</svg>

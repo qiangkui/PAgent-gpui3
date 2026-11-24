@@ -1,0 +1,6 @@
+{
+  "inputs": {
+    "repo": "fixtures/sample",
+    "maxFiles": 20000
+  }
+}

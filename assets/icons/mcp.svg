@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <!-- Two linked nodes: one server, one tool, joined by a connector. -->
+  <g fill="#000">
+    <rect x="2.6" y="6.4" width="7.4" height="11.2" rx="2"/>
+    <rect x="14" y="6.4" width="7.4" height="11.2" rx="2"/>
+    <rect x="9.6" y="10.7" width="4.8" height="2.6" rx="1.1"/>
+  </g>
+</svg>

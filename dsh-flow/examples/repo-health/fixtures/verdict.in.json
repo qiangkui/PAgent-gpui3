@@ -1,0 +1,21 @@
+{
+  "vars": {
+    "counts": {
+      "files": 3,
+      "kib": 0.0
+    },
+    "gitVersion": "git version 2.0.0\n"
+  },
+  "steps": {
+    "counts": {
+      "id": "counts",
+      "kind": "run",
+      "status": "ok",
+      "durationMs": 1,
+      "json": {
+        "files": 3,
+        "kib": 0.0
+      }
+    }
+  }
+}
