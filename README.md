@@ -53,6 +53,8 @@ node src/cli.ts run examples/repo-health/flow.yml --input repo=.
 - `win32_observe` 用 UI Automation 读取控件树，返回元素编号、名称、类型、中心坐标、密码框标记和 45 秒快照；
 - 只读，不点击、不修改。
 
+另有 `plugins/office/`：`office_open` / `office_status` / `office_read` / `office_edit` / `office_save` / `office_close` / `office_help`，通过 Windows Office COM 直接操作已打开的 Word/Excel（Word 段落、表格、样式；Excel 单元格、公式、格式、工作表与图表），支持 `dry_run`、保存/另存为/PDF 和受限制的关闭。需要本机安装 Microsoft Office 或 WPS，默认不启用。
+
 另有 `plugins/win32-input/`：`win32_focus` / `win32_click` / `win32_scroll` / `win32_type` / `win32_keys` / `win32_drag` / `win32_wait`。优先接收 `win32_observe` 的 `snapshot` + `element`，拒绝过期快照和密码框输入；默认不启用，所有操作都需审批，并支持 `dry_run` 先验证不执行。
 
 ## 测试
