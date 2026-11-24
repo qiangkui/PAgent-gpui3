@@ -42,7 +42,7 @@ node src/cli.ts validate examples/repo-health/flow.yml
 node src/cli.ts run examples/repo-health/flow.yml --input repo=.
 ```
 
-界面查找引擎的顺序：项目内 `dsh-flow/` → 可执行文件旁的 `dsh-flow/` → `DSH_FLOW_HOME`。便携发布包会把引擎放在 exe 旁边。
+界面查找引擎的顺序：`DSH_FLOW_HOME` → 项目/可执行文件附近的 `dsh-flow/` → 当前目录下的 `dsh-flow/`。便携发布包会把引擎放在 exe 旁边。
 
 ## 测试
 
