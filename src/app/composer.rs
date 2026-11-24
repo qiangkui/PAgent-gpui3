@@ -870,12 +870,6 @@ impl DshFlowApp {
                                             }))
                                             .child(
                                                 div()
-                                                    .text_xs()
-                                                    .text_color(rgb(palette.muted))
-                                                    .child("模式"),
-                                            )
-                                            .child(
-                                                div()
                                                     .max_w(px(120.))
                                                     .truncate()
                                                     .text_xs()
