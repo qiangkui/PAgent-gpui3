@@ -1079,4 +1079,11 @@ mod tests {
         assert_eq!(started_at_ms("2026-11-22"), None);
         assert_eq!(started_at_ms("not a date"), None);
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_this_process_creation_time() {
+        // The FFI path used before ending a task must answer for a live pid.
+        assert!(process_started_ms(std::process::id()).is_some());
+    }
 }
