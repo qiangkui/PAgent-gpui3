@@ -21,6 +21,18 @@ except AttributeError:
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+# The input plugin injects physical screen coordinates. A DPI-unaware Python
+# process sees virtualized rectangles instead (e.g. 1536x864 on a 1920x1080
+# display at 125%), so clicks land off-target. Declare per-monitor awareness
+# before any window call so both plugins share one coordinate space.
+try:
+    ctypes.windll.shcore.SetProcessDpiAwareness(2)
+except Exception:
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 GW_CHILD = 5
 GW_HWNDNEXT = 2
 GW_OWNER = 4
