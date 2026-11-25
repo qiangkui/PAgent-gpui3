@@ -2,6 +2,45 @@
 
 use super::*;
 #[test]
+fn the_caption_buttons_are_named_by_the_pointer() {
+    use super::{TITLEBAR_HEIGHT, window_button_at};
+    use gpui::WindowControlArea;
+
+    let width = 1200.;
+    let bar = TITLEBAR_HEIGHT;
+    // Close is the rightmost cell; the three cells are each 46px wide.
+    assert_eq!(
+        window_button_at(width - 1., 10., width, bar),
+        Some(WindowControlArea::Close)
+    );
+    assert_eq!(
+        window_button_at(width - 46., 10., width, bar),
+        Some(WindowControlArea::Close)
+    );
+    assert_eq!(
+        window_button_at(width - 46.5, 10., width, bar),
+        Some(WindowControlArea::Max)
+    );
+    assert_eq!(
+        window_button_at(width - 92., 10., width, bar),
+        Some(WindowControlArea::Max)
+    );
+    assert_eq!(
+        window_button_at(width - 92.5, 10., width, bar),
+        Some(WindowControlArea::Min)
+    );
+    assert_eq!(
+        window_button_at(width - 138., 10., width, bar),
+        Some(WindowControlArea::Min)
+    );
+    // Left of the strip, above it, and past the right edge are no button.
+    assert_eq!(window_button_at(width - 139., 10., width, bar), None);
+    assert_eq!(window_button_at(width - 1., bar, width, bar), None);
+    assert_eq!(window_button_at(width - 1., -1., width, bar), None);
+    assert_eq!(window_button_at(width + 5., 10., width, bar), None);
+}
+
+#[test]
 fn attachments_read_text_and_refuse_what_is_not_text() {
     let root = std::env::temp_dir().join(format!("dsh-attach-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -646,7 +685,7 @@ fn regenerate_finds_the_last_question() {
         ChatMessage::assistant("回答一"),
         ChatMessage::user("第二个问题"),
         ChatMessage::tool("read · a.txt — 已读取 2 行", false),
-        ChatMessage::assistant("回答二"),
+        ChatMessage::assistant("回答"),
     ];
     assert_eq!(
         last_question(&messages),
@@ -673,7 +712,7 @@ fn retry_sits_on_the_answer_unless_a_failure_ends_the_transcript() {
     let failed_later = vec![
         ChatMessage::user("问题一"),
         ChatMessage::assistant("回答一"),
-        ChatMessage::user("问题二"),
+        ChatMessage::user("问题"),
         ChatMessage::note("出错了", true),
     ];
     assert_eq!(retry_message(&failed_later), Some(3));
@@ -690,7 +729,7 @@ fn retry_sits_on_the_answer_unless_a_failure_ends_the_transcript() {
     let awaiting = vec![
         ChatMessage::user("问题一"),
         ChatMessage::assistant("回答一"),
-        ChatMessage::user("问题二"),
+        ChatMessage::user("问题"),
     ];
     assert_eq!(retry_message(&awaiting), None);
 }
@@ -732,13 +771,10 @@ fn taking_the_last_question_drops_everything_after_it() {
         ChatMessage::assistant("回答一"),
         ChatMessage::tool("read · a.txt", false),
         ChatMessage::note("出错了", true),
-        ChatMessage::user("问题二"),
-        ChatMessage::assistant("回答二"),
+        ChatMessage::user("问题"),
+        ChatMessage::assistant("回答"),
     ];
-    assert_eq!(
-        take_last_question(&mut messages),
-        Some("问题二".to_string())
-    );
+    assert_eq!(take_last_question(&mut messages), Some("问题".to_string()));
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[3].role, Role::Note);
 
@@ -925,9 +961,13 @@ fn saved_conversations_come_back() {
             read_only: false,
             full_access: true,
             auto_actions: false,
+            auto_review: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
-mode: crate::config::MODE_FULL.to_string(),
+            mode: crate::config::MODE_FULL.to_string(),
+            web_search: None,
+            plan: false,
+            todos: Vec::new(),
             messages: vec![
                 crate::chats::StoredMessage {
                     role: "user".to_string(),
@@ -935,14 +975,22 @@ mode: crate::config::MODE_FULL.to_string(),
                     failed: false,
                     model: String::new(),
                     elapsed_ms: 0,
+                    model_ms: 0,
+                    tool_ms: 0,
                     tokens: 0,
                     context: 0,
                     cache_hits: 0,
                     rounds: 0,
                     round_tokens: Vec::new(),
+                    round_reasoning: Vec::new(),
                     composition: Vec::new(),
                     tools_tokens: 0,
+                    compaction_layer: String::new(),
+                    compaction_saved: 0,
                     interrupted: false,
+                    reasoning: String::new(),
+                    server_tool_calls: Vec::new(),
+                    round: 0,
                     kind: String::new(),
                     input: String::new(),
                     output: String::new(),
@@ -960,14 +1008,22 @@ mode: crate::config::MODE_FULL.to_string(),
                     failed: false,
                     model: "deepseek-chat".to_string(),
                     elapsed_ms: 1300,
+                    model_ms: 0,
+                    tool_ms: 0,
                     tokens: 0,
                     context: 0,
                     cache_hits: 0,
                     rounds: 0,
                     round_tokens: Vec::new(),
+                    round_reasoning: Vec::new(),
                     composition: Vec::new(),
                     tools_tokens: 0,
+                    compaction_layer: String::new(),
+                    compaction_saved: 0,
                     interrupted: false,
+                    reasoning: String::new(),
+                    server_tool_calls: Vec::new(),
+                    round: 0,
                     kind: String::new(),
                     input: String::new(),
                     output: String::new(),
@@ -985,14 +1041,22 @@ mode: crate::config::MODE_FULL.to_string(),
                     failed: true,
                     model: String::new(),
                     elapsed_ms: 0,
+                    model_ms: 0,
+                    tool_ms: 0,
                     tokens: 0,
                     context: 0,
                     cache_hits: 0,
                     rounds: 0,
                     round_tokens: Vec::new(),
+                    round_reasoning: Vec::new(),
                     composition: Vec::new(),
                     tools_tokens: 0,
+                    compaction_layer: String::new(),
+                    compaction_saved: 0,
                     interrupted: false,
+                    reasoning: String::new(),
+                    server_tool_calls: Vec::new(),
+                    round: 0,
                     kind: String::new(),
                     input: String::new(),
                     output: String::new(),
@@ -1020,9 +1084,13 @@ mode: crate::config::MODE_FULL.to_string(),
             read_only: false,
             full_access: true,
             auto_actions: false,
+            auto_review: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
-mode: crate::config::MODE_FULL.to_string(),
+            mode: crate::config::MODE_FULL.to_string(),
+            web_search: None,
+            plan: false,
+            todos: Vec::new(),
             messages: Vec::new(),
         },
     ];
@@ -1058,9 +1126,13 @@ fn unsent_text_and_files_come_back_with_the_conversation() {
         read_only: false,
         full_access: true,
         auto_actions: false,
+        auto_review: false,
         max_rounds: crate::config::MAX_ROUNDS_CHOICE,
         max_calls: crate::config::MAX_CALLS_CHOICE,
-mode: crate::config::MODE_FULL.to_string(),
+        mode: crate::config::MODE_FULL.to_string(),
+        web_search: None,
+        plan: false,
+        todos: Vec::new(),
         messages: Vec::new(),
     };
     let (drafts, files) = drafts_of(std::slice::from_ref(&saved));
@@ -1129,9 +1201,13 @@ fn saved_conversations_keep_their_own_settings() {
         read_only: true,
         full_access: false,
         auto_actions: false,
+        auto_review: false,
         max_rounds: 12,
         max_calls: 40,
-mode: crate::config::MODE_FULL.to_string(),
+        mode: crate::config::MODE_FULL.to_string(),
+        web_search: None,
+        plan: false,
+        todos: Vec::new(),
         messages: Vec::new(),
     };
     let chats = load_saved(vec![saved], defaults);
@@ -1156,6 +1232,7 @@ fn role_names_round_trip() {
         Role::User,
         Role::Assistant,
         Role::Tool,
+        Role::Thinking,
         Role::Approval,
         Role::Note,
     ] {
@@ -1251,15 +1328,18 @@ fn history_keeps_questions_and_answers_only() {
         vec![
             Turn {
                 speaker: Speaker::User,
-                text: "第一个问题".to_string()
+                text: "第一个问题".to_string(),
+                server_tool_calls: Vec::new(),
             },
             Turn {
                 speaker: Speaker::Assistant,
-                text: "第一段回答".to_string()
+                text: "第一段回答".to_string(),
+                server_tool_calls: Vec::new(),
             },
             Turn {
                 speaker: Speaker::User,
-                text: "第二个问题".to_string()
+                text: "第二个问题".to_string(),
+                server_tool_calls: Vec::new(),
             },
         ]
     );
@@ -1459,9 +1539,56 @@ fn a_finished_approval_says_what_happened() {
     assert_eq!(approval_label("move"), "移动确认");
     assert_eq!(approval_label("delete"), "删除确认");
     assert_eq!(approval_label("write"), "写入确认");
+    assert_eq!(approval_label("edit"), "写入确认");
     assert_eq!(approval_hint("delete"), "允许后才会删除；删除后不能撤销");
     assert_eq!(approval_state("node", true), "已执行");
     assert_eq!(approval_state("python", false), "执行失败");
+    // A plugin tool and an MCP tool run code or an RPC call; neither writes a
+    // file, so neither may borrow the write wording.
+    assert_eq!(approval_label("plugin_echo"), "插件确认");
+    assert_eq!(approval_label("mcp"), "MCP 确认");
+    assert_eq!(approval_label("mcp_files_read"), "MCP 确认");
+    assert_eq!(approval_state("plugin_echo", true), "已执行");
+    assert_eq!(approval_state("plugin_echo", false), "执行失败");
+    assert_eq!(approval_state("mcp_files_read", true), "已执行");
+    assert!(approval_hint("plugin_echo").contains("插件代码"));
+    assert!(approval_hint("mcp_files_read").contains("MCP"));
+    // Only an exact command or snippet may be remembered for the session.
+    assert!(!allow_session_button("plugin_echo", "{\"text\":\"hi\"}"));
+}
+
+#[test]
+fn a_plugin_card_counts_what_the_plugin_contributed() {
+    let tools = vec![
+        ("demo".to_string(), "demo_echo".to_string()),
+        ("demo".to_string(), "demo_clock".to_string()),
+        ("other".to_string(), "other_thing".to_string()),
+    ];
+    let prompts = vec![
+        ("demo".to_string(), "先看 README".to_string()),
+        ("other".to_string(), "再跑测试".to_string()),
+        ("other".to_string(), "最后写总结".to_string()),
+    ];
+    assert_eq!(
+        plugin_contribution("demo", &tools, &prompts),
+        " · 2 个工具 · 1 段提示"
+    );
+    assert_eq!(
+        plugin_contribution("other", &tools, &prompts),
+        " · 1 个工具 · 2 段提示"
+    );
+    // A plugin that contributed nothing (or is switched off) adds no suffix.
+    assert_eq!(plugin_contribution("idle", &tools, &prompts), "");
+    assert_eq!(plugin_contribution("demo", &[], &[]), "");
+    // Tools count first, then prompts.
+    assert_eq!(
+        plugin_contribution("demo", &tools[..1], &prompts[..0]),
+        " · 1 个工具"
+    );
+    assert_eq!(
+        plugin_contribution("demo", &[], &prompts[..1]),
+        " · 1 段提示"
+    );
 }
 
 #[test]
@@ -1670,7 +1797,7 @@ fn an_approval_opens_its_diff_and_folds_when_settled() {
         false,
     ));
     assert!(chat.messages[0].open, "the diff is visible while deciding");
-    settle_approvals(&mut chat, "已取消");
+    settle_interactions(&mut chat, "已取消");
     assert_eq!(chat.messages[0].output, "已取消");
     assert!(!chat.messages[0].open, "a settled card folds");
 }
@@ -1892,6 +2019,28 @@ fn a_field_row_is_measured_the_way_the_layout_draws_it() {
     assert_eq!(field_text_top(80., 2, false), 20.);
     assert_eq!(field_row_at(20., 80., 2, false), 0);
     assert_eq!(field_row_at(40., 80., 2, false), 1);
+}
+
+#[test]
+fn wrapped_rows_start_where_the_caret_and_the_click_look_for_them() {
+    // One row per manual line, and an empty last line still gets its own row so
+    // a caret after the final newline has somewhere to sit.
+    assert_eq!(logical_rows("ab\ncd"), vec![0..2, 3..5]);
+    assert_eq!(logical_rows(""), vec![0..0]);
+    assert_eq!(logical_rows("a\n"), vec![0..1, 2..2]);
+
+    let rows = logical_rows("one\ntwo\nthree");
+    assert_eq!(row_of_caret(&rows, 0), 0);
+    assert_eq!(row_of_caret(&rows, 3), 0, "the break belongs to the row above");
+    assert_eq!(row_of_caret(&rows, 4), 1);
+    assert_eq!(row_of_caret(&rows, 12), 2, "past the end still finds a row");
+
+    // A folded row is a slice of one manual line: the caret at the break sits at
+    // the start of the second piece, and the ranges stay inside the text.
+    let folded = vec![0..3, 3..7, 8..10];
+    assert_eq!(row_of_caret(&folded, 3), 1);
+    assert_eq!(row_of_caret(&folded, 7), 1);
+    assert_eq!(row_of_caret(&folded, 8), 2);
 }
 
 #[test]
@@ -2118,6 +2267,20 @@ fn a_tool_detail_shows_its_bar_only_when_there_is_more_to_read() {
 }
 
 #[test]
+fn a_wheel_delta_never_pushes_a_table_past_its_ends() {
+    // Offsets run from 0 at the top to -max at the end: the delta is added and
+    // then pinned, which is what keeps a table that cannot move from handing
+    // the wheel to the panel behind it.
+    let max = px(200.);
+    assert_eq!(wheel_offset(px(0.), px(-40.), max), px(-40.));
+    assert_eq!(wheel_offset(px(-40.), px(-200.), max), px(-200.));
+    assert_eq!(wheel_offset(px(0.), px(40.), max), px(0.));
+    assert_eq!(wheel_offset(px(-180.), px(-40.), max), px(-200.));
+    // Nothing to scroll: the offset stays at the top whatever the delta says.
+    assert_eq!(wheel_offset(px(0.), px(-40.), px(0.)), px(0.));
+}
+
+#[test]
 fn dragging_a_tool_bar_moves_by_the_same_ratio_as_its_thumb() {
     let (track, thumb) = bar_geometry(px(320.), px(480.)).expect("content overflows");
     let travel = track - thumb;
@@ -2136,33 +2299,6 @@ fn a_tool_row_summary_leaves_room_for_its_badge_and_chip() {
     assert!(width < 664. + 24. - 104., "{width}");
     assert!(width > 400., "{width}");
     assert_eq!(tool_row_text_width(0.), 80.);
-}
-
-#[test]
-fn the_example_plugin_matches_the_format_the_engine_reads() {
-    // The settings page writes these two strings; a typo would only show up as
-    // "plugin did not load", so the shape is checked here instead.
-    let manifest: serde_json::Value =
-        serde_json::from_str(EXAMPLE_PLUGIN_MANIFEST).expect("valid JSON");
-    assert_eq!(manifest["api"], 1, "只支持api 1");
-    assert_eq!(manifest["name"], "示例：回显");
-    assert!(EXAMPLE_PLUGIN_SOURCE.contains("export function activate(api)"));
-    assert!(EXAMPLE_PLUGIN_SOURCE.contains("api.registerTool("));
-    assert!(EXAMPLE_PLUGIN_SOURCE.contains("api.injectPrompt("));
-    // The template literal and the schema survive the escaping in the Rust
-    // string: a dropped `$` would make the tool return a literal placeholder.
-    assert!(
-        EXAMPLE_PLUGIN_SOURCE.contains("`echo: ${String(args.text ?? '')}`"),
-        "{}",
-        EXAMPLE_PLUGIN_SOURCE
-    );
-    assert!(EXAMPLE_PLUGIN_SOURCE.contains("required: ['text']"));
-    // The tool name has to pass the engine's naming rule and avoid built-ins.
-    let name = "plugin_echo";
-    assert!(name.starts_with("plugin_"));
-    assert!(!ALL_TOOLS.contains(&name), "不能与内置工具重名");
-    // The folder name has to be one the window will hand over.
-    assert!(crate::config::is_plugin_id(EXAMPLE_PLUGIN_ID));
 }
 
 #[test]
@@ -2214,15 +2350,15 @@ fn every_context_category_has_its_own_name_and_colour() {
     let mut labels: Vec<&str> = ContextKind::ALL.iter().map(|kind| kind.label()).collect();
     labels.sort_unstable();
     labels.dedup();
-    assert_eq!(labels.len(), 8);
+    assert_eq!(labels.len(), 9);
     let mut colours: Vec<u32> = ContextKind::ALL.iter().map(|kind| kind.color()).collect();
     colours.sort_unstable();
     colours.dedup();
-    assert_eq!(colours.len(), 8);
+    assert_eq!(colours.len(), 9);
     // The one category that can be empty still says where to turn it on.
     assert_eq!(
         ContextKind::Skills.empty_note(),
-        Some("没有启用的技能；在左侧 Skill 页打开开关后，这里会出现注入内容")
+        Some("没有启用的技能（左侧 Skill 页开启）")
     );
     assert_eq!(ContextKind::System.empty_note(), None);
 }
@@ -2237,7 +2373,7 @@ fn every_context_category_round_trips_through_its_stored_key() {
     let mut keys: Vec<&str> = ContextKind::ALL.iter().map(|kind| kind.key()).collect();
     keys.sort_unstable();
     keys.dedup();
-    assert_eq!(keys.len(), 8);
+    assert_eq!(keys.len(), 9);
     // A key this build does not know is skipped, not guessed at.
     assert_eq!(ContextKind::from_key("cache"), None);
 }
@@ -2377,7 +2513,10 @@ fn two_transcripts_naming_the_same_folder_are_split_apart() {
     ]);
     assert_eq!(chats.len(), 3);
     assert_eq!(chats[0].dir, "chat-1");
-    assert_ne!(chats[1].dir, "chat-1", "the duplicate got a folder of its own");
+    assert_ne!(
+        chats[1].dir, "chat-1",
+        "the duplicate got a folder of its own"
+    );
     assert!(!chats[2].dir.is_empty(), "an empty name got one too");
     let dirs: std::collections::HashSet<&str> =
         chats.iter().map(|chat| chat.dir.as_str()).collect();
@@ -2433,4 +2572,155 @@ fn an_exported_conversation_is_readable_markdown() {
     assert!(text.contains("回答\n第二行"));
     assert!(text.contains("- 工具：read · a.txt second line"));
     assert!(text.contains("> 提示"));
+}
+
+#[test]
+fn a_code_gutter_numbers_every_drawn_line() {
+    use super::message::line_numbers;
+    assert_eq!(line_numbers(""), (1, "1".to_string()));
+    assert_eq!(line_numbers("a"), (1, "1".to_string()));
+    assert_eq!(line_numbers("a\nb"), (2, "1\n2".to_string()));
+    // A trailing newline draws no extra line, and a blank line inside does.
+    assert_eq!(line_numbers("a\nb\n"), (2, "1\n2".to_string()));
+    assert_eq!(line_numbers("a\n\nb"), (3, "1\n2\n3".to_string()));
+}
+
+#[test]
+fn interaction_cards_settle_when_the_request_ends() {
+    use crate::app::util::settle_interactions;
+
+    let mut chat = Chat::empty("chat-1".to_string());
+    chat.plan = true;
+    chat.todos = vec![TodoItem {
+        text: "读代码".to_string(),
+        status: TodoStatus::Active,
+    }];
+    chat.messages.push(ChatMessage::question(
+        "q1".to_string(),
+        "选哪个方案？".to_string(),
+        r#"{"options":["甲","乙"],"allowCustom":false}"#.to_string(),
+    ));
+    chat.messages.push(ChatMessage::plan_review(
+        "p1".to_string(),
+        "# 计划\n\n先读代码".to_string(),
+    ));
+    settle_interactions(&mut chat, "已失效");
+    assert_eq!(chat.messages[0].output, "已失效");
+    assert_eq!(chat.messages[1].output, "已失效");
+    // The todo list and plan flag are conversation state, not interaction cards:
+    // settling a finished request must not silently clear them.
+    assert!(chat.plan);
+    assert_eq!(chat.todos.len(), 1);
+    assert_eq!(chat.todos[0].status, TodoStatus::Active);
+}
+
+#[test]
+fn auto_review_only_grants_low_risk_actions() {
+    use crate::app::util::auto_review_allows;
+
+    // Ordinary workspace writes.
+    assert!(auto_review_allows("write", "", "src/main.rs", "diff"));
+    assert!(auto_review_allows("edit", "", "README.md", "diff"));
+    // Outside the workspace, sensitive files, or a huge rewrite.
+    assert!(!auto_review_allows("write", "", "C:\\Windows\\x.txt", "d"));
+    assert!(!auto_review_allows("write", "", "../outside.txt", "d"));
+    assert!(!auto_review_allows("write", "", ".env", "d"));
+    assert!(!auto_review_allows("write", "", "keys/server.pem", "d"));
+    assert!(!auto_review_allows("write", "", ".git/config", "d"));
+    assert!(!auto_review_allows(
+        "write",
+        "",
+        "big.txt",
+        &"x".repeat(200_001)
+    ));
+    // Read-only commands.
+    assert!(auto_review_allows("shell", "git status", "", ""));
+    assert!(auto_review_allows(
+        "shell",
+        "git branch --show-current",
+        "",
+        ""
+    ));
+    assert!(auto_review_allows("shell", "cargo test --release", "", ""));
+    assert!(auto_review_allows("shell", "dir", "", ""));
+    // Anything that can chain, delete, publish or run code still asks.
+    assert!(!auto_review_allows(
+        "shell",
+        "git status && rm -rf .",
+        "",
+        ""
+    ));
+    assert!(!auto_review_allows("shell", "git branch -D main", "", ""));
+    assert!(!auto_review_allows(
+        "shell",
+        "git diff --output=diff.patch",
+        "",
+        ""
+    ));
+    assert!(!auto_review_allows("shell", "cargo clippy --fix", "", ""));
+    assert!(!auto_review_allows("shell", "git push", "", ""));
+    assert!(!auto_review_allows("shell", "cargo fmt", "", ""));
+    assert!(!auto_review_allows("shell", "npm test", "", ""));
+    assert!(!auto_review_allows("python", "", "", ""));
+    assert!(!auto_review_allows("delete", "", "gone.txt", ""));
+    // Command substitution runs a second command inside an allowed one, so it
+    // must ask instead of slipping through `cat` / `git diff`.
+    assert!(!auto_review_allows("shell", "cat $(rm -rf .)", "", ""));
+    assert!(!auto_review_allows(
+        "shell",
+        "git log $(curl -s https://x/y)",
+        "",
+        ""
+    ));
+    assert!(!auto_review_allows("shell", "cat `rm -rf .`", "", ""));
+}
+
+#[test]
+fn sliders_land_on_the_notch_their_value_stands_for() {
+    // Presets an older config may hold, and figures with no notch at all: the
+    // knob has to sit somewhere honest, and picking it writes the notch back.
+    // The default is not a notch of its own any more — it parks the knob on the
+    // value the endpoint uses, so "恢复默认" is a move, not a blank rail.
+    assert_eq!(
+        max_tokens_notch(0, Reasoning::Off),
+        2,
+        "no thinking: the endpoint gives 8k"
+    );
+    assert_eq!(max_tokens_notch(0, Reasoning::Default), 5, "thinking: 64k");
+    assert_eq!(max_tokens_notch(0, Reasoning::High), 5);
+    assert_eq!(max_tokens_notch(0, Reasoning::Max), 6, "top effort: 128k");
+    assert_eq!(max_tokens_notch(2_048, Reasoning::Off), 0);
+    assert_eq!(max_tokens_notch(8_192, Reasoning::Off), 2);
+    assert_eq!(max_tokens_notch(6_000, Reasoning::Off), 1, "nearest below");
+    assert_eq!(max_tokens_notch(999_999, Reasoning::Off), 7, "nearest above");
+
+    assert_eq!(
+        window_notch(0, "deepseek-flash"),
+        5,
+        "the name table gives this model 1M"
+    );
+    assert_eq!(window_notch(0, "some-local-model"), 2, "unknown: 128k");
+    assert_eq!(window_notch(32_768, "x"), 0);
+    assert_eq!(window_notch(262_144, "x"), 3);
+    assert_eq!(window_notch(200_000, "x"), 3, "closer to 256k than 128k");
+    assert_eq!(window_notch(1_000_000, "x"), 5);
+
+    assert_eq!(reasoning_notch(Reasoning::Off), 0);
+    assert_eq!(reasoning_notch(Reasoning::Low), 1);
+    assert_eq!(reasoning_notch(Reasoning::High), 2);
+    assert_eq!(reasoning_notch(Reasoning::Max), 3);
+    assert_eq!(
+        reasoning_notch(Reasoning::Default),
+        reasoning_notch(Reasoning::High),
+        "endpoint thinks at high"
+    );
+
+    // The temperature row parks an unset value where DeepSeek sits, and reads a
+    // stored figure back to the nearest quarter.
+    assert_eq!(temperature_notch(None), 4);
+    assert_eq!(temperature_notch(Some(0.0)), 0);
+    assert_eq!(temperature_notch(Some(1.0)), 4);
+    assert_eq!(temperature_notch(Some(1.25)), 5);
+    assert_eq!(temperature_notch(Some(0.73)), 3);
+    assert_eq!(temperature_notch(Some(9.0)), TEMPERATURE_NOTCHES - 1);
 }

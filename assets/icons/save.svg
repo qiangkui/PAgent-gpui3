@@ -1,9 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- An arrow into a tray: save the conversation next to it. Alpha only; the
-       theme supplies the colour. -->
-  <g fill="none" stroke="#000" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
-    <path d="M12 4v9.6"/>
-    <path d="M8.2 10.2 12 14l3.8-3.8"/>
-    <path d="M5 15.6v2.6A1.8 1.8 0 0 0 6.8 20h10.4A1.8 1.8 0 0 0 19 18.2v-2.6"/>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" stroke-linejoin="round"><!-- Save: a disk, beside the copy button. From the dsh product icon set, regular weight. --><path d="M2.5 1.5h8l3 3v9a1 1 0 0 1-1 1h-10a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1Z"></path><path d="M4.5 1.5v4h6v-4M4 14.5v-6h7v6"></path></svg>

@@ -3,6 +3,46 @@
 use super::*;
 
 impl DshFlowApp {
+    /// Turn plan mode on or off for this conversation.
+    ///
+    /// Plan mode is a conversation setting rather than a preference: the engine
+    /// reads it per request, so the switch in the composer's menu writes it to
+    /// the chat. It needs tools to be on at all — with no tools a "plan" would
+    /// have nothing to plan with.
+    pub(crate) fn set_plan(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chats.get_mut(self.active_chat)
+            && chat.tools
+        {
+            chat.plan = on;
+            chat.touch();
+        }
+        self.save_chats();
+        cx.notify();
+    }
+
+    /// Turn the rule-based auto review on or off for this conversation.
+    pub(crate) fn set_auto_review(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chats.get_mut(self.active_chat)
+            && ToolMode::of(chat) == ToolMode::Workspace
+        {
+            chat.auto_review = on;
+            chat.touch();
+        }
+        self.save_chats();
+        cx.notify();
+    }
+
+    /// Override this conversation's web search, or go back to following the
+    /// connection's own switch when `state` is `None`.
+    pub(crate) fn set_chat_web_search(&mut self, state: Option<bool>, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chats.get_mut(self.active_chat) {
+            chat.web_search = state;
+            chat.touch();
+        }
+        self.save_chats();
+        cx.notify();
+    }
+
     /// The floating message box.
     ///
     /// Like dsh's composer: the card is the surface, the field inside is
@@ -167,11 +207,13 @@ impl DshFlowApp {
             )
     }
 
-    /// The attach menu: files to add, then the context command.
+    /// The "+" menu: files to add, the context command, and the conversation's
+    /// own switches.
     ///
     /// The shell matches the model picker (a floating card, one row per
-    /// choice). Nothing here keeps the menu open: choosing a file opens the
-    /// native dialog, and 压缩上下文 runs at once.
+    /// choice). Files open a native dialog and 压缩上下文 runs at once, so those
+    /// rows close the menu; the switches under 本次对话 change a setting of this
+    /// conversation only and leave it open, the way a settings sheet behaves.
     pub(crate) fn render_attach_menu(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
         let heading = |text: &'static str, first: bool| {
             div()
@@ -249,6 +291,107 @@ impl DshFlowApp {
                             .child("压缩上下文"),
                     ),
             )
+            // The conversation's own switches. They used to sit as chips on the
+            // composer's lower row, which made that row a list of states rather
+            // than a place to type; dsh keeps only the permission and the model
+            // there, so the rest live here, one switch per row.
+            .child(heading("本次对话", false))
+            .child(menu_switch_row(
+                "menu-plan",
+                "计划模式",
+                if self.chat().tools {
+                    "先给出步骤再动手，确认后才执行"
+                } else {
+                    "需要打开工具权限才能使用"
+                },
+                self.chat().plan,
+                palette,
+                cx,
+                |view, cx| {
+                    let on = !view.chat().plan;
+                    view.set_plan(on, cx);
+                },
+            ))
+            .when(ToolMode::of(self.chat()) == ToolMode::Workspace, |this| {
+                this.child(menu_switch_row(
+                    "menu-review",
+                    "自动审查",
+                    "低风险操作直接放行，高风险仍然询问",
+                    self.chat().auto_review,
+                    palette,
+                    cx,
+                    |view, cx| {
+                        let on = !view.chat().auto_review;
+                        view.set_auto_review(on, cx);
+                    },
+                ))
+            })
+            .when(
+                self.ai
+                    .active()
+                    .is_some_and(|entry| entry.supports_web_search()),
+                |this| {
+                    // Searching is on wherever the endpoint offers the tools, so
+                    // the switch only ever turns it off for this conversation.
+                    let over = self.chat().web_search;
+                    let effective = over.unwrap_or(true);
+                    this.child(menu_switch_row(
+                        "menu-web",
+                        "联网搜索",
+                        match over {
+                            None => "默认开启（模型自行决定何时上网）".to_string(),
+                            Some(true) => "本对话已开启".to_string(),
+                            Some(false) => "本对话已关闭".to_string(),
+                        },
+                        effective,
+                        palette,
+                        cx,
+                        move |view, cx| {
+                            let next = !view.chat().web_search.unwrap_or(true);
+                            view.set_chat_web_search(Some(next), cx);
+                        },
+                    ))
+                    .when(over.is_some(), |this| {
+                        this.child(
+                            div()
+                                .id("menu-web-follow")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(rgb(palette.accent))
+                                .cursor_pointer()
+                                .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                )
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.set_chat_web_search(None, cx);
+                                }))
+                                .child("↺ 回到默认（开启）"),
+                        )
+                    })
+                },
+            )
+            .child(menu_budget_row(
+                "menu-rounds",
+                "轮数上限",
+                &[6, 12, 24],
+                self.chat().max_rounds,
+                palette,
+                cx,
+                |view, value, cx| view.set_max_rounds(value, cx),
+            ))
+            .child(menu_budget_row(
+                "menu-calls",
+                "工具调用上限",
+                &[20, 40, 80],
+                self.chat().max_calls,
+                palette,
+                cx,
+                |view, value, cx| view.set_max_calls(value, cx),
+            ))
     }
 
     /// The tool-permission menu, opened by the chip beside the model.
@@ -339,131 +482,6 @@ impl DshFlowApp {
                 cx.listener(|_, _, _, cx| cx.stop_propagation()),
             )
             .children(items)
-    }
-
-    /// The tool-budget menu: round-trips and calls for this conversation.
-    pub(crate) fn render_budget_menu(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
-        let (rounds, calls) = (self.chat().max_rounds, self.chat().max_calls);
-        let mut round_items: Vec<AnyElement> = Vec::new();
-        for value in [6u32, 12, 24] {
-            let selected = rounds == value;
-            round_items.push(
-                div()
-                    .id(("max-rounds", value as usize))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .when(selected, |this| this.bg(rgb(palette.panel_soft)))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.set_max_rounds(value, cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(rgb(if selected {
-                                palette.accent
-                            } else {
-                                palette.text
-                            }))
-                            .child(format!("{value} 轮")),
-                    )
-                    .when(selected, |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(palette.accent))
-                                .child("使用中"),
-                        )
-                    })
-                    .into_any_element(),
-            );
-        }
-        let mut call_items: Vec<AnyElement> = Vec::new();
-        for value in [20u32, 40, 80] {
-            let selected = calls == value;
-            call_items.push(
-                div()
-                    .id(("max-calls", value as usize))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .when(selected, |this| this.bg(rgb(palette.panel_soft)))
-                    .cursor_pointer()
-                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.set_max_calls(value, cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_xs()
-                            .text_color(rgb(if selected {
-                                palette.accent
-                            } else {
-                                palette.text
-                            }))
-                            .child(format!("{value} 次")),
-                    )
-                    .when(selected, |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(palette.accent))
-                                .child("使用中"),
-                        )
-                    })
-                    .into_any_element(),
-            );
-        }
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .p_2()
-            .mb_1()
-            .rounded_lg()
-            .bg(rgb(palette.canvas))
-            .shadow_lg()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .child("工具轮次"),
-            )
-            .children(round_items)
-            .child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .child("工具调用"),
-            )
-            .children(call_items)
-            .child(
-                div()
-                    .px_2()
-                    .pt_1()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .child("达到上限时先让模型总结；shell、移动、删除仍逐次确认。"),
-            )
     }
 
     /// The files waiting to be sent, drawn above the model and tool chips.
@@ -603,16 +621,6 @@ impl DshFlowApp {
                                 .child(self.render_tools_menu(palette, cx)),
                         )
                     })
-                    .when(self.budget_menu, |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .right_0()
-                                .bottom(relative(1.))
-                                .child(self.render_budget_menu(palette, cx)),
-                        )
-                    })
                     .when(self.mode_menu, |this| {
                         this.child(
                             div()
@@ -697,14 +705,13 @@ impl DshFlowApp {
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.model_menu = false;
                                                 view.tools_menu = false;
-                                                view.budget_menu = false;
                                                 view.mode_menu = false;
                                                 view.attach_menu = !view.attach_menu;
                                                 cx.notify();
                                             }))
                                             .child(
                                                 svg()
-                                                    .path("icons/plus-thin.svg")
+                                                    .path("icons/plus.svg")
                                                     .w(px(18.))
                                                     .h(px(18.))
                                                     .flex_shrink_0()
@@ -746,14 +753,12 @@ impl DshFlowApp {
                                                     view.open_settings(cx);
                                                     view.model_menu = false;
                                                     view.tools_menu = false;
-                                                    view.budget_menu = false;
                                                 } else {
                                                     if !view.model_menu {
                                                         // Open on the provider in use.
                                                         view.model_tab = view.ai.active;
                                                     }
                                                     view.tools_menu = false;
-                                                    view.budget_menu = false;
                                                     view.model_menu = !view.model_menu;
                                                 }
                                                 cx.notify();
@@ -814,7 +819,6 @@ impl DshFlowApp {
                                             )
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.model_menu = false;
-                                                view.budget_menu = false;
                                                 view.attach_menu = false;
                                                 view.mode_menu = false;
                                                 view.tools_menu = !view.tools_menu;
@@ -863,7 +867,6 @@ impl DshFlowApp {
                                             .on_click(cx.listener(|view, _, _, cx| {
                                                 view.model_menu = false;
                                                 view.tools_menu = false;
-                                                view.budget_menu = false;
                                                 view.attach_menu = false;
                                                 view.mode_menu = !view.mode_menu;
                                                 cx.notify();
@@ -875,54 +878,6 @@ impl DshFlowApp {
                                                     .text_xs()
                                                     .text_color(rgb(palette.text))
                                                     .child(self.ai.mode_label(&self.chat().mode)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(palette.muted))
-                                                    .child("▾"),
-                                            ),
-                                    )
-                                    // Rounds and calls share one chip: they are one
-                                    // budget and the row is already busy.
-                                    .child(
-                                        div()
-                                            .id("budget-chip")
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .gap_1()
-                                            .flex_shrink_0()
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_full()
-                                            .cursor_pointer()
-                                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                            )
-                                            .on_click(cx.listener(|view, _, _, cx| {
-                                                view.model_menu = false;
-                                                view.tools_menu = false;
-                                                view.attach_menu = false;
-                                                view.mode_menu = false;
-                                                view.budget_menu = !view.budget_menu;
-                                                cx.notify();
-                                            }))
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(rgb(if self.chat().tools {
-                                                        palette.muted
-                                                    } else {
-                                                        palette.faint
-                                                    }))
-                                                    .child(format!(
-                                                        "预算 {} 轮 / {} 次",
-                                                        self.chat().max_rounds,
-                                                        self.chat().max_calls
-                                                    )),
                                             )
                                             .child(
                                                 div()
@@ -972,7 +927,10 @@ impl DshFlowApp {
                                                 // Keep the caret in the composer so the
                                                 // next question can be typed straight away.
                                                 view.focused = Some(Field::Composer);
-                                                window.focus(&view.composer.focus_handle().clone(), cx);
+                                                window.focus(
+                                                    &view.composer.focus_handle().clone(),
+                                                    cx,
+                                                );
                                                 cx.notify();
                                             }))
                                             .child(if waiting {
@@ -1054,6 +1012,48 @@ fn attach_file_row(
                 .text_color(rgb(palette.muted)),
         )
         .child(div().text_xs().text_color(rgb(palette.text)).child(label))
+        .into_any_element()
+}
+
+/// One row of the conversation menu that picks a number: its name, then the
+/// choices as small chips, the one in use filled by [`menu_choice`].
+fn menu_budget_row(
+    id: &'static str,
+    label: &'static str,
+    values: &'static [u32],
+    current: u32,
+    palette: Palette,
+    cx: &mut Context<DshFlowApp>,
+    pick: impl Fn(&mut DshFlowApp, u32, &mut Context<DshFlowApp>) + Clone + 'static,
+) -> AnyElement {
+    let mut choices: Vec<AnyElement> = Vec::new();
+    for value in values {
+        let action = pick.clone();
+        choices.push(menu_choice(
+            (id, *value as usize),
+            format!("{value}"),
+            current == *value,
+            palette,
+            cx,
+            move |view, cx| action(view, *value, cx),
+        ));
+    }
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .px_2()
+        .py_1()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .text_xs()
+                .text_color(rgb(palette.text))
+                .child(label),
+        )
+        .children(choices)
         .into_any_element()
 }
 

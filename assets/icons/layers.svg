@@ -1,9 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- Three stacked sheets: "what the request carries", beside the context
-       figure so it reads as a prompt rather than as a spend. Filled so the
-       renderer can tint it with the theme colour. -->
-  <g fill="#000">
-    <path fill-rule="evenodd" d="M12 2.4a1.4 1.4 0 0 0-1.3.8L2.6 12.2a1.6 1.6 0 0 0 .7 2.1l7.6 3.6a1.6 1.6 0 0 0 1.3 0l7.6-3.6a1.6 1.6 0 0 0 .7-2.1l-8-8.9a1.4 1.4 0 0 0-1.2-.8zm0 2.9 5.6 6.2-5.6 2.6-5.6-2.6L12 5.3z"/>
-    <path d="M4.2 15.9a1.2 1.2 0 0 1 1.6-.5l5.5 2.6a2 2 0 0 0 1.5 0l5.5-2.6a1.2 1.2 0 1 1 1 2.2l-5.5 2.6a4.4 4.4 0 0 1-3.5 0l-5.5-2.6a1.2 1.2 0 0 1-.6-1.7z"/>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><!-- Layers: stacked sheets, beside the composer capsule's context figure. From the dsh product icon set, regular weight. --><path d="M8.481371 2.304371 a1.159971 1.159971 0 0 0-.962742 0 L2.547971 4.566371 a.580029 .580029 0 0 0 0 1.0614 l4.9764 2.267829 a1.159971 1.159971 0 0 0 .962829 0 l4.9764-2.262 a.580029 .580029 0 0 0 0-1.0614Z" stroke="currentColor"></path><path d="M2.199971 8 a.580029 .580029 0 0 0 .336429 .527829 l4.987971 2.267742 a1.159971 1.159971 0 0 0 .957 0 l4.9764-2.262 A.580029 .580029 0 0 0 13.800029 8" stroke="currentColor"></path><path d="M2.199971 10.899971 a.580029 .580029 0 0 0 .336429 .527829 l4.987971 2.267829 a1.159971 1.159971 0 0 0 .957 0 l4.9764-2.262 A.580029 .580029 0 0 0 13.800029 10.899971" stroke="currentColor"></path></svg>

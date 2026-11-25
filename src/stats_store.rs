@@ -48,6 +48,23 @@ pub struct StatsRecord {
     pub context: u64,
     /// Tool calls the question made.
     pub tools: u64,
+    /// Prompt tokens the provider served from its cache.
+    pub cache_hits: u64,
+    /// Prompt tokens the question sent, summed over its rounds: the denominator
+    /// of the cache rate. Zero for records written before it was kept.
+    pub prompt_tokens: u64,
+    /// Wall clock spent waiting for model round trips, in milliseconds; zero
+    /// for records written before it was measured.
+    pub model_ms: u64,
+    /// Wall clock spent running tools, in milliseconds.
+    pub tool_ms: u64,
+    /// Searches the provider ran on its own side for the question.
+    pub web_searches: u32,
+    /// Pages the provider opened or read for the question.
+    pub web_fetches: u32,
+    /// Thinking tokens the question produced, summed over its rounds; zero for
+    /// records written before they were counted.
+    pub reasoning_tokens: u64,
     /// True when the time is the conversation's last change, not the answer's.
     pub estimated: bool,
 }
@@ -65,6 +82,13 @@ impl StatsRecord {
             "tokens": self.tokens,
             "context": self.context,
             "tools": self.tools,
+            "cacheHits": self.cache_hits,
+            "promptTokens": self.prompt_tokens,
+            "modelMs": self.model_ms,
+            "toolMs": self.tool_ms,
+            "webSearches": self.web_searches,
+            "webFetches": self.web_fetches,
+            "reasoningTokens": self.reasoning_tokens,
             "estimated": self.estimated,
         })
     }
@@ -85,6 +109,30 @@ impl StatsRecord {
             tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
             context: value.get("context").and_then(Value::as_u64).unwrap_or(0),
             tools: value.get("tools").and_then(Value::as_u64).unwrap_or(0),
+            cache_hits: value
+                .get("cacheHits")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            prompt_tokens: value
+                .get("promptTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            model_ms: value.get("modelMs").and_then(Value::as_u64).unwrap_or(0),
+            tool_ms: value.get("toolMs").and_then(Value::as_u64).unwrap_or(0),
+            web_searches: value
+                .get("webSearches")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u64::from(u32::MAX)) as u32,
+            web_fetches: value
+                .get("webFetches")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .min(u64::from(u32::MAX)) as u32,
+            reasoning_tokens: value
+                .get("reasoningTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             estimated: value
                 .get("estimated")
                 .and_then(Value::as_bool)
@@ -98,6 +146,14 @@ impl StatsRecord {
 pub struct ModelCount {
     pub requests: u64,
     pub tokens: u64,
+    /// Prompt tokens the provider served from its cache, for this model.
+    pub cache_hits: u64,
+    /// Prompt tokens this model's requests sent, summed over rounds.
+    pub prompt_tokens: u64,
+    /// Wall clock this model spent on round trips, in milliseconds.
+    pub model_ms: u64,
+    /// Wall clock its tools spent, in milliseconds.
+    pub tool_ms: u64,
 }
 
 /// Permanent aggregate for one UTC day.
@@ -109,6 +165,20 @@ pub struct DayRollup {
     pub tokens: u64,
     pub prompt: u64,
     pub tools: u64,
+    /// Prompt tokens the provider served from its cache that day.
+    pub cache_hits: u64,
+    /// Prompt tokens the day's requests sent, summed over rounds.
+    pub prompt_tokens: u64,
+    /// Wall clock the day spent waiting for model round trips, in milliseconds.
+    pub model_ms: u64,
+    /// Wall clock the day spent running tools, in milliseconds.
+    pub tool_ms: u64,
+    /// Searches the day's questions ran on the provider's side.
+    pub web_searches: u64,
+    /// Pages those questions opened or read.
+    pub web_fetches: u64,
+    /// Thinking tokens the day's questions produced.
+    pub reasoning_tokens: u64,
     /// Conversations that answered at least once that day.
     pub chats: Vec<String>,
     /// Model shares for the day.
@@ -124,7 +194,14 @@ impl DayRollup {
             .map(|(name, count)| {
                 (
                     name.clone(),
-                    json!({ "requests": count.requests, "tokens": count.tokens }),
+                    json!({
+                        "requests": count.requests,
+                        "tokens": count.tokens,
+                        "cacheHits": count.cache_hits,
+                        "promptTokens": count.prompt_tokens,
+                        "modelMs": count.model_ms,
+                        "toolMs": count.tool_ms
+                    }),
                 )
             })
             .collect();
@@ -134,6 +211,13 @@ impl DayRollup {
             "tokens": self.tokens,
             "prompt": self.prompt,
             "tools": self.tools,
+            "cacheHits": self.cache_hits,
+            "promptTokens": self.prompt_tokens,
+            "modelMs": self.model_ms,
+            "toolMs": self.tool_ms,
+            "webSearches": self.web_searches,
+            "webFetches": self.web_fetches,
+            "reasoningTokens": self.reasoning_tokens,
             "chats": self.chats,
             "models": models,
             "estimated": self.estimated,
@@ -150,6 +234,16 @@ impl DayRollup {
                     ModelCount {
                         requests: item.get("requests").and_then(Value::as_u64).unwrap_or(0),
                         tokens: item.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                        cache_hits: item
+                            .get("cacheHits")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        prompt_tokens: item
+                            .get("promptTokens")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                        model_ms: item.get("modelMs").and_then(Value::as_u64).unwrap_or(0),
+                        tool_ms: item.get("toolMs").and_then(Value::as_u64).unwrap_or(0),
                     },
                 );
             }
@@ -160,6 +254,28 @@ impl DayRollup {
             tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
             prompt: value.get("prompt").and_then(Value::as_u64).unwrap_or(0),
             tools: value.get("tools").and_then(Value::as_u64).unwrap_or(0),
+            cache_hits: value
+                .get("cacheHits")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            prompt_tokens: value
+                .get("promptTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            model_ms: value.get("modelMs").and_then(Value::as_u64).unwrap_or(0),
+            tool_ms: value.get("toolMs").and_then(Value::as_u64).unwrap_or(0),
+            web_searches: value
+                .get("webSearches")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            web_fetches: value
+                .get("webFetches")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reasoning_tokens: value
+                .get("reasoningTokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             chats: value
                 .get("chats")
                 .and_then(Value::as_array)
@@ -319,12 +435,25 @@ fn add_to_day(rollup: &mut DayRollup, record: &StatsRecord) {
     rollup.tokens = rollup.tokens.saturating_add(record.tokens);
     rollup.prompt = rollup.prompt.saturating_add(record.context);
     rollup.tools = rollup.tools.saturating_add(record.tools);
+    rollup.cache_hits = rollup.cache_hits.saturating_add(record.cache_hits);
+    rollup.prompt_tokens = rollup.prompt_tokens.saturating_add(record.prompt_tokens);
+    rollup.model_ms = rollup.model_ms.saturating_add(record.model_ms);
+    rollup.tool_ms = rollup.tool_ms.saturating_add(record.tool_ms);
+    rollup.web_searches = rollup.web_searches.saturating_add(u64::from(record.web_searches));
+    rollup.web_fetches = rollup.web_fetches.saturating_add(u64::from(record.web_fetches));
+    rollup.reasoning_tokens = rollup
+        .reasoning_tokens
+        .saturating_add(record.reasoning_tokens);
     rollup.estimated |= record.estimated;
     let model = record.model.trim();
     let name = if model.is_empty() { "未知模型" } else { model };
     let entry = rollup.models.entry(name.to_string()).or_default();
     entry.requests = entry.requests.saturating_add(1);
     entry.tokens = entry.tokens.saturating_add(record.tokens);
+    entry.cache_hits = entry.cache_hits.saturating_add(record.cache_hits);
+    entry.prompt_tokens = entry.prompt_tokens.saturating_add(record.prompt_tokens);
+    entry.model_ms = entry.model_ms.saturating_add(record.model_ms);
+    entry.tool_ms = entry.tool_ms.saturating_add(record.tool_ms);
 }
 
 fn write_days(dir: &Path, records: &[StatsRecord]) -> Result<(), String> {
@@ -441,6 +570,13 @@ mod tests {
             tokens,
             context: tokens / 2,
             tools: 1,
+            cache_hits: 0,
+            prompt_tokens: 0,
+            model_ms: 0,
+            tool_ms: 0,
+            web_searches: 0,
+            web_fetches: 0,
+            reasoning_tokens: 0,
             estimated: false,
         }
     }
@@ -470,6 +606,45 @@ mod tests {
         let days = load_daily(&dir, 0, u64::MAX);
         assert_eq!(days.iter().map(|day| day.requests).sum::<u64>(), 1);
         assert!(load_records(&dir, 0, u64::MAX).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_ledger_keeps_cache_and_timing_beside_the_tokens() {
+        let dir = temp_dir("timing");
+        let now = now_ms();
+        let mut first = record(now, "chat-a", 100);
+        first.cache_hits = 640;
+        first.prompt_tokens = 1_000;
+        first.model_ms = 2_100;
+        first.tool_ms = 640;
+        first.web_searches = 3;
+        first.web_fetches = 1;
+        first.reasoning_tokens = 1_200;
+        // A record appended without the fields reads back as zero.
+        append_many(&dir, &[first, record(now, "chat-b", 50)]).unwrap();
+        let details = load_records(&dir, 0, u64::MAX);
+        assert_eq!(details[0].cache_hits, 640);
+        assert_eq!(details[0].prompt_tokens, 1_000);
+        assert_eq!(details[0].model_ms, 2_100);
+        assert_eq!(details[0].tool_ms, 640);
+        assert_eq!(details[0].web_searches, 3);
+        assert_eq!(details[0].web_fetches, 1);
+        assert_eq!(details[0].reasoning_tokens, 1_200);
+        assert_eq!(details[1].model_ms, 0);
+        assert_eq!(details[1].web_searches, 0);
+        // The daily aggregate carries the same sums, and the model's own.
+        let day = load_daily(&dir, 0, u64::MAX).remove(0);
+        assert_eq!(day.cache_hits, 640);
+        assert_eq!(day.prompt_tokens, 1_000);
+        assert_eq!(day.model_ms, 2_100);
+        assert_eq!(day.tool_ms, 640);
+        assert_eq!(day.web_searches, 3);
+        assert_eq!(day.web_fetches, 1);
+        assert_eq!(day.reasoning_tokens, 1_200);
+        let model = day.models.values().next().expect("one model");
+        assert_eq!(model.cache_hits, 640);
+        assert_eq!(model.model_ms, 2_100);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -186,6 +186,7 @@ impl DshFlowApp {
             .px_4()
             .py_3()
             .overflow_y_scroll()
+            .contained_wheel()
             .track_scroll(&self.steps_scroll)
             .children(cards)
     }
@@ -201,11 +202,14 @@ impl DshFlowApp {
     }
 
     /// How many model round-trips this conversation's questions may take.
+    ///
+    /// Chosen from the composer's menu, which holds several settings at once, so
+    /// the menu stays open: the figure is one of a row of chips, and closing on
+    /// each pick would make setting two of them a four-step job.
     pub(crate) fn set_max_rounds(&mut self, value: u32, cx: &mut Context<Self>) {
         if let Some(chat) = self.chats.get_mut(self.active_chat) {
             chat.max_rounds = value.clamp(1, crate::config::MAX_ROUNDS_CHOICE);
         }
-        self.close_composer_menus();
         self.save_chats();
         cx.notify();
     }
@@ -215,7 +219,6 @@ impl DshFlowApp {
         if let Some(chat) = self.chats.get_mut(self.active_chat) {
             chat.max_calls = value.clamp(1, crate::config::MAX_CALLS_CHOICE);
         }
-        self.close_composer_menus();
         self.save_chats();
         cx.notify();
     }
@@ -224,7 +227,6 @@ impl DshFlowApp {
     pub(crate) fn close_composer_menus(&mut self) {
         self.model_menu = false;
         self.tools_menu = false;
-        self.budget_menu = false;
         self.mode_menu = false;
         self.attach_menu = false;
     }
@@ -274,7 +276,8 @@ impl DshFlowApp {
             .gap_3()
             .px_5()
             .py_3()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            .contained_wheel();
 
         match selected {
             Some(row) => {
@@ -502,6 +505,7 @@ impl DshFlowApp {
                     .px_4()
                     .py_1()
                     .overflow_y_scroll()
+                    .contained_wheel()
                     .track_scroll(&self.log_scroll)
                     .children(lines),
             )

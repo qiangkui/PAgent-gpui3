@@ -321,7 +321,7 @@ impl DshFlowApp {
         // task or context tab open on an empty conversation.
         self.chat_tab = ChatTab::Chat;
         let chat_index = self.active_chat;
-        let Some((dir, tools, read_only, full_access, max_rounds, max_calls, mode)) =
+        let Some((dir, tools, read_only, full_access, max_rounds, max_calls, mode, plan)) =
             self.chats.get(chat_index).map(|chat| {
                 (
                     chat.dir.clone(),
@@ -331,6 +331,7 @@ impl DshFlowApp {
                     chat.max_rounds,
                     chat.max_calls,
                     chat.mode.clone(),
+                    chat.plan,
                 )
             })
         else {
@@ -350,22 +351,12 @@ impl DshFlowApp {
         let blocks = self.prompt_blocks(chat_index, &model);
         // Only this conversation's schemas: another answer running beside it must
         // not change what this request is recorded as carrying.
-        let schemas = self
-            .tool_schemas
-            .get(&dir)
-            .cloned()
-            .unwrap_or_default();
+        let schemas = self.tool_schemas.get(&dir).cloned().unwrap_or_default();
         // Recorded with the answer, so the request can be looked at again later
         // even though only one total token figure comes back from the endpoint.
         // The question itself is not in `history` yet, so it is passed in here:
         // without it the person's own words would be missing from the record.
-        let items = request_items(
-            &blocks,
-            &schemas,
-            &self.plugin_prompts,
-            &history,
-            &text,
-        );
+        let items = request_items(&blocks, &schemas, &self.plugin_prompts, &history, &text);
         if let Some(chat) = self.chats.get_mut(chat_index) {
             if dropped > 0 {
                 // Say it where the answer will be read: a cut-down context is
@@ -399,6 +390,14 @@ impl DshFlowApp {
             cx.notify();
             return;
         };
+
+        // A conversation may keep searching on or off; `None` leaves it on, the
+        // default everywhere the endpoint offers the tools.
+        let web_search = self
+            .chats
+            .get(chat_index)
+            .and_then(|chat| chat.web_search)
+            .unwrap_or(true);
 
         // Each conversation works inside its own folder under the workspace, so
         // files the assistant or a tool writes stay with that conversation.
@@ -460,6 +459,8 @@ impl DshFlowApp {
             &read_only_roots,
             max_rounds,
             max_calls,
+            plan,
+            web_search,
             &files,
             plugin_dir.as_deref(),
             &plugins,
@@ -468,14 +469,24 @@ impl DshFlowApp {
         ) {
             Ok(request) => {
                 let request = Arc::new(request);
+                // Panels are rebuilt with every request. Dropping the previous
+                // set here keeps a request that reports none — tools switched
+                // off, or a crash before the first round — from showing the last
+                // request's cards as its own.
+                self.plugin_panels.remove(&dir);
                 self.pending.push(PendingAnswer {
                     dir,
                     request: request.clone(),
                     draft: String::new(),
+                    reasoning: String::new(),
+                    thinking_row: None,
+                    thinking_rows: 0,
                     follow: true,
                     bottom: self.chat_scroll.offset().y,
                     viewing: false,
                     approval: None,
+                    question: None,
+                    plan: None,
                     writes: Vec::new(),
                     model: connection.model.clone(),
                     acted: false,
@@ -495,6 +506,8 @@ impl DshFlowApp {
                         max_rounds,
                         max_calls,
                         mode: mode.clone(),
+                        plan,
+                        web_search,
                         attachments: files.clone(),
                         tried: vec![connection_key(&connection)],
                     },
@@ -627,6 +640,46 @@ impl DshFlowApp {
                 AiEvent::Progress { round, calls } => {
                     self.pending[slot].round = round;
                     self.pending[slot].calls = calls;
+                    // A new round starts with its own thinking row; the previous
+                    // round's text is already stored in its own message.
+                    self.pending[slot].thinking_row = None;
+                }
+                AiEvent::Reasoning(text) => {
+                    self.pending[slot].reasoning.push_str(&text);
+                    // One row per continuous stretch: a tool call or a new round
+                    // closes it, so thinking and tools stay in the order they
+                    // happened.
+                    let round = self.pending[slot].round.max(1);
+                    let open = self.pending[slot].thinking_row;
+                    let mut created = false;
+                    let mut row_index = open;
+                    if let Some(chat) = self.chats.get_mut(chat_index) {
+                        let usable = open.filter(|index| {
+                            chat.messages
+                                .get(*index)
+                                .is_some_and(|row| row.role == Role::Thinking && row.round == round)
+                        });
+                        match usable {
+                            Some(index) => {
+                                chat.messages[index].text.push_str(&text);
+                                chat.touch();
+                            }
+                            None => {
+                                let mut row = ChatMessage::thinking(String::new(), round);
+                                row.text.push_str(&text);
+                                chat.messages.push(row);
+                                row_index = Some(chat.messages.len() - 1);
+                                created = true;
+                                chat.touch();
+                            }
+                        }
+                    }
+                    if created {
+                        self.pending[slot].thinking_rows += 1;
+                    }
+                    if row_index.is_some() {
+                        self.pending[slot].thinking_row = row_index;
+                    }
                 }
                 AiEvent::ToolStart { call, tool, target } => {
                     if call.is_empty() {
@@ -634,6 +687,8 @@ impl DshFlowApp {
                     }
                     self.pending[slot].draft.clear();
                     self.pending[slot].acted = true;
+                    // The tool's row comes after the thinking that asked for it.
+                    self.pending[slot].thinking_row = None;
                     let write = take_write(&mut self.pending[slot].writes, &call);
                     if let Some(chat) = self.chats.get_mut(chat_index) {
                         let exists = chat
@@ -695,6 +750,9 @@ impl DshFlowApp {
                 }
                 AiEvent::Delta(text) => {
                     self.pending[slot].approval = None;
+                    // The answer started: the next thinking fragment belongs to
+                    // a new row, not to the one that led into this text.
+                    self.pending[slot].thinking_row = None;
                     self.pending[slot].draft.push_str(&text);
                 }
                 AiEvent::Tools {
@@ -702,10 +760,15 @@ impl DshFlowApp {
                     prompts,
                     errors,
                     mcp_errors,
+                    plugin_tools,
+                    mcp_tools,
+                    panels,
                 } => {
                     // The context panel shows what the next request carries, so
                     // the schemas and plugin prompts are kept until the engine
-                    // sends a new set; the settings page shows the failures.
+                    // sends a new set; the settings page shows the failures, and
+                    // the plugin/MCP cards count what each one contributed. The
+                    // panels belong to this request, so they stay with it.
                     // This run needs its own copy: the first question of a
                     // conversation was recorded before any schema arrived.
                     self.pending[slot].schemas = items.clone();
@@ -713,6 +776,9 @@ impl DshFlowApp {
                     self.plugin_prompts = prompts;
                     self.plugin_errors = errors;
                     self.mcp_errors = mcp_errors;
+                    self.plugin_tools = plugin_tools;
+                    self.mcp_tools = mcp_tools;
+                    self.plugin_panels.insert(dir.clone(), panels);
                 }
                 AiEvent::Step {
                     tool,
@@ -728,6 +794,9 @@ impl DshFlowApp {
                     self.pending[slot].approval = None;
                     self.pending[slot].draft.clear();
                     self.pending[slot].acted = true;
+                    // The thinking that led here is complete; a later fragment
+                    // starts a row of its own.
+                    self.pending[slot].thinking_row = None;
                     let text = if detail.is_empty() {
                         format!("{tool} · {target}")
                     } else {
@@ -808,7 +877,17 @@ impl DshFlowApp {
                             chat.allow_session
                                 .contains(&session_key(&tool, &remembered))
                         });
-                    let go_ahead = trusted || allowed_before;
+                    // Auto review: a conservative rule grants low-risk writes
+                    // and read-only commands, and everything else still asks.
+                    let reviewed = !auto
+                        && !trusted
+                        && !allowed_before
+                        && self.chats.get(chat_index).is_some_and(|chat| {
+                            chat.auto_review
+                                && !chat.read_only
+                                && auto_review_allows(&tool, &command, &path, &diff)
+                        });
+                    let go_ahead = trusted || allowed_before || reviewed;
                     if !auto && !go_ahead {
                         self.pending[slot].approval = Some(call.clone());
                     }
@@ -853,6 +932,80 @@ impl DshFlowApp {
                     }
                     self.save_chats();
                 }
+                AiEvent::Question {
+                    call,
+                    question,
+                    options,
+                    allow_custom,
+                } => {
+                    if call.is_empty() {
+                        continue;
+                    }
+                    self.pending[slot].draft.clear();
+                    self.pending[slot].acted = true;
+                    self.pending[slot].thinking_row = None;
+                    self.pending[slot].question = Some(call.clone());
+                    // Only one interaction can be live at a time.
+                    self.pending[slot].plan = None;
+                    let payload = serde_json::json!({
+                        "options": options,
+                        "allowCustom": allow_custom,
+                    })
+                    .to_string();
+                    if let Some(chat) = self.chats.get_mut(chat_index) {
+                        if let Some(existing) = chat
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|entry| entry.role == Role::Question && entry.call == call)
+                        {
+                            existing.text = question;
+                            existing.input = payload;
+                        } else {
+                            chat.messages
+                                .push(ChatMessage::question(call, question, payload));
+                        }
+                        chat.touch();
+                    }
+                    self.save_chats();
+                }
+                AiEvent::Plan { call, plan } => {
+                    if call.is_empty() {
+                        continue;
+                    }
+                    self.pending[slot].draft.clear();
+                    self.pending[slot].acted = true;
+                    self.pending[slot].thinking_row = None;
+                    self.pending[slot].plan = Some(call.clone());
+                    self.pending[slot].question = None;
+                    if let Some(chat) = self.chats.get_mut(chat_index) {
+                        if let Some(existing) = chat
+                            .messages
+                            .iter_mut()
+                            .rev()
+                            .find(|entry| entry.role == Role::Plan && entry.call == call)
+                        {
+                            existing.text = plan;
+                        } else {
+                            chat.messages.push(ChatMessage::plan_review(call, plan));
+                        }
+                        chat.touch();
+                    }
+                    self.save_chats();
+                }
+                AiEvent::Todo { items } => {
+                    if let Some(chat) = self.chats.get_mut(chat_index) {
+                        chat.todos = items
+                            .into_iter()
+                            .map(|(text, status)| TodoItem {
+                                text,
+                                status: TodoStatus::from_key(&status),
+                            })
+                            .collect();
+                        chat.touch();
+                    }
+                    self.save_chats();
+                }
                 AiEvent::Done {
                     text,
                     usage,
@@ -860,12 +1013,33 @@ impl DshFlowApp {
                     cache_hits,
                     rounds,
                     round_tokens,
+                    round_reasoning,
                     compaction,
+                    model_ms,
+                    tool_ms,
+                    reasoning,
+                    web_searches,
+                    web_fetches,
+                    server_tool_calls,
                 } => {
                     // Say what the engine's compaction did, above the answer, so
                     // a suddenly shorter context is explained rather than
                     // mysterious. An empty note means nothing happened.
-                    let note = compaction.map(|report| report.note()).unwrap_or_default();
+                    let note = compaction
+                        .as_ref()
+                        .map(|report| report.note())
+                        .unwrap_or_default();
+                    // The same fact, kept as data: the panel flags and the step
+                    // brief read these fields instead of matching the note's
+                    // prose, so a wording change cannot lose the event.
+                    let compaction_layer = compaction
+                        .as_ref()
+                        .map(|report| report.layer.clone())
+                        .unwrap_or_default();
+                    let compaction_saved = compaction
+                        .as_ref()
+                        .map(|report| report.before.saturating_sub(report.after))
+                        .unwrap_or(0);
                     if !note.is_empty()
                         && let Some(chat) = self.chats.get_mut(chat_index)
                     {
@@ -876,10 +1050,42 @@ impl DshFlowApp {
                     let elapsed = pending.request.elapsed_ms();
                     let mut items = pending.items.clone();
                     let schemas = pending.schemas.clone();
+                    // The provider may report the whole thinking only with the
+                    // answer (no live fragments). No row means no readable
+                    // record, so one is written here in the same shape.
+                    let thinking_text = if reasoning.trim().is_empty() {
+                        pending.reasoning.clone()
+                    } else {
+                        reasoning.clone()
+                    };
                     // The number the panel counts requests by: this answer's
-                    // place among the answers of this conversation.
-                    let mut done = None;
+                    // place among the answers of this conversation. The same
+                    // figures feed the request line and the statistics ledger,
+                    // so they are gathered once, when the answer is built.
+                    struct Answered {
+                        turn: u64,
+                        tokens: u64,
+                        context: u64,
+                        calls: u64,
+                        cache_hits: u64,
+                        prompt_tokens: u64,
+                        model_ms: u64,
+                        tool_ms: u64,
+                        reasoning: String,
+                        reasoning_tokens: u32,
+                        web_searches: u32,
+                        web_fetches: u32,
+                    }
+                    let mut done: Option<Answered> = None;
                     if let Some(chat) = self.chats.get_mut(chat_index) {
+                        // A provider that reports the thinking only with the
+                        // answer sends no live fragments; without this the text
+                        // would have no row to live in.
+                        if self.pending[slot].thinking_rows == 0 && !thinking_text.trim().is_empty()
+                        {
+                            chat.messages
+                                .push(ChatMessage::thinking(thinking_text.clone(), rounds.max(1)));
+                        }
                         // What the tools returned during this question is
                         // replayed into its next round, so it belongs to what
                         // this question cost — and `chat.json` only kept the
@@ -918,6 +1124,21 @@ impl DshFlowApp {
                                 totals.get(tool_index).copied().unwrap_or(0),
                             )
                         };
+                        // Thinking tokens are output the bill includes, so they
+                        // join the request's make-up under their own category
+                        // instead of disappearing into the answer.
+                        let reasoning_total: u32 = round_reasoning
+                            .iter()
+                            .fold(0u32, |sum, tokens| sum.saturating_add(*tokens));
+                        let mut composition = composition;
+                        if reasoning_total > 0
+                            && let Some(slot) = ContextKind::ALL
+                                .iter()
+                                .position(|kind| *kind == ContextKind::Reasoning)
+                            && let Some(cell) = composition.get_mut(slot)
+                        {
+                            *cell = cell.saturating_add(reasoning_total);
+                        }
                         let turn = chat
                             .messages
                             .iter()
@@ -934,20 +1155,48 @@ impl DshFlowApp {
                         let mut message = ChatMessage::assistant(text);
                         message.model = model.clone();
                         message.elapsed_ms = elapsed;
+                        message.model_ms = model_ms;
+                        message.tool_ms = tool_ms;
                         message.tokens = usage.map_or(0, |usage| usage.total());
                         message.context = context;
                         message.cache_hits = cache_hits;
                         message.rounds = rounds;
                         message.round_tokens = round_tokens;
+                        message.round_reasoning = round_reasoning;
+                        message.server_tool_calls = server_tool_calls;
                         message.composition = composition;
                         message.tools_tokens = tools_tokens.min(u32::MAX as usize) as u32;
-                        done = Some((turn, message.tokens, message.context, calls));
+                        message.compaction_layer = compaction_layer;
+                        message.compaction_saved = compaction_saved;
+                        // Thinking is written as its own rows; the answer keeps only what it said.
+                        // Prompt tokens the question sent, summed over its
+                        // rounds: the denominator of its cache rate, and the
+                        // figure the ledger needs to report one later.
+                        let prompt_tokens: u64 = message
+                            .round_tokens
+                            .iter()
+                            .map(|(prompt, _, _)| *prompt)
+                            .sum();
+                        done = Some(Answered {
+                            turn,
+                            tokens: message.tokens,
+                            context: message.context,
+                            calls,
+                            cache_hits: message.cache_hits,
+                            prompt_tokens,
+                            model_ms: message.model_ms,
+                            tool_ms: message.tool_ms,
+                            reasoning: thinking_text.clone(),
+                            reasoning_tokens: reasoning_total,
+                            web_searches,
+                            web_fetches,
+                        });
                         chat.messages.push(message);
-                        settle_approvals(chat, "已失效");
+                        settle_interactions(chat, "已失效");
                         chat.touch();
                     }
                     self.pending.remove(slot);
-                    if let (Some((turn, tokens, context, calls)), Some((folder, title))) = (
+                    if let (Some(answered), Some((folder, title))) = (
                         done,
                         self.chats
                             .get(chat_index)
@@ -958,12 +1207,20 @@ impl DshFlowApp {
                         // the full text lives here, so the request can be opened
                         // again later without bloating `chat.json`.
                         let request = crate::chats::StoredRequest {
-                            turn,
+                            turn: answered.turn,
                             at_ms,
                             model,
-                            tokens,
-                            context,
-                            calls,
+                            tokens: answered.tokens,
+                            context: answered.context,
+                            calls: answered.calls,
+                            cache_hits: answered.cache_hits,
+                            prompt_tokens: answered.prompt_tokens,
+                            model_ms: answered.model_ms,
+                            tool_ms: answered.tool_ms,
+                            reasoning: answered.reasoning,
+                            reasoning_tokens: answered.reasoning_tokens,
+                            web_searches: answered.web_searches,
+                            web_fetches: answered.web_fetches,
                             items: items
                                 .iter()
                                 .map(|item| crate::chats::StoredRequestItem {
@@ -1055,6 +1312,8 @@ impl DshFlowApp {
                                     &retry.read_only_roots,
                                     retry.max_rounds,
                                     retry.max_calls,
+                                    retry.plan,
+                                    retry.web_search,
                                     &retry.attachments,
                                     plugin_dir.as_deref(),
                                     &plugins,
@@ -1117,7 +1376,7 @@ impl DshFlowApp {
                     if let Some(chat) = self.chats.get_mut(chat_index) {
                         chat.messages.extend(stopped_messages(&draft));
                         chat.messages.push(ChatMessage::note(error, true));
-                        settle_approvals(chat, "已取消");
+                        settle_interactions(chat, "已取消");
                         chat.touch();
                     }
                     self.pending.remove(slot);
@@ -1181,7 +1440,107 @@ impl DshFlowApp {
         let draft = pending.draft.trim().to_string();
         if let Some(chat) = self.chats.get_mut(index) {
             chat.messages.extend(stopped_messages(&draft));
-            settle_approvals(chat, "已取消");
+            settle_interactions(chat, "已取消");
+            chat.touch();
+        }
+        self.save_chats();
+        cx.notify();
+    }
+
+    /// Answer the structured question whose card sits at `index`.
+    pub(crate) fn answer_question(&mut self, index: usize, choice: String, cx: &mut Context<Self>) {
+        let Some(dir) = self
+            .chats
+            .get(self.active_chat)
+            .map(|chat| chat.dir.clone())
+        else {
+            return;
+        };
+        let Some(message) = self
+            .chats
+            .get(self.active_chat)
+            .and_then(|chat| chat.messages.get(index))
+        else {
+            return;
+        };
+        if message.role != Role::Question || !message.output.is_empty() {
+            return;
+        }
+        let call = message.call.clone();
+        if call.is_empty() {
+            return;
+        }
+        let Some(slot) = self.pending.iter().position(|pending| pending.dir == dir) else {
+            return;
+        };
+        if self.pending[slot].question.as_deref() != Some(call.as_str()) {
+            return;
+        }
+        let delivered = self.pending[slot].request.respond_question(&call, &choice);
+        self.pending[slot].question = None;
+        if let Some(message) = self
+            .chats
+            .get_mut(self.active_chat)
+            .and_then(|chat| chat.messages.get_mut(index))
+        {
+            message.output = if delivered {
+                format!("已选择：{choice}")
+            } else {
+                "已失效".to_string()
+            };
+        }
+        self.save_chats();
+        cx.notify();
+    }
+
+    /// Approve or reject the plan whose card sits at `index`.
+    pub(crate) fn answer_plan(&mut self, index: usize, approved: bool, cx: &mut Context<Self>) {
+        let Some(dir) = self
+            .chats
+            .get(self.active_chat)
+            .map(|chat| chat.dir.clone())
+        else {
+            return;
+        };
+        let Some(message) = self
+            .chats
+            .get(self.active_chat)
+            .and_then(|chat| chat.messages.get(index))
+        else {
+            return;
+        };
+        if message.role != Role::Plan || !message.output.is_empty() {
+            return;
+        }
+        let call = message.call.clone();
+        if call.is_empty() {
+            return;
+        }
+        let Some(slot) = self.pending.iter().position(|pending| pending.dir == dir) else {
+            return;
+        };
+        if self.pending[slot].plan.as_deref() != Some(call.as_str()) {
+            return;
+        }
+        let delivered = self.pending[slot].request.respond_plan(&call, approved);
+        self.pending[slot].plan = None;
+        if approved && delivered {
+            // A fallback retry of this question must not re-enter plan mode.
+            self.pending[slot].retry.plan = false;
+        }
+        if let Some(chat) = self.chats.get_mut(self.active_chat) {
+            // An approved plan ends plan mode for the next question; the current
+            // run keeps its guidance so the model can start executing.
+            if approved && delivered {
+                chat.plan = false;
+            }
+            if let Some(message) = chat.messages.get_mut(index) {
+                message.output = match (delivered, approved) {
+                    (true, true) => "已批准".to_string(),
+                    (true, false) => "已拒绝，继续修改".to_string(),
+                    (false, _) => "已失效".to_string(),
+                };
+            }
             chat.touch();
         }
         self.save_chats();

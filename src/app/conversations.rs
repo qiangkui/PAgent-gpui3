@@ -52,9 +52,20 @@ impl DshFlowApp {
                 read_only: chat.read_only,
                 full_access: chat.full_access,
                 auto_actions: chat.auto_actions,
+                auto_review: chat.auto_review,
                 max_rounds: chat.max_rounds,
                 max_calls: chat.max_calls,
                 mode: chat.mode.clone(),
+                web_search: chat.web_search,
+                plan: chat.plan,
+                todos: chat
+                    .todos
+                    .iter()
+                    .map(|todo| crate::chats::StoredTodo {
+                        text: todo.text.clone(),
+                        status: todo.status.key().to_string(),
+                    })
+                    .collect(),
                 messages: chat
                     .messages
                     .iter()
@@ -64,14 +75,22 @@ impl DshFlowApp {
                         failed: message.failed,
                         model: message.model.clone(),
                         elapsed_ms: message.elapsed_ms,
+                        model_ms: message.model_ms,
+                        tool_ms: message.tool_ms,
                         tokens: message.tokens,
                         context: message.context,
                         cache_hits: message.cache_hits,
                         rounds: message.rounds,
                         round_tokens: message.round_tokens.clone(),
+                        round_reasoning: message.round_reasoning.clone(),
                         composition: message.composition.clone(),
                         tools_tokens: message.tools_tokens,
+                        compaction_layer: message.compaction_layer.clone(),
+                        compaction_saved: message.compaction_saved,
                         interrupted: message.interrupted,
+                        reasoning: message.reasoning.clone(),
+                        server_tool_calls: message.server_tool_calls.clone(),
+                        round: message.round,
                         kind: message.kind.key().to_string(),
                         input: message.input.clone(),
                         output: message.output.clone(),
@@ -788,14 +807,21 @@ pub(crate) fn load_saved(
                     );
                     restored.model = message.model;
                     restored.elapsed_ms = message.elapsed_ms;
+                    restored.model_ms = message.model_ms;
+                    restored.tool_ms = message.tool_ms;
                     restored.tokens = message.tokens;
                     restored.context = message.context;
                     restored.cache_hits = message.cache_hits;
                     restored.rounds = message.rounds;
                     restored.round_tokens = message.round_tokens;
+                    restored.round_reasoning = message.round_reasoning;
                     restored.composition = message.composition;
                     restored.tools_tokens = message.tools_tokens;
+                    restored.compaction_layer = message.compaction_layer;
+                    restored.compaction_saved = message.compaction_saved;
                     restored.interrupted = message.interrupted;
+                    restored.reasoning = message.reasoning;
+                    restored.round = message.round;
                     restored.kind = AttachmentKind::from_key(&message.kind);
                     restored.input = message.input;
                     restored.output = message.output;
@@ -817,9 +843,20 @@ pub(crate) fn load_saved(
             chat.read_only = stored.read_only;
             chat.full_access = stored.full_access;
             chat.auto_actions = stored.auto_actions;
+            chat.auto_review = stored.auto_review;
             chat.max_rounds = stored.max_rounds;
             chat.max_calls = stored.max_calls;
             chat.mode = stored.mode;
+            chat.web_search = stored.web_search;
+            chat.plan = stored.plan;
+            chat.todos = stored
+                .todos
+                .into_iter()
+                .map(|todo| TodoItem {
+                    text: todo.text,
+                    status: TodoStatus::from_key(&todo.status),
+                })
+                .collect();
             chat.details = stored.details.into_iter().collect();
             chat.checks = stored.checks.into_iter().collect();
             chat
@@ -880,8 +917,11 @@ pub(crate) fn role_name(role: Role) -> &'static str {
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
+        Role::Thinking => "thinking",
         Role::Note => "note",
         Role::Approval => "approval",
+        Role::Question => "question",
+        Role::Plan => "plan",
         Role::Attachment => "attachment",
     }
 }
@@ -892,7 +932,10 @@ pub(crate) fn role_from(name: &str) -> Role {
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "tool" => Role::Tool,
+        "thinking" => Role::Thinking,
         "approval" => Role::Approval,
+        "question" => Role::Question,
+        "plan" => Role::Plan,
         "attachment" => Role::Attachment,
         _ => Role::Note,
     }

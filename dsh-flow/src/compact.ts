@@ -145,13 +145,36 @@ export function messageTokens(content: string | Array<Record<string, unknown>>):
 }
 
 /**
+ * How many tokens one wire message costs, its tool-call arguments included.
+ *
+ * The arguments of an assistant turn ride in `tool_calls`, not in `content`: a
+ * single `write` may carry hundreds of thousands of characters, and every later
+ * round resends them. Measuring only `content` made the pressure estimate blind
+ * to the largest messages, so a transcript dominated by one such call never
+ * triggered compaction and the endpoint kept refusing it.
+ * @param message - the message to measure.
+ * @returns estimated tokens.
+ */
+export function wireMessageTokens(message: CompactMessage): number {
+  let tokens = messageTokens(message.content)
+  if (message.tool_calls !== undefined) {
+    try {
+      tokens += estimateTokens(JSON.stringify(message.tool_calls))
+    } catch {
+      // A value that cannot be serialised never reaches the wire either.
+    }
+  }
+  return tokens
+}
+
+/**
  * Measure a whole transcript.
  * @param messages - the messages that would be sent.
  * @returns estimated prompt tokens.
  */
 export function transcriptTokens(messages: readonly CompactMessage[]): number {
   let tokens = 0
-  for (const message of messages) tokens += messageTokens(message.content)
+  for (const message of messages) tokens += wireMessageTokens(message)
   return tokens
 }
 
@@ -224,7 +247,9 @@ export function selectSummaryRange(
   let kept = 0
   let keepFrom = newestQuestion
   for (let index = newestQuestion - 1; index >= first; index -= 1) {
-    kept += messageTokens(messages[index]!.content)
+    // Tool-call arguments count as well: a turn carrying one huge `write` is
+    // exactly what the retained tail must not shelter from compaction.
+    kept += wireMessageTokens(messages[index]!)
     keepFrom = index
     if (kept >= limits.retainTokens) break
   }
@@ -340,13 +365,18 @@ export async function summarizeRange(
     if (message.role === 'system') continue
     const who =
       message.role === 'assistant' ? 'assistant' : message.role === 'tool' ? 'tool' : 'user'
-    // The span can itself be huge; the per-entry cap bounds the auxiliary call.
-    const body = pruneResult(flatContent(message.content), {
+    // The arguments a turn sent belong to the span too: without them a summary
+    // cannot say what a `write` actually put on disk. The per-entry cap keeps
+    // the auxiliary call bounded even so.
+    const calls =
+      message.tool_calls === undefined ? '' : `\n工具调用：${JSON.stringify(message.tool_calls)}`
+    const raw = `${flatContent(message.content)}${calls}`.trim()
+    if (raw === '') continue
+    const body = pruneResult(raw, {
       thresholdChars: 2_000,
       headChars: 1_400,
       tailChars: 400
     })
-    if (body.trim() === '') continue
     lines.push(`### ${who}\n${body.trim()}`)
   }
   if (lines.length === 0) return null
@@ -357,6 +387,10 @@ export async function summarizeRange(
     stream_options: { include_usage: true },
     max_tokens: target.maxTokens
   }
+  // The checkpoint has to fit its own budget. DeepSeek thinks by default, and
+  // that thinking would spend the same output tokens without adding a word of
+  // it; only DeepSeek is told, so a stricter gateway never sees the key.
+  if (target.baseUrl.toLowerCase().includes('deepseek')) body.thinking = { type: 'disabled' }
   try {
     const answer = await streamCompletion({
       url: `${target.baseUrl}/chat/completions`,
@@ -495,6 +529,9 @@ export function fitForModel(
 ): string {
   if (text.length <= limit) return text
   const room = limit - note.length
+  // A budget smaller than the note itself has no room for a tail; keeping the
+  // head bounded is better than slicing with a negative length.
+  if (room <= 0) return slicePoints(text, 0, Math.max(0, limit))
   const head = Math.ceil(room * 0.7)
   return `${slicePoints(text, 0, head)}${note}\n${slicePoints(text, Math.max(0, Array.from(text).length - (room - head)), Array.from(text).length)}`
 }

@@ -160,7 +160,7 @@ impl DshFlowApp {
                             .whitespace_normal()
                             .child(
                                 "每个技能一个文件夹，里面放 skill.json（name / description，可选 instructions），\
-                                 或再放一个 SKILL.md 写指令；然后点「重新扫描」并打开开关。",
+                                 或再放一个 SKILL.md 写指令；点标题旁的 + 选择这样的文件夹，会复制到这里并启用。",
                             ),
                     )
                     .child(
@@ -202,13 +202,9 @@ impl DshFlowApp {
                         cx,
                         |view, cx| view.refresh_skills(cx),
                     ),
-                    icon_button(
-                        "skills-example",
-                        "icons/plus.svg",
-                        palette,
-                        cx,
-                        |view, cx| view.create_example_skill(cx),
-                    ),
+                    icon_button("skills-add", "icons/plus.svg", palette, cx, |view, cx| {
+                        view.add_skill(cx)
+                    }),
                 ],
                 palette,
             ))
@@ -220,6 +216,7 @@ impl DshFlowApp {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    .contained_wheel()
                     .child(body),
             )
     }
@@ -236,27 +233,37 @@ impl DshFlowApp {
         cx.notify();
     }
 
-    /// Write the example skill into the folder.
-    pub(crate) fn create_example_skill(&mut self, cx: &mut Context<Self>) {
-        self.skills_dir =
-            AiSettings::skill_dir().unwrap_or_else(|| self.ai.data_dir().join("skills"));
-        match crate::skill::create_example() {
-            Ok((folder, true)) => {
-                self.skill_note = format!(
-                    "已生成 {}：打开开关后，下一次提问会把它的指令一起交给助手。",
-                    folder.display()
-                );
-            }
-            Ok((folder, false)) => {
-                let _ = open_path(&folder);
-                self.skill_note = format!(
-                    "{} 已存在，已打开它的文件夹（不会覆盖你改过的内容）。",
-                    folder.display()
-                );
+    /// Ask for a skill folder to copy into the skills folder.
+    pub(crate) fn add_skill(&mut self, cx: &mut Context<Self>) {
+        let opened = self.open_picker(
+            PickPurpose::Skill,
+            || match crate::folder::pick_folder("Add skill folder") {
+                Some(folder) => PickResult::Folder(folder),
+                None => PickResult::Cancelled,
+            },
+            cx,
+        );
+        if !opened {
+            self.skill_note = "已经有一个选择对话框打开了，先处理它。".to_string();
+            cx.notify();
+        }
+    }
+
+    /// Copy the chosen skill folder in, switch it on and rescan.
+    pub(crate) fn install_skill_folder(&mut self, source: &Path, cx: &mut Context<Self>) {
+        match crate::skill::import_skill(source) {
+            Ok(id) => {
+                self.ai.set_skill(&id, true);
+                if let Err(error) = self.ai.save() {
+                    self.banner = Some(Banner::error(error));
+                }
+                self.skill_note = format!("已添加技能「{id}」并启用：下一次提问会带上它的指令。");
             }
             Err(error) => self.skill_note = error,
         }
         self.installed_skills = crate::skill::scanned_skills(&self.skills_dir);
+        self.skill_menu = None;
+        self.skill_delete_confirm = None;
         cx.notify();
     }
 

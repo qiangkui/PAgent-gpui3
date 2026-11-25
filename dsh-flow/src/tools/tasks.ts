@@ -9,6 +9,7 @@
 
 import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { ToolResult } from './types.ts'
@@ -64,20 +65,52 @@ export async function startBackground(
   const dir = tasksDir(workDir)
   await fs.mkdir(dir, { recursive: true })
   const id = `task-${await nextNumber(dir)}`
-  const log = logPath(workDir, id)
+  const helper = process.env.DSH_SANDBOX_HELPER
+  const workspace = process.env.DSH_SANDBOX_WORKSPACE || workDir
+  const readonly = process.env.DSH_SANDBOX_READONLY === '1'
+  // A read-only sandbox cannot write the task folder, so its log lives in the
+  // Low-integrity temp folder instead; the record still points at it.
+  const log = helper && readonly
+    ? path.join(workspace, '.dsh-flow', 'sandbox-tmp', `${id}.log`)
+    : logPath(workDir, id)
   // A detached process cannot hand a file handle to its child on Windows, so a
   // small wrapper runs the command and writes the log itself; it is the process
   // whose pid is recorded, and the tree kill reaches the command from there.
   const wrapper = fileURLToPath(new URL('./task-run.ts', import.meta.url))
-  const child = spawn(process.execPath, [wrapper, log, cwd, command], {
-    cwd,
-    windowsHide: true,
-    // Detached so the answer can end while it keeps running; its own group is
-    // also what `killPid` ends.
-    detached: true,
-    stdio: 'ignore',
-    env: commandEnv()
-  })
+  const env = commandEnv()
+  let child
+  if (helper && process.platform === 'win32') {
+    const temp = path.join(workspace, '.dsh-flow', 'sandbox-tmp')
+    mkdirSync(path.dirname(log), { recursive: true })
+    const specPath = path.join(dir, `sandbox-${id}.json`)
+    const payload = {
+      cwd,
+      workspace,
+      readonly,
+      file: process.execPath,
+      args: [wrapper, log, cwd, command]
+    }
+    writeFileSync(specPath, JSON.stringify(payload), 'utf8')
+    env.TEMP = temp
+    env.TMP = temp
+    child = spawn(helper, ['--spec', specPath], {
+      cwd,
+      windowsHide: true,
+      detached: true,
+      stdio: 'ignore',
+      env
+    })
+  } else {
+    child = spawn(process.execPath, [wrapper, log, cwd, command], {
+      cwd,
+      windowsHide: true,
+      // Detached so the answer can end while it keeps running; its own group is
+      // also what `killPid` ends.
+      detached: true,
+      stdio: 'ignore',
+      env
+    })
+  }
   const pid = child.pid ?? 0
   child.on('error', () => {
     // Recorded below with pid 0; an empty log is the only trace left.

@@ -7,8 +7,17 @@
  * never sees or sets a path outside it.
  */
 
-import { DEFAULT_BASE_URL, DEFAULT_MODEL, historyMessages, userContent } from './ai.ts'
+import {
+  DEFAULT_BASE_URL,
+  DEFAULT_MODEL,
+  applyThinking,
+  emptyAnswerReason,
+  historyMessages,
+  userContent
+} from './ai.ts'
 import type { AiRequest } from './ai.ts'
+import { serverToolDeclarations, webEventRow, webReport, webSteps } from './web.ts'
+import type { WebSearchReport } from './web.ts'
 import {
   MAX_CODE_CHARS,
   MAX_SHELL_COMMAND,
@@ -17,7 +26,7 @@ import {
   runToolScoped,
   safeEnd
 } from './tools.ts'
-import type { Sandbox } from './tools.ts'
+import type { Sandbox, ToolDefinition } from './tools.ts'
 import { outsidePaths, resolveCommandDir, sandboxRefusal } from './tools/sandbox.ts'
 import { httpSummary } from './tools/http.ts'
 import { streamCompletion } from './stream.ts'
@@ -29,6 +38,7 @@ import type { WireToolCall } from './stream.ts'
 import {
   compactLimits,
   compactTranscript,
+  estimateTokens,
   fitForModel,
   transcriptTokens
 } from './compact.ts'
@@ -55,11 +65,142 @@ export const TOOL_TIMEOUT_MS = 60_000
  */
 const READ_ONLY_TOOLS = new Set(['read', 'list', 'glob', 'grep', 'tree', 'symbols', 'git'])
 
+/**
+ * Tools whose side effect has to be observed through.
+ *
+ * They are local file operations that finish in milliseconds; racing one
+ * against the tool timer would report a timeout while the change still lands,
+ * leaving the model wrong and the window's undo record behind the disk.
+ */
+const MUTATING_TOOLS = new Set(['write', 'edit', 'replace', 'move', 'delete'])
+
+/** Guidance added while the conversation is in plan mode. */
+const PLAN_GUIDE = [
+  '当前处于计划模式：先只读调查，不要修改文件，也不要运行会改变状态的命令。',
+  '把要做的事整理成一份完整计划（以 # 标题开头的 markdown），然后调用 exit_plan_mode 提交。',
+  '用户批准后才能开始执行；用户要求修改时，按反馈修订计划再提交。'
+].join('\n')
+
+/** One todo item as the model writes it. */
+export interface TodoUpdate {
+  /** What has to be done. */
+  text: string
+  /** `pending`, `in_progress` or `completed`. */
+  status: 'pending' | 'in_progress' | 'completed'
+}
+
+/** A structured question the model asks the person. */
+export interface QuestionRequest {
+  /** Provider id of the call, echoed back with the answer. */
+  call: string
+  /** What the model asks. */
+  question: string
+  /** The choices, in order. */
+  options: string[]
+  /** True when a free-form answer is allowed. */
+  allowCustom: boolean
+}
+
+/** A plan submitted for approval. */
+export interface PlanReviewRequest {
+  /** Provider id of the call, echoed back with the decision. */
+  call: string
+  /** The plan, markdown. */
+  plan: string
+}
+
+/** The models the window can act on besides files and commands. */
+const INTERACTION_TOOLS: ToolDefinition[] = [
+  {
+    type: 'function',
+    function: {
+      name: 'ask_user_question',
+      description:
+        '向用户提一个带选项的问题并等待回答。需要用户在几个方案中选择、或确认一个关键前提时使用；不要在能自己判断时滥用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: '要问用户的问题' },
+          options: {
+            type: 'array',
+            description: '2–6 个选项，按推荐顺序排列',
+            items: { type: 'string' }
+          },
+          allowCustom: {
+            type: 'boolean',
+            description: '是否允许用户自己输入（可选）'
+          }
+        },
+        required: ['question', 'options']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'todo_write',
+      description:
+        '写入或替换本次对话的待办列表。开始多步任务时列出计划，之后每次完成一步就更新状态；只保留当前列表，不要追加旧项。',
+      parameters: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            description: '完整的新列表，按执行顺序',
+            items: {
+              type: 'object',
+              properties: {
+                text: { type: 'string', description: '要做的事' },
+                status: {
+                  type: 'string',
+                  enum: ['pending', 'in_progress', 'completed'],
+                  description: '待办 / 进行中 / 完成'
+                }
+              },
+              required: ['text', 'status']
+            }
+          }
+        },
+        required: ['items']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'exit_plan_mode',
+      description:
+        '提交一份完整计划，等待用户批准后再执行。只有在计划模式下、并且计划已经写成以 # 标题开头的 markdown 时才能调用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          plan: { type: 'string', description: '完整计划，markdown，以 # 标题开头' }
+        },
+        required: ['plan']
+      }
+    }
+  }
+]
+
+/** Names the interaction tools, so an allow-list cannot hide them. */
+const INTERACTION_NAMES = new Set(INTERACTION_TOOLS.map((tool) => tool.function.name))
+
 /** Longest tool argument text kept for the transcript's expanded row. */
 export const MAX_STEP_INPUT = 2_000
 
 /** Longest tool result text kept for the transcript's expanded row. */
 export const MAX_STEP_OUTPUT = 4_000
+
+/**
+ * Longest tool arguments replayed to the model after their call has run.
+ *
+ * A `write` may carry up to `MAX_WRITE_CHARS` characters, and the assistant turn
+ * that asked for it is resent on every later round of the same question:
+ * compaction cannot reach it, because it belongs to the newest question. Once
+ * the result is in, the body has served its purpose; a note keeps the pairing
+ * (same id and name) without carrying the file through the rest of the loop.
+ */
+export const MAX_WIRE_ARGUMENTS = 8_000
 
 /**
  * Longest tool result handed back to the model. `read` alone may return 20 万
@@ -148,6 +289,22 @@ export interface ApprovalRequest {
   cwd?: string
 }
 
+/**
+ * Where a question's wall clock went, in milliseconds.
+ *
+ * Only the two phases the loop itself drives are measured: the model round
+ * trips (streaming included, so time-to-first-token is part of it) and the tool
+ * runs. Everything else — compaction, approvals the person answered, prompt
+ * assembly, process start — stays unattributed, which is what lets the window
+ * show an honest "其他" bucket instead of guessing.
+ */
+export interface AgentTiming {
+  /** Wall clock spent waiting for model round trips. */
+  modelMs: number
+  /** Wall clock spent running tools. */
+  toolMs: number
+}
+
 /** What the loop produced. */
 export interface AgentResult {
   /** The assistant's final text. */
@@ -174,10 +331,44 @@ export interface AgentResult {
    */
   roundTokens: Array<[number, number, number]>
   /**
+   * Estimated thinking tokens of each round, oldest first: output the bill
+   * includes that the prompt never holds. Empty for providers that do not
+   * stream reasoning, which reads as zero everywhere downstream.
+   */
+  roundReasoning: number[]
+  /**
+   * The thinking text itself, every round joined with a blank line: what the
+   * window shows in a collapsible block above the answer. Empty when the
+   * provider streams none.
+   */
+  reasoning: string
+  /**
    * Prompt tokens the provider served from its cache, summed over rounds. The
    * bill is cheaper by this much, so the window shows it beside the spend.
    */
   cacheHits: number
+  /**
+   * Where the question's wall clock went: the model round trips and the tool
+   * runs, both summed. The window subtracts them from the answer's elapsed time
+   * to show what it could not attribute, and hides the card when both are zero
+   * (an older engine reported neither).
+   */
+  timing: AgentTiming
+  /**
+   * What the provider's own server tools did for this question: searches and
+   * page reads run on its side, so this is the only trace of them the window
+   * gets besides the rows handed to `onStep`.
+   */
+  webSearch: WebSearchReport
+  /**
+   * The raw `server_tool_calls` and citation entries of every round, oldest
+   * first. Kept so a caller can store them and pass them back on the next
+   * question: the provider restores pages read earlier from them, and drops
+   * that context silently when they are missing.
+   */
+  serverCalls: unknown[]
+  /** Raw `url_citation` entries of every round, in arrival order. */
+  annotations: unknown[]
   /**
    * What the context compaction did to this question, when it did anything.
    * Absent for a question that fit, so a short one is never annotated.
@@ -209,6 +400,13 @@ export interface AgentOptions {
   sandbox?: Sandbox | null
   /** Called before a `write` / `edit`; resolves false to leave the file alone. */
   approve?: (request: ApprovalRequest) => Promise<boolean>
+  /**
+   * True when the caller asked for writes to be confirmed but has no
+   * `approve` bridge to ask through (a one-shot run). A write is then refused
+   * instead of running silently, the same way commands are refused without a
+   * confirmation bridge.
+   */
+  requireWriteApproval?: boolean
   /** Reports a write that proceeds without waiting for a decision. */
   onApproval?: (request: ApprovalRequest) => void
   /**
@@ -217,6 +415,14 @@ export interface AgentOptions {
    * refused, so a caller that cannot ask never runs one.
    */
   confirmActions?: (request: ApprovalRequest) => Promise<boolean>
+  /** True when the question starts in plan mode. */
+  plan?: boolean
+  /** Ask the person a structured question and wait for the chosen option. */
+  askUser?: (request: QuestionRequest) => Promise<string>
+  /** Submit a plan for approval; resolves false when the person wants changes. */
+  reviewPlan?: (request: PlanReviewRequest) => Promise<boolean>
+  /** The model replaced the conversation's todo list. */
+  onTodo?: (items: TodoUpdate[]) => void
   /** Called once per tool call, before its result goes back to the model. */
   onStep?: (step: AgentStep) => void
   /**
@@ -226,6 +432,8 @@ export interface AgentOptions {
   onProgress?: (progress: AgentProgress) => void
   /** Called with each fragment of the answer, as the model writes it. */
   onDelta?: (text: string) => void
+  /** Called with each fragment of the model's thinking, when it streams one. */
+  onReasoning?: (text: string) => void
   /** Called when a `shell` command is about to run, before its first output. */
   onToolStart?: (call: string, tool: string, target: string) => void
   /** Called with throttled `shell` output while the command is still running. */
@@ -271,6 +479,10 @@ export interface ToolSchema {
   name: string
   /** The whole definition, serialised, for a readable breakdown. */
   schema: string
+  /** Plugin folder that registered the tool, when a plugin did. */
+  plugin?: string
+  /** MCP server that offers the tool, when one does. */
+  server?: string
 }
 
 /** One entry of the wire-level `messages` array. */
@@ -280,6 +492,11 @@ interface WireMessage {
   content: string | Array<Record<string, unknown>>
   tool_calls?: WireToolCall[]
   tool_call_id?: string
+  /**
+   * Server tools this assistant turn ran, passed back so the provider keeps the
+   * pages it read in context for the rounds that follow.
+   */
+  server_tool_calls?: unknown[]
 }
 
 /**
@@ -305,12 +522,24 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
   const pluginTools = options.plugins ?? []
   const mcpTools = options.mcpTools ?? []
   const builtins = allowed ? TOOLS.filter((tool) => allowed.has(tool.function.name)) : TOOLS
+  // Plan guidance and the exit tool only exist while the conversation is in
+  // plan mode; asking and todo-writing are always available with tools on.
+  const planMode = options.plan === true || request.plan === true
+  // The loop's tool executor reads the same flag; an approved plan clears it.
+  options.plan = planMode
+  const interactionTools = INTERACTION_TOOLS.filter(
+    (tool) => planMode || tool.function.name !== 'exit_plan_mode'
+  )
   // Plugin and MCP tools are not in the window's allow-list (that list names
   // the engine's own tools), so they are added on top and callable by name.
   const pluginNames = new Set(pluginTools.map((tool) => tool.name))
   const mcpNames = new Set(mcpTools.map((tool) => tool.name))
-  const tools = [
+  // The tools this engine runs itself. They stay a separate list from the wire
+  // array because the prompt accounting and the window's panel count function
+  // schemas only, and the server tools have none.
+  const functionTools = [
     ...builtins,
+    ...interactionTools,
     ...pluginTools.map((tool) => ({
       type: 'function' as const,
       function: {
@@ -328,9 +557,29 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       }
     }))
   ]
+  // `deepseek_web_search` / `deepseek_read_url`: the model may go online and the
+  // provider runs the search itself, so these are declared to the wire and never
+  // added to the local loop.
+  const webSearch = request.webSearch === true
+  const wireTools = webSearch
+    ? [...serverToolDeclarations(), ...functionTools]
+    : functionTools
   /** Whether this request may run the named tool. */
   const permitted = (name: string): boolean =>
-    allowed === null || allowed.has(name) || pluginNames.has(name) || mcpNames.has(name)
+    INTERACTION_NAMES.has(name) ||
+    allowed === null ||
+    allowed.has(name) ||
+    pluginNames.has(name) ||
+    mcpNames.has(name)
+  // Which tool came from where. The window counts a plugin's contribution on its
+  // card; the origin never reaches the model, so it rides beside the schema.
+  const origins = new Map<string, { plugin?: string; server?: string }>()
+  for (const tool of pluginTools) origins.set(tool.name, { plugin: tool.plugin })
+  for (const tool of mcpTools) {
+    // The `mcp` gateway belongs to no single server, so it keeps no origin.
+    if (tool.name === 'mcp') continue
+    origins.set(tool.name, { server: tool.server })
+  }
   const scope = options.scopeRoot === undefined ? options.root : options.scopeRoot
 
   const messages: WireMessage[] = []
@@ -341,7 +590,9 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     .map((prompt) => prompt.text.trim())
     .filter((text) => text !== '')
     .join('\n\n')
-  const full = [system, injected].filter((part) => part !== '').join('\n\n')
+  const full = [system, injected, planMode ? PLAN_GUIDE : '']
+    .filter((part) => part !== '')
+    .join('\n\n')
   if (full) messages.push({ role: 'system', content: full })
   messages.push(...historyMessages(request.history))
   messages.push({ role: 'user', content: userContent(prompt, request.attachments) })
@@ -355,7 +606,7 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     contextWindow: typeof request.contextWindow === 'number' ? request.contextWindow : 0,
     systemChars: full.length,
     injectedChars: injected.length,
-    toolChars: tools.reduce(
+    toolChars: functionTools.reduce(
       (total, tool) =>
         total +
         tool.function.name.length +
@@ -372,7 +623,12 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     }))
   })
   options.onTools?.({
-    items: tools.map((tool) => ({ name: tool.function.name, schema: JSON.stringify(tool) })),
+    items: functionTools.map((tool) => {
+      const origin = origins.get(tool.function.name)
+      return origin === undefined
+        ? { name: tool.function.name, schema: JSON.stringify(tool) }
+        : { name: tool.function.name, schema: JSON.stringify(tool), ...origin }
+    }),
     prompts: options.promptInjections ?? [],
     panels: collected.panels,
     panelErrors: collected.errors
@@ -380,6 +636,10 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
 
   let calls = 0
   let reason = ''
+  // Ids the transcript already used: a gateway that omits them gets the same
+  // `call_0` on every round, and a repeated id makes the tool pairing ambiguous
+  // for stricter endpoints.
+  const seenCalls = new Set<string>()
   // Indices of tool messages, oldest first, plus their text, so the transcript
   // can shrink without breaking the `tool_call_id` pairing.
   const toolResults: number[] = []
@@ -414,8 +674,58 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
   let taken = 0
   // What each round cost, so the window can show where the bill comes from.
   const roundTokens: Array<[number, number, number]> = []
+  // Thinking tokens per round, measured from the text the provider streamed.
+  const roundReasoning: number[] = []
+  // The thinking itself, so the window can show it under the answer instead of
+  // only counting what it cost.
+  const reasoningParts: string[] = []
   // Prompt tokens the provider served from its cache, summed over rounds.
   let cacheHits = 0
+  // Server tools the provider ran for this question and the citations of the
+  // answer, both raw so the report can list the sources.
+  const webCalls: unknown[] = []
+  const webCitations: unknown[] = []
+  /**
+   * Show what the provider's server tools did this round.
+   *
+   * They run on its side, so there is no local tool loop to report them; the
+   * rows go out as ordinary steps, which is what the transcript, the actions
+   * card and the saved conversation already know how to draw.
+   * @param answer - the round that just finished.
+   * @param prefix - id prefix, unique per round.
+   */
+  const reportWeb = (
+    answer: Awaited<ReturnType<typeof streamCompletion>>,
+    prefix: string
+  ): void => {
+    for (const step of webSteps(answer.serverCalls, answer.annotations, prefix)) {
+      options.onStep?.(step)
+    }
+    webCalls.push(...answer.serverCalls)
+    webCitations.push(...answer.annotations)
+  }
+  // Where the question's wall clock went. A compaction pass or a person's slow
+  // approval is deliberately left out of both, so it reads as 其他 downstream
+  // instead of being blamed on the model or the tools.
+  let modelMs = 0
+  let toolMs = 0
+  /**
+   * Run one phase and add its wall clock to a timing bucket.
+   * @param bucket - which of the two measured phases this is.
+   * @param run - the work to time; its result and errors pass through.
+   * @returns whatever `run` resolved to.
+   */
+  const timed = async <T>(bucket: 'model' | 'tool', run: () => Promise<T>): Promise<T> => {
+    const startedAt = Date.now()
+    try {
+      return await run()
+    } finally {
+      // `finally`, so a failed request still counts as time the person waited.
+      const spent = Date.now() - startedAt
+      if (bucket === 'model') modelMs += spent
+      else toolMs += spent
+    }
+  }
   // The compaction layers: prune under pressure, summarize the oldest whole
   // turns with the model, and drop that range only if the model call fails.
   const limits = compactLimits(options.windowTokens ?? DEFAULT_WINDOW_TOKENS)
@@ -465,8 +775,19 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
    * what keeps a long conversation answerable instead of failing outright.
    */
   const askOnce = async (
-    build: () => Record<string, unknown>
+    build: () => Record<string, unknown>,
+    round: number
   ): Promise<{ answer: Awaited<ReturnType<typeof streamCompletion>>; retried: boolean }> => {
+    // Server tools run on the provider's side, so each `call_started` is shown
+    // as a running row with the id the finished step will use; the counter
+    // counts calls only, matching the order the finished calls arrive in.
+    let liveCalls = 0
+    const onServerEvent = (event: unknown): void => {
+      const row = webEventRow(event, `round-${round}`, liveCalls + 1)
+      if (row === null) return
+      liveCalls += 1
+      options.onToolStart?.(row.call, row.tool, row.target)
+    }
     try {
       return {
         answer: await streamCompletion({
@@ -476,7 +797,9 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
           body: build(),
           fetchImpl: options.fetchImpl,
           timeoutMs: request.timeoutMs,
-          onDelta: options.onDelta
+          onDelta: options.onDelta,
+          onReasoning: options.onReasoning,
+          onServerEvent
         }),
         retried: false
       }
@@ -494,7 +817,11 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
           body: build(),
           fetchImpl: options.fetchImpl,
           timeoutMs: request.timeoutMs,
-          onDelta: options.onDelta
+          onDelta: options.onDelta,
+          onReasoning: options.onReasoning,
+          // The retried attempt can run server tools too; without this its
+          // searches would only appear once they finish, never as running rows.
+          onServerEvent
         }),
         retried: true
       }
@@ -512,24 +839,41 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
         model,
         messages,
         stream: true,
-        tools,
+        tools: wireTools,
         stream_options: { include_usage: true }
       }
       if (typeof request.temperature === 'number') body.temperature = request.temperature
       if (typeof request.maxTokens === 'number') body.max_tokens = request.maxTokens
+      applyThinking(body, request.reasoning)
       return body
     }
-    const { answer, retried } = await askOnce(build)
+    const { answer, retried } = await timed('model', () => askOnce(build, round))
 
     spent = addUsage(usage, answer.usage) || spent
     context = contextSize(answer.usage) || context
     cacheHits += cacheHitSize(answer.usage)
     const counted = roundCount(answer.usage)
     if (counted !== null) roundTokens.push([counted[0], counted[1], answer.toolCalls.length])
+    // Thinking is output, so it rides with the round that produced it instead
+    // of being folded into the answer or the prompt.
+    roundReasoning.push(estimateTokens(answer.reasoning))
+    if (answer.reasoning.trim() !== '') reasoningParts.push(answer.reasoning)
+    // A search the model ran on the provider's side is shown before the answer
+    // it produced, the way a local tool's row is.
+    reportWeb(answer, `round-${round}`)
+
+    let renamed = 0
+    for (const call of answer.toolCalls) {
+      if (call.id === '' || seenCalls.has(call.id)) {
+        call.id = `call_${round}_${renamed}`
+        renamed += 1
+      }
+      seenCalls.add(call.id)
+    }
 
     if (answer.toolCalls.length === 0) {
-      const text = answer.content.trim()
-      if (!text) throw new Error(`${model} 没有返回内容`)
+      const text = fullAnswer(answer.content, answer.finishReason)
+      if (!text.trim()) throw new Error(emptyAnswerReason(model, answer.finishReason))
       return {
         text,
         model,
@@ -537,12 +881,25 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
         context,
         rounds: retried ? round + 1 : round,
         roundTokens,
+        roundReasoning,
+        reasoning: reasoningParts.join('\n\n'),
         cacheHits,
+        webSearch: webReport(webCalls, webCitations),
+        serverCalls: webCalls,
+        annotations: webCitations,
+        timing: { modelMs, toolMs },
         compaction
       }
     }
 
-    messages.push({ role: 'assistant', content: answer.content, tool_calls: answer.toolCalls })
+    messages.push({
+      role: 'assistant',
+      content: answer.content,
+      tool_calls: answer.toolCalls,
+      // The search this round ran is part of the turn too; the next round's
+      // request keeps those pages in context only when they ride along.
+      ...(answer.serverCalls.length > 0 ? { server_tool_calls: answer.serverCalls } : {})
+    })
     const planned = answer.toolCalls.map((call) => {
       const name = call.function?.name ?? ''
       const rawArgs: unknown = call.function?.arguments
@@ -557,12 +914,14 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     const remaining = Math.max(0, maxCalls - calls)
     const onlyReads = planned.every((entry) => READ_ONLY_TOOLS.has(entry.name))
     const prepared = onlyReads
-      ? await Promise.all(
-          planned.map((entry, index) => {
-            if (index >= remaining || entry.parsed.problem !== '') return null
-            if (!permitted(entry.name)) return null
-            return runToolWithTimeout(options, scope, entry.call.id, entry.name, entry.args)
-          })
+      ? await timed('tool', () =>
+          Promise.all(
+            planned.map((entry, index) => {
+              if (index >= remaining || entry.parsed.problem !== '') return null
+              if (!permitted(entry.name)) return null
+              return runToolWithTimeout(options, scope, entry.call.id, entry.name, entry.args)
+            })
+          )
         )
       : planned.map(() => null)
     for (const [index, entry] of planned.entries()) {
@@ -599,7 +958,7 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       } else {
         // A broken approval bridge must fail this call, not the answer: the
         // write stays undone and the model still gets a usable turn.
-        result = await runToolWithTimeout(options, scope, call.id, name, args)
+        result = await timed('tool', () => runToolWithTimeout(options, scope, call.id, name, args))
       }
       options.onStep?.({
         tool: name,
@@ -612,6 +971,10 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       })
       pushToolResult(call.id, fitToolResult(result.text))
     }
+    // The results are in, so the arguments no longer have to ride along in
+    // full: the assistant turn is replayed on every later round of this
+    // question, and compaction cannot drop a turn of the newest question.
+    for (const entry of planned) shrinkArguments(entry.call, entry.args)
     if (reason !== '') break
   }
   if (reason === '') reason = `模型往返达到 ${maxRounds} 轮上限`
@@ -629,22 +992,28 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
   }
   if (typeof request.temperature === 'number') body.temperature = request.temperature
   if (typeof request.maxTokens === 'number') body.max_tokens = request.maxTokens
+  applyThinking(body, request.reasoning)
   try {
-    const answer = await streamCompletion({
-      url: `${baseUrl}/chat/completions`,
-      apiKey,
-      label: model,
-      body,
-      fetchImpl: options.fetchImpl,
-      timeoutMs: request.timeoutMs,
-      onDelta: options.onDelta
-    })
+    const answer = await timed('model', () =>
+      streamCompletion({
+        url: `${baseUrl}/chat/completions`,
+        apiKey,
+        label: model,
+        body,
+        fetchImpl: options.fetchImpl,
+        timeoutMs: request.timeoutMs,
+        onDelta: options.onDelta,
+        onReasoning: options.onReasoning
+      })
+    )
     spent = addUsage(usage, answer.usage) || spent
     context = contextSize(answer.usage) || context
     cacheHits += cacheHitSize(answer.usage)
     const counted = roundCount(answer.usage)
     if (counted !== null) roundTokens.push([counted[0], counted[1], 0])
-    const text = answer.content.trim()
+    roundReasoning.push(estimateTokens(answer.reasoning))
+    if (answer.reasoning.trim() !== '') reasoningParts.push(answer.reasoning)
+    const text = fullAnswer(answer.content, answer.finishReason)
     const note = `（${reason}，先给出基于已有信息的结果；需要继续时再发一条消息。）`
     return {
       text: text ? `${text}\n\n${note}` : note,
@@ -653,7 +1022,13 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       context,
       rounds: taken + 1,
       roundTokens,
+      roundReasoning,
+      reasoning: reasoningParts.join('\n\n'),
       cacheHits,
+      webSearch: webReport(webCalls, webCitations),
+      serverCalls: webCalls,
+      annotations: webCitations,
+      timing: { modelMs, toolMs },
       compaction
     }
   } catch (error) {
@@ -665,7 +1040,13 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       context,
       rounds: taken + 1,
       roundTokens,
+      roundReasoning,
+      reasoning: reasoningParts.join('\n\n'),
       cacheHits,
+      webSearch: webReport(webCalls, webCitations),
+      serverCalls: webCalls,
+      annotations: webCitations,
+      timing: { modelMs, toolMs },
       compaction
     }
   }
@@ -712,13 +1093,73 @@ async function runAllowedTool(
   name: string,
   args: Record<string, unknown>
 ): Promise<{ ok: boolean; text: string }> {
+  if (name === 'ask_user_question') {
+    const question = typeof args.question === 'string' ? args.question.trim() : ''
+    if (question === '') return { ok: false, text: '缺少参数 question' }
+    const offered = Array.isArray(args.options) ? args.options : []
+    const choices = offered
+      .map((option) => (typeof option === 'string' ? option.trim() : ''))
+      .filter((option) => option !== '')
+    if (choices.length < 2 || choices.length > 6) {
+      return { ok: false, text: 'options 需要 2–6 个非空选项' }
+    }
+    if (!options.askUser) return { ok: false, text: '没有提问界面，这次提问没有发出。' }
+    const answer = await options.askUser({
+      call: id,
+      question,
+      options: choices,
+      allowCustom: args.allowCustom === true
+    })
+    if (answer.trim() === '') return { ok: false, text: '用户没有给出回答。' }
+    return { ok: true, text: `用户选择：${answer.trim()}` }
+  }
+  if (name === 'todo_write') {
+    const listed = Array.isArray(args.items) ? args.items : []
+    if (listed.length > 30) return { ok: false, text: '待办最多 30 项' }
+    const items: TodoUpdate[] = []
+    for (const item of listed) {
+      if (!item || typeof item !== 'object') continue
+      const entry = item as Record<string, unknown>
+      const text = typeof entry.text === 'string' ? entry.text.trim() : ''
+      if (text === '') continue
+      const status =
+        entry.status === 'in_progress' || entry.status === 'completed'
+          ? entry.status
+          : 'pending'
+      items.push({ text, status })
+    }
+    const done = items.filter((item) => item.status === 'completed').length
+    options.onTodo?.(items)
+    return {
+      ok: true,
+      text: items.length === 0 ? '待办列表已清空。' : `已更新待办：${done}/${items.length} 完成。`
+    }
+  }
+  if (name === 'exit_plan_mode') {
+    if (options.plan !== true) return { ok: false, text: '当前不在计划模式。' }
+    const plan = typeof args.plan === 'string' ? args.plan.trim() : ''
+    if (!plan.startsWith('#')) {
+      return { ok: false, text: '计划需要是一份以 # 标题开头的完整 markdown。' }
+    }
+    if (!options.reviewPlan) return { ok: false, text: '没有计划审批界面，计划没有提交。' }
+    const approved = await options.reviewPlan({ call: id, plan })
+    if (!approved) {
+      // Keep plan mode on: the model revises and submits again.
+      return { ok: false, text: '用户没有批准计划，请继续完善后再次提交。' }
+    }
+    // The current run may now execute; the window also clears the conversation's
+    // plan flag, so the next question starts in normal mode.
+    options.plan = false
+    return { ok: true, text: '用户已批准计划，可以开始执行。' }
+  }
   if (name === 'mcp') {
     const gateway = options.mcpTools?.find((tool) => tool.name === 'mcp')
     if (!gateway) return { ok: false, text: 'MCP 工具没有加载。' }
     const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : ''
-    // Listing and disconnecting change nothing outside this question; linking
-    // starts a process or opens a connection, and calling runs its tool.
-    if (action === 'link' || action === 'call') {
+    // Listing and describing change nothing outside this question; linking
+    // starts a process or opens a connection, calling runs its tool, and
+    // disconnecting stops a server that is already running.
+    if (action === 'link' || action === 'call' || action === 'disconnect') {
       if (!options.confirmActions) {
         return { ok: false, text: '没有确认界面，MCP 操作没有执行。' }
       }
@@ -965,6 +1406,10 @@ async function runAllowedTool(
         if (!allowed) {
           return { ok: false, text: '用户拒绝了这次写入，文件没有改动。' }
         }
+      } else if (options.requireWriteApproval) {
+        // The caller wanted a decision but gave no way to ask for one; running
+        // the write anyway would be a confirmation bypass.
+        return { ok: false, text: '没有确认界面，这次写入没有执行。' }
       } else {
         options.onApproval?.(question)
       }
@@ -1008,7 +1453,18 @@ async function runToolWithTimeout(
     const message = error instanceof Error ? error.message : String(error)
     return { ok: false, text: `工具没有执行：${message}` }
   })
-  if (name === 'shell' || name === 'python' || name === 'node') return await work
+  // A tool whose effect has to be observed is never raced: giving up while a
+  // write or a delete is still in flight would report a failure that did not
+  // happen, and the window's undo record would disagree with the disk.
+  if (
+    name === 'shell' ||
+    name === 'python' ||
+    name === 'node' ||
+    MUTATING_TOOLS.has(name) ||
+    INTERACTION_NAMES.has(name)
+  ) {
+    return await work
+  }
   let timer: ReturnType<typeof setTimeout> | undefined
   const limit = new Promise<{ ok: boolean; text: string }>((resolve) => {
     timer = setTimeout(() => {
@@ -1158,6 +1614,16 @@ function describe(name: string, args: Record<string, unknown>): string {
     const id = typeof args.id === 'string' ? args.id.trim() : ''
     return id === '' ? action : `${action} ${id}`
   }
+  // The interaction tools are named by what they ask for.
+  if (name === 'ask_user_question') {
+    const question = typeof args.question === 'string' ? args.question.trim() : ''
+    return question.length > 200 ? `${question.slice(0, safeEnd(question, 200))}…` : question
+  }
+  if (name === 'todo_write') {
+    const items = Array.isArray(args.items) ? args.items : []
+    return `${items.length} 项待办`
+  }
+  if (name === 'exit_plan_mode') return '提交计划'
   // `move` has no `path`: without this its step row would only say "move".
   const from = typeof args.from === 'string' ? args.from : ''
   const target = path || pattern || command || from || name
@@ -1197,6 +1663,44 @@ function clipArgs(args: Record<string, unknown>): string {  let text: string
  */
 function fitToolResult(text: string): string {
   return fitForModel(text, MAX_TOOL_MESSAGE)
+}
+
+/** What an answer cut short by the output cap says about itself. */
+const LENGTH_NOTE = '（输出达到长度上限，回答可能未写完。）'
+
+/**
+ * The text of one answer, flagged when the provider stopped at the output cap.
+ *
+ * A partial answer is still worth showing, but returning it as if it were
+ * complete hides that it was cut; the person would only notice by re-reading it.
+ * @param content - what the provider wrote.
+ * @param finishReason - why the round ended.
+ * @returns the answer text, with a note when it ended on `length`.
+ */
+function fullAnswer(content: string, finishReason: string): string {
+  const text = content.trim()
+  if (text === '' || finishReason !== 'length') return text
+  return `${text}\n\n${LENGTH_NOTE}`
+}
+
+/**
+ * Replace oversized tool arguments with a note once the call has run.
+ *
+ * The id, type and name stay untouched, so the assistant turn still pairs with
+ * its tool result; only the body the model already used is shortened. Without
+ * this, one `write` of a large file rides in every later round of the same
+ * question, and compaction cannot drop a turn of the newest question.
+ * @param call - the wire call, updated in place.
+ * @param args - the arguments the tool actually ran with.
+ */
+function shrinkArguments(call: WireToolCall, args: Record<string, unknown>): void {
+  const text = call.function.arguments
+  if (text.length <= MAX_WIRE_ARGUMENTS) return
+  const where = textArg(args.path) || textArg(args.from) || textArg(args.url)
+  call.function.arguments = JSON.stringify({
+    ...(where === '' ? {} : { path: where }),
+    omitted: `参数过长（${text.length} 字符），已省略；执行结果见对应的工具消息。`
+  })
 }
 
 /**

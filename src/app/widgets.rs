@@ -2,6 +2,329 @@
 
 use super::*;
 
+/// A small on/off pill: the track and its knob, no label and no handler.
+///
+/// The row that holds it is the hit target, so this stays a drawing: the
+/// composer's per-conversation menu uses it to show a setting's state, and
+/// [`menu_switch_row`] wraps it with the name and the click.
+pub(crate) fn switch_pill(on: bool, palette: Palette) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .w(px(28.))
+        .h(px(16.))
+        .px(px(2.))
+        .rounded_full()
+        .bg(rgb(if on {
+            palette.accent
+        } else {
+            palette.panel_soft
+        }))
+        .border_1()
+        .border_color(rgb(if on { palette.accent } else { palette.border }))
+        .when(on, |this| this.justify_end())
+        .when(!on, |this| this.justify_start())
+        .child(div().size(px(10.)).rounded_full().bg(rgb(if on {
+            palette.accent_text
+        } else {
+            palette.muted
+        })))
+}
+
+/// One per-conversation setting: its name, a line about what it does, and a
+/// switch that turns it on or off.
+///
+/// The whole row is the hit target, so a click anywhere on it flips the switch
+/// rather than only on the 28-by-16 pill.
+pub(crate) fn menu_switch_row(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    note: impl Into<SharedString>,
+    on: bool,
+    palette: Palette,
+    cx: &mut Context<DshFlowApp>,
+    action: impl Fn(&mut DshFlowApp, &mut Context<DshFlowApp>) + 'static,
+) -> AnyElement {
+    let note: SharedString = note.into();
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_3()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(palette.panel_soft)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+        )
+        .on_click(cx.listener(move |view, _, _, cx| action(view, cx)))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w(px(0.))
+                .gap_0p5()
+                .child(div().text_xs().text_color(rgb(palette.text)).child(label))
+                .when(!note.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette.faint))
+                            .whitespace_normal()
+                            .child(note.clone()),
+                    )
+                }),
+        )
+        .child(switch_pill(on, palette))
+        .into_any_element()
+}
+
+/// One choice of a per-conversation figure, laid out in a row of small chips.
+pub(crate) fn menu_choice(
+    id: impl Into<ElementId>,
+    label: impl Into<String>,
+    selected: bool,
+    palette: Palette,
+    cx: &mut Context<DshFlowApp>,
+    action: impl Fn(&mut DshFlowApp, &mut Context<DshFlowApp>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(if selected {
+            palette.panel_soft
+        } else {
+            palette.canvas
+        }))
+        .text_xs()
+        .text_color(rgb(if selected {
+            palette.accent
+        } else {
+            palette.muted
+        }))
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(palette.panel_soft)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+        )
+        .on_click(cx.listener(move |view, _, _, cx| action(view, cx)))
+        .child(label.into())
+        .into_any_element()
+}
+
+/// A slider over a fixed list of values: a rail, a ring per notch, and one hit
+/// area per notch.
+///
+/// Painting is one track, one fill, a ring per notch and one knob, all placed
+/// from the same fraction (`notch / (notches - 1)`): the fill ends exactly where
+/// the knob's centre is, and every ring sits on a notch the pointer can reach,
+/// so the count of stops is readable without dragging. The knob is always drawn
+/// — an unset setting parks it on the value it stands for.
+///
+/// Rings past the knob use the rail's own colour, so the filled half reads as
+/// one piece. A disabled slider (`enabled == false`) paints everything in the
+/// rail colour and takes no input: the row's value still shows, it just cannot
+/// be moved (temperature while thinking is on).
+///
+/// Hit testing is still one area per notch rather than a bounds check, so a
+/// click lands on the notch under the pointer and a drag across the rail keeps
+/// setting values as it passes (each area reports its own mouse moves while the
+/// button is down). The rail is inset by half a knob at each end so the knob can
+/// reach 0 % and 100 % without hanging outside the control.
+pub(crate) fn settings_slider(
+    id: &'static str,
+    notches: usize,
+    active: usize,
+    enabled: bool,
+    palette: Palette,
+    cx: &mut Context<DshFlowApp>,
+    on_pick: impl Fn(&mut DshFlowApp, usize, &mut Context<DshFlowApp>) + Clone + 'static,
+) -> Div {
+    /// Height of the whole control, which is also the knob's room to sit in.
+    const RAIL_HEIGHT: f32 = 18.;
+    /// Thickness of the rail itself.
+    const BAR: f32 = 4.;
+    /// Diameter of the knob, gap ring included.
+    const KNOB: f32 = 16.;
+    /// Diameter of the coloured dot inside that ring: one pixel of background
+    /// all round, which keeps the dot from blurring into the rail it sits on
+    /// without the ring reading as a white wheel of its own.
+    const DOT: f32 = 14.;
+    /// Diameter of a notch ring: twice the rail, so the hole still shows.
+    const TICK: f32 = 8.;
+    /// Thickness of that ring.
+    const RING: f32 = 2.;
+    /// Visible length of the rail, from notch 0 to the last notch.
+    const RAIL: f32 = 180.;
+    /// Room for half a knob beyond each end of the rail.
+    const END_PAD: f32 = KNOB / 2.;
+
+    let last = notches.saturating_sub(1);
+    let active = active.min(last);
+    let frac_of = move |notch: usize| {
+        if last == 0 {
+            0.
+        } else {
+            notch as f32 / last as f32
+        }
+    };
+    let frac = frac_of(active);
+    let ink = if enabled {
+        palette.accent
+    } else {
+        palette.border
+    };
+    let dot_ink = if enabled {
+        palette.accent
+    } else {
+        palette.muted
+    };
+
+    let mut rings: Vec<AnyElement> = Vec::with_capacity(notches);
+    for notch in 0..notches {
+        let ring = if enabled && notch <= active {
+            palette.accent
+        } else {
+            palette.border
+        };
+        rings.push(
+            div()
+                .absolute()
+                .left(relative(frac_of(notch)))
+                .top(px((BAR - TICK) / 2.))
+                .ml(px(-TICK / 2.))
+                .size(px(TICK))
+                .rounded_full()
+                .border(px(RING))
+                .border_color(rgb(ring))
+                .bg(rgb(palette.canvas))
+                .into_any_element(),
+        );
+    }
+
+    let mut hits: Vec<AnyElement> = Vec::with_capacity(notches);
+    for notch in 0..notches {
+        let on_click = on_pick.clone();
+        let on_drag = on_pick.clone();
+        let area = div().id((id, notch)).flex_1().h_full();
+        let area = if enabled {
+            area.cursor_pointer()
+                .on_click(cx.listener(move |view, _, _, cx| on_click(view, notch, cx)))
+                .on_mouse_move(cx.listener(move |view, event: &MouseMoveEvent, _, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        on_drag(view, notch, cx);
+                    }
+                }))
+        } else {
+            area
+        };
+        hits.push(area.into_any_element());
+    }
+
+    div()
+        .relative()
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .w(px(RAIL + END_PAD * 2.))
+        .h(px(RAIL_HEIGHT))
+        .px(px(END_PAD))
+        .child(
+            div()
+                .relative()
+                .w_full()
+                .h(px(BAR))
+                .rounded_full()
+                .bg(rgb(palette.border))
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .h_full()
+                        .w(relative(frac))
+                        .rounded_full()
+                        .bg(rgb(ink)),
+                )
+                // Rings sit above the fill, exactly like the mock: their canvas
+                // hole punches through both the rail and the filled part, which
+                // is what makes the notch readable at every stop.
+                .children(rings)
+                .child(
+                    // Centred on the fraction, then back by half the knob so the
+                    // dot sits over the end of the fill rather than after it.
+                    div()
+                        .absolute()
+                        .left(relative(frac))
+                        .top(px((BAR - KNOB) / 2.))
+                        .ml(px(-KNOB / 2.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .size(px(KNOB))
+                        .rounded_full()
+                        .bg(rgb(palette.canvas))
+                        .child(div().size(px(DOT)).rounded_full().bg(rgb(dot_ink))),
+                )
+                .child(
+                    // The hit band is as tall as the whole control, not just the
+                    // 4px rail, so a click is easy to land; it is still cut into
+                    // one area per notch.
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(-(RAIL_HEIGHT - BAR) / 2.))
+                        .w_full()
+                        .h(px(RAIL_HEIGHT))
+                        .flex()
+                        .flex_row()
+                        .children(hits),
+                ),
+        )
+}
+
+/// The "恢复默认" link beside a slider: accent and clickable while the setting
+/// is its own, faint and inert once it is back at the default.
+pub(crate) fn settings_default_button(
+    id: impl Into<ElementId>,
+    at_default: bool,
+    palette: Palette,
+    cx: &mut Context<DshFlowApp>,
+    action: impl Fn(&mut DshFlowApp, &mut Context<DshFlowApp>) + 'static,
+) -> AnyElement {
+    let link = div()
+        .id(id)
+        .flex_shrink_0()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .text_color(rgb(if at_default {
+            palette.faint
+        } else {
+            palette.accent
+        }))
+        .child("恢复默认");
+    if at_default {
+        // Nothing left to restore, so no hover highlight and no click.
+        return link.into_any_element();
+    }
+    link.cursor_pointer()
+        .hover(move |style| style.bg(rgb(palette.panel_soft)))
+        .on_click(cx.listener(move |view, _, _, cx| action(view, cx)))
+        .into_any_element()
+}
+
 /// The drag handle between the sidebar and the pane.
 ///
 /// Painted in the sidebar's own colour: the two read as one surface, and the
@@ -87,7 +410,12 @@ impl DshFlowApp {
 ///
 /// Windows sizes its own caption buttons at 46x32; matching that keeps the hit
 /// area where the pointer expects it.
-pub(crate) fn window_button(area: WindowControlArea, glyph: &'static str, palette: Palette) -> Div {
+pub(crate) fn window_button(
+    area: WindowControlArea,
+    glyph: &'static str,
+    palette: Palette,
+    hovered: bool,
+) -> Div {
     let hover_background = if matches!(area, WindowControlArea::Close) {
         palette.failed
     } else {
@@ -98,15 +426,22 @@ pub(crate) fn window_button(area: WindowControlArea, glyph: &'static str, palett
         .flex()
         .items_center()
         .justify_center()
-        .w(px(46.))
+        .w(px(WINDOW_BUTTON_WIDTH))
         .h_full()
         .window_control_area(area)
-        .hover(move |style| style.bg(rgb(hover_background)))
+        // The highlight is painted from the window's own pointer state, not
+        // gpui's hover: these cells are non-client for the platform, and its
+        // mouse moves do not always reach the hover hit-test.
+        .when(hovered, |this| this.bg(rgb(hover_background)))
         .text_color(rgb(palette.text))
         .child(div().text_size(px(19.)).child(glyph))
 }
 
 /// A 20px square icon button, used for the page actions beside a heading.
+/// One small square action in a page header: a folder, a rescan, a "＋".
+///
+/// The button is a little larger than the glyph it carries so the target stays
+/// comfortable next to a page title, and the header rows bottom-align it.
 pub(crate) fn icon_button(
     id: &'static str,
     icon: &'static str,
@@ -120,7 +455,7 @@ pub(crate) fn icon_button(
         .items_center()
         .justify_center()
         .flex_shrink_0()
-        .size(px(20.))
+        .size(px(24.))
         .rounded_sm()
         .cursor_pointer()
         .hover(move |style| style.bg(rgb(palette.panel_soft)))
@@ -128,8 +463,8 @@ pub(crate) fn icon_button(
         .child(
             svg()
                 .path(icon)
-                .w(px(13.))
-                .h(px(13.))
+                .w(px(16.))
+                .h(px(16.))
                 .text_color(rgb(palette.muted)),
         )
         .into_any_element()
@@ -145,8 +480,48 @@ pub(crate) fn settings_section(title: &'static str, palette: Palette) -> Div {
     settings_card(title, palette)
 }
 
+/// A section whose explanation sits behind a "?" beside the heading.
+pub(crate) fn settings_section_help(
+    title: &'static str,
+    explanation: impl Into<String>,
+    palette: Palette,
+) -> Div {
+    settings_card_help(title, explanation, palette)
+}
+
+/// A card whose heading carries its explanation behind a "?".
+///
+/// The pages used to spell the explanation out under the heading, which pushed
+/// the controls down for text read once. The icon keeps the card tight; the
+/// tooltip has the words when someone wants them.
+pub(crate) fn settings_card_help(
+    title: &str,
+    explanation: impl Into<String>,
+    palette: Palette,
+) -> Div {
+    settings_shell(
+        palette,
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .child(settings_heading(title.to_string(), palette))
+            .child(help_icon(
+                SharedString::from(format!("help-card-{title}")),
+                explanation,
+                palette,
+            )),
+    )
+}
+
 /// The card itself: the one surface every settings block sits on.
 pub(crate) fn settings_card(title: &str, palette: Palette) -> Div {
+    settings_shell(palette, settings_heading(title.to_string(), palette))
+}
+
+/// The card around a heading.
+fn settings_shell(palette: Palette, heading: impl IntoElement) -> Div {
     div()
         .flex()
         .flex_col()
@@ -157,13 +532,16 @@ pub(crate) fn settings_card(title: &str, palette: Palette) -> Div {
         .bg(rgb(palette.canvas))
         .shadow_sm()
         .p_5()
-        .child(
-            div()
-                .text_sm()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(palette.text))
-                .child(title.to_string()),
-        )
+        .child(heading)
+}
+
+/// A card's bold heading.
+fn settings_heading(title: String, palette: Palette) -> Div {
+    div()
+        .text_sm()
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(rgb(palette.text))
+        .child(title)
 }
 
 /// The heading of a whole page: a title, then one line about the page.
@@ -191,6 +569,144 @@ pub(crate) fn settings_note(note: &str, palette: Palette) -> AnyElement {
         .whitespace_normal()
         .child(note.to_string())
         .into_any_element()
+}
+
+/// The "i" ring that holds a setting's explanation.
+///
+/// Settings pages no longer print the explanation beside every control; the
+/// icon marks where to look and the words arrive on hover. gpui draws the
+/// bubble itself as a root element of the same window, so the page's scroll
+/// area cannot clip it and it flips to stay inside the window.
+///
+/// The glyph carries the ring, so the button draws no border and no surface of
+/// its own: only the ink changes, from muted to the accent, while it is hovered.
+pub(crate) fn help_icon(
+    id: impl Into<ElementId>,
+    explanation: impl Into<String>,
+    palette: Palette,
+) -> impl IntoElement {
+    let explanation = explanation.into();
+    div()
+        .id(id)
+        .group("help-chip")
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(14.))
+        .flex_shrink_0()
+        .cursor_pointer()
+        // The platform default is half a second; a settings hint that appears
+        // faster feels like part of the row instead of a delayed surprise.
+        .tooltip_show_delay(Duration::from_millis(250))
+        .child(
+            // A vector glyph rather than a font character: layout centres this
+            // box exactly, so the ring lands in the middle of the chip whatever
+            // font the system picks.
+            svg()
+                .path("icons/help.svg")
+                .w(px(14.))
+                .h(px(14.))
+                .text_color(rgb(palette.faint))
+                .group_hover("help-chip", move |style| {
+                    style.text_color(rgb(palette.accent))
+                }),
+        )
+        .tooltip(move |_window, cx| {
+            let bubble = cx.new(|_| HelpBubble {
+                explanation: explanation.clone(),
+                palette,
+            });
+            bubble.into()
+        })
+}
+
+/// The bubble a [`help_icon`] shows on hover.
+///
+/// It is drawn over whatever the page has underneath, so it brings its own
+/// surface: the panel colour, a hairline border and a shadow, at a width that
+/// keeps a paragraph readable without covering the page.
+struct HelpBubble {
+    explanation: String,
+    palette: Palette,
+}
+
+impl Render for HelpBubble {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(280.))
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(self.palette.border))
+            .bg(rgb(self.palette.canvas))
+            .shadow_sm()
+            .text_xs()
+            .line_height(px(18.))
+            .text_color(rgb(self.palette.text))
+            .whitespace_normal()
+            .child(self.explanation.clone())
+    }
+}
+
+/// The offset a wheel delta asks for, kept inside what is left to scroll.
+///
+/// Offsets run from `0` at the top to `-max` at the end, the convention the
+/// scroll handles use. A delta past either end pins the offset there instead of
+/// being ignored, which is what keeps a table that cannot move any further from
+/// handing the wheel to the page behind it.
+pub(crate) fn wheel_offset(offset: Pixels, delta: Pixels, max: Pixels) -> Pixels {
+    (offset + delta).clamp(-max, px(0.))
+}
+
+/// Scroll `handle` by a wheel event that landed where nothing scrolls by itself.
+///
+/// A table's thin bar is a real column beside its rows, so the wheel over the
+/// bar belongs to the table; without this the event would fall through to the
+/// page behind the card and the panel would jump instead.
+/// @returns true when the offset moved, so the caller can repaint.
+pub(crate) fn wheel_scroll(handle: &ScrollHandle, event: &ScrollEvent, window: &Window) -> bool {
+    let delta = event.delta.pixel_delta(window.line_height()).y;
+    if delta == px(0.) {
+        return false;
+    }
+    let current = handle.offset();
+    let next = wheel_offset(current.y, delta, handle.max_offset().y);
+    if next == current.y {
+        return false;
+    }
+    handle.set_offset(point(current.x, next));
+    true
+}
+
+/// Keeps a nested scroll area's wheel to itself.
+///
+/// gpui has already scrolled the element by the time this runs, so stopping the
+/// event here only means the surface behind it — the transcript, a panel, a
+/// settings page — no longer picks the same wheel up once this list reaches its
+/// ends. Every scrollable piece that lives inside another scrollable surface
+/// ends with this.
+pub(crate) trait ContainedWheel: Sized {
+    /// Stop scroll events at this element.
+    fn contained_wheel(self) -> Self;
+}
+
+impl ContainedWheel for gpui::Stateful<Div> {
+    fn contained_wheel(self) -> Self {
+        self.on_scroll(|_, _, cx| cx.stop_propagation())
+    }
+}
+
+/// Fade a surface in as it appears, lifting it by `rise` pixels.
+///
+/// The animation is keyed by the element's id, so a menu that is rebuilt every
+/// frame still plays once when it opens, and a surface that stays open keeps its
+/// last frame. gpui's `reduce_motion` setting is honoured by the element itself.
+pub(crate) fn appear(element: Div, key: impl Into<ElementId>, rise: f32) -> impl IntoElement {
+    element.with_animation(
+        key,
+        Animation::new(std::time::Duration::from_millis(140)).with_easing(gpui::ease_out_quint()),
+        move |element, delta| element.opacity(delta).mt(px(rise * (1.0 - delta))),
+    )
 }
 
 /// A path, a command or a file name on a soft chip, so it reads as a value.
@@ -348,13 +864,19 @@ pub(crate) fn settings_notice(text: &str, failed: bool, palette: Palette) -> Any
 /// The plugins, MCP and Skill pages are read as flat lists: the title is the
 /// only heading, its actions follow it after a gap (not pinned to the far
 /// edge), and there is no line of explanation beneath it.
+/// A page's name, with its action buttons pinned to the title's bottom edge.
+///
+/// Bottom alignment rather than centring: the icon buttons are shorter than a
+/// `text_xl` line, and sitting them on the baseline band keeps them from
+/// floating above the title's left edge. The wide gap after the title keeps the
+/// action cluster from crowding it; the buttons themselves stay close together.
 pub(crate) fn page_title(title: &'static str, actions: Vec<AnyElement>, palette: Palette) -> Div {
     let has_actions = !actions.is_empty();
     let mut row = div()
         .flex()
         .flex_row()
-        .items_center()
-        .gap(px(20.))
+        .items_end()
+        .gap(px(32.))
         .flex_shrink_0()
         .px_6()
         .py_4()
@@ -364,8 +886,8 @@ pub(crate) fn page_title(title: &'static str, actions: Vec<AnyElement>, palette:
             div()
                 .flex()
                 .flex_row()
-                .items_center()
-                .gap_2()
+                .items_end()
+                .gap_1()
                 .children(actions),
         );
     }

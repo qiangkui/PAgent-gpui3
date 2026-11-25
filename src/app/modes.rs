@@ -45,11 +45,11 @@ impl DshFlowApp {
                 cx,
             ));
         }
-        let list = settings_card("模式列表", palette)
-            .child(settings_note(
-                "基础/全量是内置模式；自定义模式单独选择资源。任何在插件、Skill、MCP 页面手动关闭的资源都不会被请求携带。",
-                palette,
-            ))
+        let list = settings_card_help(
+            "模式列表",
+            "基础/全量是内置模式；自定义模式单独选择资源。任何在插件、Skill、MCP 页面手动关闭的资源都不会被请求携带。",
+            palette,
+        )
             .child(div().flex().flex_col().gap_1().children(mode_rows))
             .child(
                 div().flex().flex_row().gap_2().pt_2().child(
@@ -64,19 +64,19 @@ impl DshFlowApp {
             );
 
         let editor = if selected == crate::config::MODE_BASIC {
-            settings_card("基础模式", palette)
-                .child(settings_note(
-                    "内置工具照常可用；不发送任何外部插件、Skill 或 MCP 定义。",
-                    palette,
-                ))
-                .into_any_element()
+            settings_card_help(
+                "基础模式",
+                "内置工具照常可用；不发送任何外部插件、Skill 或 MCP 定义。",
+                palette,
+            )
+            .into_any_element()
         } else if selected == crate::config::MODE_FULL {
             let enabled = self.ai.mode_selection(crate::config::MODE_FULL);
-            settings_card("全量模式", palette)
-                .child(settings_note(
-                    "发送所有当前手动启用的资源。取消插件、Skill 或 MCP 页面上的开关，也会立即把它们从全量模式中移除。",
-                    palette,
-                ))
+            settings_card_help(
+                "全量模式",
+                "发送所有当前手动启用的资源。取消插件、Skill 或 MCP 页面上的开关，也会立即把它们从全量模式中移除。",
+                palette,
+            )
                 .child(settings_text_row(
                     "当前携带",
                     format!(
@@ -95,17 +95,17 @@ impl DshFlowApp {
                 .flex_col()
                 .gap_4()
                 .child(
-                    settings_card("模式名称", palette)
-                        .child(settings_note(
-                            "修改后会立即保存，并同步到设置页和聊天输入框的模式按钮。",
-                            palette,
-                        ))
-                        .child(self.render_field(
-                            Field::ModeName,
-                            "例如：写作、代码审阅、只读分析",
-                            palette,
-                            cx,
-                        )),
+                    settings_card_help(
+                        "模式名称",
+                        "修改后会立即保存，并同步到设置页和聊天输入框的模式按钮。",
+                        palette,
+                    )
+                    .child(self.render_field(
+                        Field::ModeName,
+                        "例如：写作、代码审阅、只读分析",
+                        palette,
+                        cx,
+                    )),
                 )
                 .child(self.render_mode_plugins(mode, palette, cx))
                 .child(self.render_mode_skills(mode, palette, cx))
@@ -113,7 +113,10 @@ impl DshFlowApp {
                 .into_any_element()
         } else {
             settings_card("模式", palette)
-                .child(settings_note("这个模式已不存在，请选择另一个模式。", palette))
+                .child(settings_note(
+                    "这个模式已不存在，请选择另一个模式。",
+                    palette,
+                ))
                 .into_any_element()
         };
 
@@ -158,12 +161,12 @@ impl DshFlowApp {
         if rows.is_empty() {
             rows.push(settings_note("没有安装外部插件。", palette));
         }
-        settings_card("外部插件", palette)
-            .child(settings_note(
-                "只在这里勾选的插件会加载；插件页面手动关闭的项始终不可用。",
-                palette,
-            ))
-            .child(div().flex().flex_col().gap_1().children(rows))
+        settings_card_help(
+            "外部插件",
+            "只在这里勾选的插件会加载；插件页面手动关闭的项始终不可用。",
+            palette,
+        )
+        .child(div().flex().flex_col().gap_1().children(rows))
     }
 
     fn render_mode_skills(
@@ -189,12 +192,12 @@ impl DshFlowApp {
         if rows.is_empty() {
             rows.push(settings_note("没有安装 Skill。", palette));
         }
-        settings_card("Skill", palette)
-            .child(settings_note(
-                "只在这里勾选的 Skill 指令会进入系统提示；Skill 页面手动关闭的项始终不可用。",
-                palette,
-            ))
-            .child(div().flex().flex_col().gap_1().children(rows))
+        settings_card_help(
+            "Skill",
+            "只在这里勾选的 Skill 指令会进入系统提示；Skill 页面手动关闭的项始终不可用。",
+            palette,
+        )
+        .child(div().flex().flex_col().gap_1().children(rows))
     }
 
     fn render_mode_mcp(
@@ -220,12 +223,12 @@ impl DshFlowApp {
         if rows.is_empty() {
             rows.push(settings_note("没有安装 MCP 服务器。", palette));
         }
-        settings_card("MCP", palette)
-            .child(settings_note(
-                "只有勾选且手动启用的 MCP 会打开，并发送 mcp 工具；未勾选时连 mcp 网关也不会出现。",
-                palette,
-            ))
-            .child(div().flex().flex_col().gap_1().children(rows))
+        settings_card_help(
+            "MCP",
+            "只有勾选且手动启用的 MCP 会打开，并发送 mcp 工具；未勾选时连 mcp 网关也不会出现。",
+            palette,
+        )
+        .child(div().flex().flex_col().gap_1().children(rows))
     }
 }
 impl DshFlowApp {
@@ -290,7 +293,11 @@ impl DshFlowApp {
                     .rounded_sm()
                     .border_1()
                     .border_color(rgb(checkbox_colour))
-                    .bg(rgb(if chosen { checkbox_colour } else { palette.panel })),
+                    .bg(rgb(if chosen {
+                        checkbox_colour
+                    } else {
+                        palette.panel
+                    })),
             )
             .child(
                 div()
@@ -303,7 +310,11 @@ impl DshFlowApp {
                         div()
                             .truncate()
                             .text_sm()
-                            .text_color(rgb(if available { palette.text } else { palette.faint }))
+                            .text_color(rgb(if available {
+                                palette.text
+                            } else {
+                                palette.faint
+                            }))
                             .child(label.to_string()),
                     )
                     .child(
@@ -423,9 +434,10 @@ impl DshFlowApp {
         }
         let id = self.ai.fresh_mode_id();
         let number = self.ai.modes.len() + 1;
-        self.ai
-            .modes
-            .push(crate::config::ChatMode::empty(id.clone(), format!("自定义模式 {number}")));
+        self.ai.modes.push(crate::config::ChatMode::empty(
+            id.clone(),
+            format!("自定义模式 {number}"),
+        ));
         if let Err(error) = self.ai.save() {
             self.mode_note = error;
         } else {
@@ -506,7 +518,14 @@ impl DshFlowApp {
                 mode.skills.len(),
                 mode.mcp_servers.len()
             );
-            rows.push(self.mode_menu_row(&mode.id, &mode.name, &note, current == mode.id, palette, cx));
+            rows.push(self.mode_menu_row(
+                &mode.id,
+                &mode.name,
+                &note,
+                current == mode.id,
+                palette,
+                cx,
+            ));
         }
         div()
             .flex()
@@ -633,7 +652,11 @@ fn mode_row(
                 .child(
                     div()
                         .text_sm()
-                        .text_color(rgb(if selected { palette.accent } else { palette.text }))
+                        .text_color(rgb(if selected {
+                            palette.accent
+                        } else {
+                            palette.text
+                        }))
                         .child(name.to_string()),
                 )
                 .child(

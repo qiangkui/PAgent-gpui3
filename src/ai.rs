@@ -33,7 +33,9 @@ static CHILDREN: Mutex<Vec<(u32, Arc<Mutex<Option<Child>>>)>> = Mutex::new(Vec::
 /// A poisoned lock is not a reason to lose the window: the data inside is still
 /// a valid list or slot, and panicking here would take the whole app with it.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Remember a running child, keyed by its process id.
@@ -100,10 +102,7 @@ pub const ONE_SHOT_TIMEOUT_MS: u64 = 60_000;
 ///
 /// `Child::wait` cannot time out, so the wait happens on its own thread and the
 /// deadline kills the process tree; the thread then ends by itself.
-fn wait_with_timeout(
-    child: Child,
-    timeout: Duration,
-) -> Result<std::process::Output, String> {
+fn wait_with_timeout(child: Child, timeout: Duration) -> Result<std::process::Output, String> {
     let pid = child.id();
     let (sender, result) = mpsc::channel();
     thread::spawn(move || {
@@ -164,6 +163,11 @@ pub enum AiEvent {
     },
     /// A fragment of the answer, as it is being written.
     Delta(String),
+    /// A fragment of the model's thinking, when it streams one.
+    ///
+    /// Kept apart from [`Self::Delta`]: thinking is output the bill includes but
+    /// never part of the answer, and the transcript shows it in its own block.
+    Reasoning(String),
     /// How far the question has got: the round trip that just started, and how
     /// many tool calls have finished.
     ///
@@ -190,6 +194,15 @@ pub enum AiEvent {
         errors: Vec<(String, String)>,
         /// MCP servers the engine skipped, as `(server id, why)`.
         mcp_errors: Vec<(String, String)>,
+        /// Tools a plugin registered, as `(plugin id, tool name)`.
+        ///
+        /// Only the last request's set is kept, the same way prompts and errors
+        /// are: it is what the plugin cards count.
+        plugin_tools: Vec<(String, String)>,
+        /// Tools an MCP server offers, as `(server id, tool name)`.
+        mcp_tools: Vec<(String, String)>,
+        /// Panels the enabled plugins built for this request, in plugin order.
+        panels: Vec<PanelReport>,
     },
     /// The assistant answered.
     Done {
@@ -211,8 +224,29 @@ pub enum AiEvent {
         /// What each round cost, oldest first, as `(prompt, completion, tool
         /// calls)`; empty when the engine did not report them.
         round_tokens: Vec<(u64, u64, u32)>,
+        /// Estimated thinking tokens of each round, oldest first: output the
+        /// bill includes that no prompt holds. Empty when unreported.
+        round_reasoning: Vec<u32>,
         /// What the context compaction did, when it did anything.
         compaction: Option<Compaction>,
+        /// The thinking text the engine streamed for the whole question, in
+        /// order; empty when the provider sent none. The transcript shows it in
+        /// its own block, so it is never mistaken for the answer.
+        reasoning: String,
+        /// Wall clock the engine spent waiting for model round trips, in
+        /// milliseconds; zero when it reported no timing (older engines).
+        model_ms: u64,
+        /// Wall clock the engine spent running tools, in milliseconds; zero
+        /// when it reported no timing.
+        tool_ms: u64,
+        /// Searches the provider ran on its own side for this question, when
+        /// the server tools were on; zero otherwise.
+        web_searches: u32,
+        /// Pages the provider opened or read for this question, same condition.
+        web_fetches: u32,
+        /// Raw server-tool calls of every round, for the next question to hand
+        /// back; empty when the server tools never ran.
+        server_tool_calls: Vec<serde_json::Value>,
     },
     /// A write or command waiting for the person to allow or refuse it.
     Approval {
@@ -239,8 +273,89 @@ pub enum AiEvent {
         /// Command line for `shell`; empty for a write.
         command: String,
     },
+    /// A structured question waiting for one option.
+    Question {
+        /// Provider id of the call, echoed back with the answer.
+        call: String,
+        /// What the model asked.
+        question: String,
+        /// The choices it offered, in order.
+        options: Vec<String>,
+        /// True when the person may answer with their own words.
+        allow_custom: bool,
+    },
+    /// A plan the model submitted before it executes it.
+    Plan {
+        /// Provider id of the call, echoed back with the decision.
+        call: String,
+        /// The plan itself, markdown.
+        plan: String,
+    },
+    /// The conversation's todo list was replaced.
+    Todo {
+        /// The new list, as `(text, status)`; status is `pending`,
+        /// `in_progress` or `completed`.
+        items: Vec<(String, String)>,
+    },
     /// The request could not be answered; the text is meant for the user.
     Failed(String),
+}
+
+/// One panel an enabled plugin built for a request.
+///
+/// The engine hands over numbers and short text; the window decides how they
+/// look, so a panel never carries layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelReport {
+    /// Stable id the plugin registered.
+    pub id: String,
+    /// Heading the plugin declared.
+    pub title: String,
+    /// Plugin folder the panel came from.
+    pub plugin: String,
+    /// Up to four headline figures, as `(label, value)`.
+    pub summary: Vec<(String, String)>,
+    /// The sections, in the order the plugin returned them.
+    pub sections: Vec<PanelSection>,
+}
+
+/// Which shape a panel section is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelKind {
+    /// A label with its text.
+    Text,
+    /// A label with a bar and a number.
+    Bars,
+    /// Column headings with rows of cells.
+    Table,
+}
+
+/// One section of a plugin panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelSection {
+    /// Heading above the section.
+    pub title: String,
+    /// The shape it is drawn in.
+    pub kind: PanelKind,
+    /// Rows for [`PanelKind::Text`] and [`PanelKind::Bars`].
+    pub items: Vec<PanelItem>,
+    /// Column headings for [`PanelKind::Table`].
+    pub columns: Vec<String>,
+    /// Cells for [`PanelKind::Table`], one row each.
+    pub rows: Vec<Vec<String>>,
+}
+
+/// One entry of a panel's list.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PanelItem {
+    /// Row label.
+    pub label: String,
+    /// Long text shown under the label.
+    pub text: String,
+    /// The number a bar row is drawn from.
+    pub value: Option<f64>,
+    /// Short aside next to the number.
+    pub note: String,
 }
 
 /// Provider token accounting for one answer.
@@ -327,6 +442,14 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 /// guess only shifts a percentage, never a request.
 pub fn context_window(model: &str) -> u64 {
     let name = model.to_ascii_lowercase();
+    // The 2026 DeepSeek lineup ships a 1M window; the older ids stay at 128K so
+    // a conversation already using them keeps its own gauge.
+    if name.contains("deepseek-flash")
+        || name.contains("deepseek-v4")
+        || name.contains("deepseek-v4-pro")
+    {
+        return 1_000_000;
+    }
     if name.contains("gpt-4.1") || name.contains("gemini") {
         return 1_000_000;
     }
@@ -357,6 +480,12 @@ pub struct Turn {
     pub speaker: Speaker,
     /// What was said.
     pub text: String,
+    /// Server-tool calls of an assistant turn, raw as the provider sent them.
+    ///
+    /// The provider restores the pages it read earlier from these; a framework
+    /// that drops them still gets an answer, just without that context. Empty
+    /// for user turns and for questions that never searched.
+    pub server_tool_calls: Vec<serde_json::Value>,
 }
 
 /// Who spoke one turn.
@@ -428,6 +557,44 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
+/// The Windows sandbox helper next to the app, once it has proven the APIs work.
+///
+/// A missing helper, a non-Windows build, or a machine where the restricted
+/// token cannot start a process all read as `None`: the caller then keeps the
+/// path guard and the approval card as the only gate.
+#[cfg(windows)]
+fn sandbox_helper() -> Option<std::path::PathBuf> {
+    static CHECKED: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    CHECKED
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let helper = exe.parent()?.join("dsh-sandbox.exe");
+            if !helper.is_file() {
+                return None;
+            }
+            let mut command = Command::new(&helper);
+            command
+                .arg("--check")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            // The helper is a console program; this window is not, so without
+            // the flag the probe would pop a console window at startup.
+            {
+                use std::os::windows::process::CommandExt;
+                command.creation_flags(0x0800_0000);
+            }
+            let ok = command.status().ok()?.success();
+            ok.then_some(helper)
+        })
+        .clone()
+}
+
+#[cfg(not(windows))]
+fn sandbox_helper() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// A request to the engine's `ai` command.
 pub struct AiRequest {
     queue: Arc<Mutex<Vec<AiEvent>>>,
@@ -458,6 +625,8 @@ impl AiRequest {
         read_only: &[PathBuf],
         max_rounds: u32,
         max_calls: u32,
+        plan: bool,
+        web_search: bool,
         attachments: &[AskAttachment],
         plugin_dir: Option<&Path>,
         plugins: &[String],
@@ -493,6 +662,23 @@ impl AiRequest {
         }
 
         crate::engine::apply_proxy_env(&mut command);
+        // Commands run through the OS sandbox when the workspace is jailed; a
+        // full-access conversation keeps the old direct spawn.
+        if let Some(helper) = sandbox_helper()
+            && scope_root.is_some()
+        {
+            let temp = work_dir.join(".dsh-flow").join("sandbox-tmp");
+            let _ = std::fs::create_dir_all(&temp);
+            command
+                .env("DSH_SANDBOX_HELPER", &helper)
+                .env("DSH_SANDBOX_WORKSPACE", work_dir)
+                .env(
+                    "DSH_SANDBOX_READONLY",
+                    if confirm_writes { "1" } else { "0" },
+                )
+                .env("TEMP", &temp)
+                .env("TMP", &temp);
+        }
         let mut child = command
             .spawn()
             .map_err(|error| crate::engine::node_error(&error))?;
@@ -521,6 +707,8 @@ impl AiRequest {
                 &roots,
                 max_rounds,
                 max_calls,
+                plan,
+                web_search,
                 attachments,
                 plugin_dir,
                 plugins,
@@ -616,7 +804,14 @@ impl AiRequest {
                         cache_hits: answer.cache_hits,
                         rounds: answer.rounds,
                         round_tokens: answer.round_tokens,
+                        round_reasoning: answer.round_reasoning,
                         compaction: answer.compaction,
+                        reasoning: answer.reasoning,
+                        model_ms: answer.model_ms,
+                        tool_ms: answer.tool_ms,
+                        web_searches: answer.web_searches,
+                        web_fetches: answer.web_fetches,
+                        server_tool_calls: answer.server_tool_calls,
                     },
                     Err(error) => AiEvent::Failed(error),
                 };
@@ -646,6 +841,28 @@ impl AiRequest {
             "type": "approval",
             "call": call,
             "allow": allow,
+        })
+        .to_string();
+        lock(&self.responder).send(line).is_ok()
+    }
+
+    /// Answer a structured question the engine is waiting on.
+    pub fn respond_question(&self, call: &str, answer: &str) -> bool {
+        let line = serde_json::json!({
+            "type": "question",
+            "call": call,
+            "answer": answer,
+        })
+        .to_string();
+        lock(&self.responder).send(line).is_ok()
+    }
+
+    /// Approve or reject a plan the engine is waiting on.
+    pub fn respond_plan(&self, call: &str, approved: bool) -> bool {
+        let line = serde_json::json!({
+            "type": "plan",
+            "call": call,
+            "approved": approved,
         })
         .to_string();
         lock(&self.responder).send(line).is_ok()
@@ -703,6 +920,8 @@ fn payload(
         read_only,
         DEFAULT_MAX_ROUNDS,
         DEFAULT_MAX_CALLS,
+        false,
+        true,
         &[],
         None,
         &[],
@@ -725,6 +944,8 @@ fn payload_with_budgets(
     read_only: &[PathBuf],
     max_rounds: u32,
     max_calls: u32,
+    plan: bool,
+    web_search: bool,
     attachments: &[AskAttachment],
     plugin_dir: Option<&Path>,
     plugins: &[String],
@@ -746,10 +967,24 @@ fn payload_with_budgets(
         let turns: Vec<serde_json::Value> = history
             .iter()
             .map(|turn| {
-                serde_json::json!({
-                    "role": turn.speaker.role(),
-                    "content": turn.text,
-                })
+                let mut entry = serde_json::Map::new();
+                entry.insert(
+                    "role".to_string(),
+                    serde_json::Value::String(turn.speaker.role().to_string()),
+                );
+                entry.insert(
+                    "content".to_string(),
+                    serde_json::Value::String(turn.text.clone()),
+                );
+                // Only an assistant turn can carry server calls, and passing
+                // them back is what keeps the pages it read in the context.
+                if !turn.server_tool_calls.is_empty() {
+                    entry.insert(
+                        "serverToolCalls".to_string(),
+                        serde_json::Value::Array(turn.server_tool_calls.clone()),
+                    );
+                }
+                serde_json::Value::Object(entry)
             })
             .collect();
         request.insert("history".to_string(), serde_json::Value::Array(turns));
@@ -766,8 +1001,8 @@ fn payload_with_budgets(
         "apiKey".to_string(),
         serde_json::Value::String(connection.api_key.clone()),
     );
-    // Left out for the default preset: the endpoint then keeps its own value.
-    if let Some(temperature) = connection.sampling.temperature() {
+    // Left out when the connection keeps the endpoint's own value.
+    if let Some(temperature) = connection.temperature {
         request.insert("temperature".to_string(), serde_json::json!(temperature));
     }
     if connection.max_tokens > 0 {
@@ -776,15 +1011,32 @@ fn payload_with_budgets(
             serde_json::json!(connection.max_tokens),
         );
     }
+    // Left out for the default choice as well: the engine then sends no switch
+    // and the endpoint keeps its own thinking setting.
+    if connection.reasoning != crate::config::Reasoning::Default {
+        request.insert(
+            "reasoning".to_string(),
+            serde_json::Value::String(connection.reasoning.name().to_string()),
+        );
+    }
+    // The server tools only exist on DeepSeek's flash models; an endpoint that
+    // does not offer them rejects the request outright, so the entries are left
+    // out here rather than trusted to the engine's own retry. Searching is on
+    // wherever it is offered; a conversation can turn it off for itself.
+    if web_search && connection.supports_web_search() {
+        request.insert("webSearch".to_string(), serde_json::Value::Bool(true));
+    }
     request.insert(
         "timeoutMs".to_string(),
         serde_json::Value::Number(CHAT_TIMEOUT_MS.into()),
     );
     // The engine compacts at the same point the window shows the gauge filling,
-    // so both sides agree on how full the window is.
+    // so both sides agree on how full the window is. An explicit setting on the
+    // connection wins over the name table, which cannot know a local model's
+    // size or one newer than the table.
     request.insert(
         "windowTokens".to_string(),
-        serde_json::json!(crate::ai::context_window(&connection.model)),
+        serde_json::json!(connection.window_tokens()),
     );
     if tools {
         request.insert("tools".to_string(), serde_json::Value::Bool(true));
@@ -795,6 +1047,9 @@ fn payload_with_budgets(
         );
         request.insert("maxRounds".to_string(), serde_json::json!(max_rounds));
         request.insert("maxCalls".to_string(), serde_json::json!(max_calls));
+        if plan {
+            request.insert("plan".to_string(), serde_json::Value::Bool(true));
+        }
         match scope_root {
             Some(root) => {
                 request.insert(
@@ -917,7 +1172,14 @@ fn events(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Vec<AiEvent> {
                 cache_hits: answer.cache_hits,
                 rounds: answer.rounds,
                 round_tokens: answer.round_tokens,
+                round_reasoning: answer.round_reasoning,
                 compaction: answer.compaction,
+                reasoning: answer.reasoning,
+                model_ms: answer.model_ms,
+                tool_ms: answer.tool_ms,
+                web_searches: answer.web_searches,
+                web_fetches: answer.web_fetches,
+                server_tool_calls: answer.server_tool_calls,
             },
             Err(error) => AiEvent::Failed(error),
         });
@@ -1081,6 +1343,73 @@ fn line_event(line: &str) -> Option<AiEvent> {
                     .to_string(),
             });
         }
+        Some("question") => {
+            let options = value
+                .get("options")
+                .and_then(|options| options.as_array())
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| option.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Some(AiEvent::Question {
+                call: value
+                    .get("call")
+                    .and_then(|call| call.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                question: value
+                    .get("question")
+                    .and_then(|question| question.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                options,
+                allow_custom: value
+                    .get("allowCustom")
+                    .and_then(|allow| allow.as_bool())
+                    .unwrap_or(false),
+            });
+        }
+        Some("plan") => {
+            return Some(AiEvent::Plan {
+                call: value
+                    .get("call")
+                    .and_then(|call| call.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                plan: value
+                    .get("plan")
+                    .and_then(|plan| plan.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        Some("todo") => {
+            let items = value
+                .get("items")
+                .and_then(|items| items.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            let text = item.get("text").and_then(|text| text.as_str())?;
+                            if text.trim().is_empty() {
+                                return None;
+                            }
+                            let status = item
+                                .get("status")
+                                .and_then(|status| status.as_str())
+                                .unwrap_or("pending");
+                            Some((text.to_string(), status.to_string()))
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Some(AiEvent::Todo { items });
+        }
         Some("delta") => {
             let text = value
                 .get("text")
@@ -1088,7 +1417,56 @@ fn line_event(line: &str) -> Option<AiEvent> {
                 .unwrap_or_default();
             return (!text.is_empty()).then(|| AiEvent::Delta(text.to_string()));
         }
+        Some("reasoning") => {
+            let text = value
+                .get("text")
+                .and_then(|text| text.as_str())
+                .unwrap_or_default();
+            return (!text.is_empty()).then(|| AiEvent::Reasoning(text.to_string()));
+        }
         Some("tools") => {
+            // One definition per offered tool, plus — when the engine knows it —
+            // which plugin or MCP server put the tool there. The origin is read
+            // here so a plugin card can count its own contribution.
+            let mut items: Vec<(String, String)> = Vec::new();
+            let mut plugin_tools: Vec<(String, String)> = Vec::new();
+            let mut mcp_tools: Vec<(String, String)> = Vec::new();
+            let list = value
+                .get("items")
+                .and_then(|items| items.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            for item in list {
+                let Some(name) = item.get("name").and_then(|name| name.as_str()) else {
+                    continue;
+                };
+                let text = |key: &str| -> &str {
+                    item.get(key)
+                        .and_then(|entry| entry.as_str())
+                        .unwrap_or_default()
+                        .trim()
+                };
+                items.push((
+                    name.to_string(),
+                    item.get("schema")
+                        .and_then(|schema| schema.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                ));
+                let plugin = text("plugin");
+                if !plugin.is_empty() {
+                    plugin_tools.push((plugin.to_string(), name.to_string()));
+                }
+                let server = text("server");
+                if !server.is_empty() {
+                    mcp_tools.push((server.to_string(), name.to_string()));
+                }
+            }
+            let panels: Vec<PanelReport> = value
+                .get("panels")
+                .and_then(|panels| panels.as_array())
+                .map(|list| list.iter().filter_map(read_panel).collect())
+                .unwrap_or_default();
             let pairs = |key: &str| {
                 value
                     .get(key)
@@ -1141,10 +1519,13 @@ fn line_event(line: &str) -> Option<AiEvent> {
                     .unwrap_or_default()
             };
             return Some(AiEvent::Tools {
-                items: pairs("items"),
+                items,
                 prompts: pairs("prompts"),
                 errors: error_pairs(false),
                 mcp_errors: error_pairs(true),
+                plugin_tools,
+                mcp_tools,
+                panels,
             });
         }
         // A type this window does not know belongs to a newer engine; ignoring
@@ -1161,10 +1542,174 @@ fn line_event(line: &str) -> Option<AiEvent> {
             cache_hits: answer.cache_hits,
             rounds: answer.rounds,
             round_tokens: answer.round_tokens,
+            round_reasoning: answer.round_reasoning,
             compaction: answer.compaction,
+            reasoning: answer.reasoning,
+            model_ms: answer.model_ms,
+            tool_ms: answer.tool_ms,
+            web_searches: answer.web_searches,
+            web_fetches: answer.web_fetches,
+            server_tool_calls: answer.server_tool_calls,
         },
         Err(error) => AiEvent::Failed(error),
     })
+}
+
+/// Most sections one panel may add; mirrors the engine's cap so a broken engine
+/// cannot grow a card without bound.
+const MAX_PANEL_SECTIONS: usize = 6;
+/// Most rows one panel section may list.
+const MAX_PANEL_ITEMS: usize = 40;
+/// Most columns a panel table may have.
+const MAX_PANEL_COLUMNS: usize = 8;
+/// Longest text kept from one panel entry.
+const MAX_PANEL_TEXT: usize = 4_000;
+/// Longest note or table cell kept.
+const MAX_PANEL_SHORT: usize = 200;
+
+/// Read one plugin panel out of a `tools` event.
+fn read_panel(value: &serde_json::Value) -> Option<PanelReport> {
+    let id = panel_text(value.get("id"), MAX_PANEL_SHORT);
+    if id.is_empty() {
+        return None;
+    }
+    let title = match panel_text(value.get("title"), MAX_PANEL_SHORT) {
+        title if title.is_empty() => id.clone(),
+        title => title,
+    };
+    let summary = value
+        .get("summary")
+        .and_then(|items| items.as_array())
+        .map(|list| {
+            list.iter()
+                .take(4)
+                .filter_map(|item| {
+                    let label = panel_text(item.get("label"), MAX_PANEL_SHORT);
+                    if label.is_empty() {
+                        return None;
+                    }
+                    let printed = match item.get("value") {
+                        Some(serde_json::Value::String(text)) => text.clone(),
+                        Some(serde_json::Value::Number(number)) => number.to_string(),
+                        _ => String::new(),
+                    };
+                    Some((label, printed))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let sections = value
+        .get("sections")
+        .and_then(|items| items.as_array())
+        .map(|list| {
+            list.iter()
+                .take(MAX_PANEL_SECTIONS)
+                .map(read_panel_section)
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(PanelReport {
+        id,
+        title,
+        plugin: panel_text(value.get("plugin"), MAX_PANEL_SHORT),
+        summary,
+        sections,
+    })
+}
+
+/// Read one section; a shape this window does not know is drawn as text.
+fn read_panel_section(value: &serde_json::Value) -> PanelSection {
+    let kind = match value.get("kind").and_then(|kind| kind.as_str()) {
+        Some("bars") => PanelKind::Bars,
+        Some("table") => PanelKind::Table,
+        _ => PanelKind::Text,
+    };
+    let items = value
+        .get("items")
+        .and_then(|items| items.as_array())
+        .map(|list| {
+            list.iter()
+                .take(MAX_PANEL_ITEMS)
+                .filter_map(|item| {
+                    let label = panel_text(item.get("label"), MAX_PANEL_SHORT);
+                    let text = panel_text(item.get("text"), MAX_PANEL_TEXT);
+                    let note = panel_text(item.get("note"), MAX_PANEL_SHORT);
+                    let number = panel_number(item.get("value"));
+                    if label.is_empty() && text.is_empty() && note.is_empty() && number.is_none() {
+                        return None;
+                    }
+                    Some(PanelItem {
+                        label,
+                        text,
+                        value: number,
+                        note,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let columns = value
+        .get("columns")
+        .and_then(|columns| columns.as_array())
+        .map(|list| {
+            list.iter()
+                .take(MAX_PANEL_COLUMNS)
+                .map(|cell| panel_text(Some(cell), MAX_PANEL_SHORT))
+                .collect()
+        })
+        .unwrap_or_default();
+    let rows = value
+        .get("rows")
+        .and_then(|rows| rows.as_array())
+        .map(|list| {
+            list.iter()
+                .take(MAX_PANEL_ITEMS)
+                .map(|row| {
+                    row.as_array()
+                        .map(|cells| {
+                            cells
+                                .iter()
+                                .take(MAX_PANEL_COLUMNS)
+                                .map(|cell| panel_text(Some(cell), MAX_PANEL_SHORT))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    PanelSection {
+        title: panel_text(value.get("title"), MAX_PANEL_SHORT),
+        kind,
+        items,
+        columns,
+        rows,
+    }
+}
+
+/// Read a JSON string, clipped to `limit` characters with a visible marker.
+fn panel_text(value: Option<&serde_json::Value>, limit: usize) -> String {
+    let text = value
+        .and_then(|entry| entry.as_str())
+        .unwrap_or_default()
+        .trim();
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut clipped: String = text.chars().take(limit).collect();
+    clipped.push('…');
+    clipped
+}
+
+/// Read a bar row's number, whether the engine sent it as a number or a string.
+fn panel_number(value: Option<&serde_json::Value>) -> Option<f64> {
+    let number = match value? {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }?;
+    // A bar is drawn from a ratio; a non-finite value would poison the layout.
+    number.is_finite().then_some(number)
 }
 
 /// One answer, with whatever the endpoint said it cost.
@@ -1179,8 +1724,28 @@ struct Answer {
     rounds: u32,
     /// What each round cost, oldest first.
     round_tokens: Vec<(u64, u64, u32)>,
+    /// Estimated thinking tokens of each round, oldest first: output the bill
+    /// includes that no prompt holds. Empty for providers that do not stream
+    /// reasoning.
+    round_reasoning: Vec<u32>,
     /// What the context compaction did, when it did anything.
     compaction: Option<Compaction>,
+    /// The thinking text the engine streamed for the whole question; empty when
+    /// the provider sent none.
+    reasoning: String,
+    /// Wall clock the engine spent waiting for model round trips, in
+    /// milliseconds; zero when it did not report timing (older engines).
+    model_ms: u64,
+    /// Wall clock the engine spent running tools, in milliseconds; zero when
+    /// it did not report timing.
+    tool_ms: u64,
+    /// Searches the provider ran for this question on its own side.
+    web_searches: u32,
+    /// Pages the provider opened or read for this question.
+    web_fetches: u32,
+    /// Raw `server_tool_calls` of every round, kept so the next question can
+    /// hand them back and keep the pages read earlier in context.
+    server_tool_calls: Vec<serde_json::Value>,
 }
 
 /// Read the engine's compaction report out of an answer.
@@ -1208,6 +1773,19 @@ fn read_compaction(value: &serde_json::Value) -> Option<Compaction> {
     report.happened().then_some(report)
 }
 
+/// Read the engine's timing buckets; `(0, 0)` when it reported none.
+///
+/// The two figures are the engine's own wall clock for the phases it drives:
+/// the model round trips and the tool runs. The window subtracts them from the
+/// answer's total to show what it could not attribute.
+fn read_timing(value: &serde_json::Value) -> (u64, u64) {
+    let Some(timing) = value.get("timing") else {
+        return (0, 0);
+    };
+    let number = |key: &str| timing.get(key).and_then(|item| item.as_u64()).unwrap_or(0);
+    (number("modelMs"), number("toolMs"))
+}
+
 /// Read the provider's token counts; `None` when the endpoint sent none.
 fn read_usage(value: &serde_json::Value) -> Option<Usage> {
     let usage = value.get("usage")?;
@@ -1230,6 +1808,17 @@ fn read_usage(value: &serde_json::Value) -> Option<Usage> {
 fn read_answer(value: &serde_json::Value) -> Result<Answer, String> {
     let usage = read_usage(value);
     let compaction = read_compaction(value);
+    // What the engine's own clock measured, so the panel can split a request
+    // into model, tools and the rest. Older engines send nothing, and the card
+    // is hidden rather than showing a made-up zero split.
+    let (model_ms, tool_ms) = read_timing(value);
+    // The thinking text, kept so the transcript can show it in its own block;
+    // empty when the provider streamed none.
+    let reasoning = value
+        .get("reasoning")
+        .and_then(|text| text.as_str())
+        .unwrap_or_default()
+        .to_string();
     let context = value
         .get("context")
         .and_then(|context| context.as_u64())
@@ -1268,6 +1857,36 @@ fn read_answer(value: &serde_json::Value) -> Result<Answer, String> {
                 .collect()
         })
         .unwrap_or_default();
+    // Thinking tokens per round: a reasoner bills them as output, so they are
+    // neither prompt nor answer and get their own figure here.
+    let round_reasoning = value
+        .get("roundReasoning")
+        .and_then(|rounds| rounds.as_array())
+        .map(|rounds| {
+            rounds
+                .iter()
+                .map(|count| count.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32)
+                .collect()
+        })
+        .unwrap_or_default();
+    // Server tools the provider ran on its own side: the counts the statistics
+    // ledger keeps, so the money spent on searching stays visible.
+    let web = value.get("webSearch");
+    let web_count = |key: &str| {
+        web.and_then(|entry| entry.get(key))
+            .and_then(|count| count.as_u64())
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32
+    };
+    let web_searches = web_count("searches");
+    let web_fetches = web_count("fetches");
+    // The raw calls, so the next question can pass them back and keep the pages
+    // this question read in the model's context.
+    let server_tool_calls: Vec<serde_json::Value> = value
+        .get("serverToolCalls")
+        .and_then(|calls| calls.as_array())
+        .cloned()
+        .unwrap_or_default();
     if let Some(text) = value.get("text").and_then(|text| text.as_str())
         && !text.trim().is_empty()
     {
@@ -1278,7 +1897,14 @@ fn read_answer(value: &serde_json::Value) -> Result<Answer, String> {
             cache_hits,
             rounds,
             round_tokens,
+            round_reasoning,
             compaction,
+            model_ms,
+            tool_ms,
+            reasoning,
+            web_searches,
+            web_fetches,
+            server_tool_calls,
         });
     }
     if let Some(json) = value.get("json") {
@@ -1289,7 +1915,14 @@ fn read_answer(value: &serde_json::Value) -> Result<Answer, String> {
             cache_hits,
             rounds,
             round_tokens,
+            round_reasoning,
             compaction,
+            model_ms,
+            tool_ms,
+            reasoning,
+            web_searches,
+            web_fetches,
+            server_tool_calls,
         });
     }
     if let Some(error) = value.get("error").and_then(|error| error.as_str()) {
@@ -1316,7 +1949,14 @@ fn answer_text(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Result<Ans
             cache_hits: 0,
             rounds: 1,
             round_tokens: Vec::new(),
+            round_reasoning: Vec::new(),
             compaction: None,
+            model_ms: 0,
+            tool_ms: 0,
+            web_searches: 0,
+            web_fetches: 0,
+            reasoning: String::new(),
+            server_tool_calls: Vec::new(),
         });
     }
 
@@ -1677,6 +2317,107 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_timing_the_engine_reports() {
+        // The engine's own clock, so the panel can split a request into model,
+        // tools and the leftover; an older engine reports nothing at all.
+        let timed = events(
+            r#"{"text":"a","timing":{"modelMs":2100,"toolMs":640}}"#,
+            "",
+            Some(0),
+        );
+        let split = timed.iter().find_map(|event| match event {
+            AiEvent::Done {
+                model_ms, tool_ms, ..
+            } => Some((*model_ms, *tool_ms)),
+            _ => None,
+        });
+        assert_eq!(split, Some((2100, 640)));
+        let older = events(r#"{"text":"a"}"#, "", Some(0));
+        let missing = older.iter().find_map(|event| match event {
+            AiEvent::Done {
+                model_ms, tool_ms, ..
+            } => Some((*model_ms, *tool_ms)),
+            _ => None,
+        });
+        assert_eq!(missing, Some((0, 0)));
+    }
+
+    #[test]
+    fn reads_the_thinking_the_engine_reports() {
+        // A reasoner bills its thinking as output; the panel keeps it apart
+        // from the answer, so each round's figure has to survive the wire.
+        let timed = events(r#"{"text":"a","roundReasoning":[120,0,40]}"#, "", Some(0));
+        let per_round = timed.iter().find_map(|event| match event {
+            AiEvent::Done {
+                round_reasoning, ..
+            } => Some(round_reasoning.clone()),
+            _ => None,
+        });
+        assert_eq!(per_round, Some(vec![120, 0, 40]));
+        // An engine that does not measure thinking sends nothing at all.
+        let older = events(r#"{"text":"a"}"#, "", Some(0));
+        let missing = older.iter().find_map(|event| match event {
+            AiEvent::Done {
+                round_reasoning, ..
+            } => Some(round_reasoning.clone()),
+            _ => None,
+        });
+        assert_eq!(missing, Some(Vec::new()));
+    }
+
+    #[test]
+    fn reads_the_thinking_text_the_engine_streamed() {
+        // Live fragments arrive as their own event, and the answer repeats the
+        // whole text so a dropped fragment cannot lose it.
+        let live = line_event(r#"{"type":"reasoning","text":"先想"}"#);
+        assert!(matches!(live, Some(AiEvent::Reasoning(text)) if text == "先想"));
+        let done = events(r#"{"text":"a","reasoning":"先想一下"}"#, "", Some(0));
+        let text = done.iter().find_map(|event| match event {
+            AiEvent::Done { reasoning, .. } => Some(reasoning.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("先想一下"));
+        // An engine that sends none reports an empty string, not a missing one.
+        let older = events(r#"{"text":"a"}"#, "", Some(0));
+        let empty = older.iter().find_map(|event| match event {
+            AiEvent::Done { reasoning, .. } => Some(reasoning.clone()),
+            _ => None,
+        });
+        assert_eq!(empty.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn reads_the_searches_the_provider_ran_on_its_own_side() {
+        // The engine turns the server tools' report into counts; the ledger keeps
+        // them so the statistics page can show what searching cost.
+        let counted = events(
+            r#"{"text":"a","webSearch":{"searches":3,"fetches":1,"sources":[]}}"#,
+            "",
+            Some(0),
+        );
+        let counts = counted.iter().find_map(|event| match event {
+            AiEvent::Done {
+                web_searches,
+                web_fetches,
+                ..
+            } => Some((*web_searches, *web_fetches)),
+            _ => None,
+        });
+        assert_eq!(counts, Some((3, 1)));
+        // No server tools: both stay at zero rather than going missing.
+        let plain = events(r#"{"text":"a"}"#, "", Some(0));
+        let zeros = plain.iter().find_map(|event| match event {
+            AiEvent::Done {
+                web_searches,
+                web_fetches,
+                ..
+            } => Some((*web_searches, *web_fetches)),
+            _ => None,
+        });
+        assert_eq!(zeros, Some((0, 0)));
+    }
+
+    #[test]
     fn reads_the_round_trips_the_engine_reports() {
         // The bill is a multiple of the window figure because every round sends
         // the whole prompt again; the panel needs the count to say so.
@@ -1739,24 +2480,86 @@ mod tests {
         // The context panel sizes the tool definitions from this event, so it
         // has to keep the schema text, not just the count.
         let event = line_event(
-            r#"{"type":"tools","items":[{"name":"read","schema":"{\"type\":\"function\"}"},{"name":"list","schema":""}],"prompts":[{"id":"demo","text":"先看 README"}],"errors":[{"id":"old","message":"api 是 99"},{"id":"demo","message":"起不来","kind":"mcp"}]}"#,
+            r#"{"type":"tools","items":[{"name":"read","schema":"{\"type\":\"function\"}"},{"name":"list","schema":""},{"name":"plugin_echo","schema":"{}","plugin":"demo"},{"name":"mcp_files_read","schema":"{}","server":"files"}],"prompts":[{"id":"demo","text":"先看 README"}],"errors":[{"id":"old","message":"api 是 99"},{"id":"demo","message":"起不来","kind":"mcp"}]}"#,
         );
         assert!(matches!(
             event,
-            Some(AiEvent::Tools { ref items, ref prompts, ref errors, ref mcp_errors })
-                if items.len() == 2
-                    && items[0].0 == "read"
-                    && items[0].1.contains("function")
-                    && items[1].0 == "list"
-                    && prompts == &vec![("demo".to_string(), "先看 README".to_string())]
-                    && errors == &vec![("old".to_string(), "api 是 99".to_string())]
-                    && mcp_errors == &vec![("demo".to_string(), "起不来".to_string())]
+            Some(AiEvent::Tools {
+                ref items,
+                ref prompts,
+                ref errors,
+                ref mcp_errors,
+                ref plugin_tools,
+                ref mcp_tools,
+                ref panels,
+            }) if items.len() == 4
+                && items[0].0 == "read"
+                && items[0].1.contains("function")
+                && items[1].0 == "list"
+                && prompts == &vec![("demo".to_string(), "先看 README".to_string())]
+                && errors == &vec![("old".to_string(), "api 是 99".to_string())]
+                && mcp_errors == &vec![("demo".to_string(), "起不来".to_string())]
+                && plugin_tools == &vec![("demo".to_string(), "plugin_echo".to_string())]
+                && mcp_tools == &vec![("files".to_string(), "mcp_files_read".to_string())]
+                && panels.is_empty()
         ));
         // An engine that sends only the list still reads as an event.
         assert!(matches!(
             line_event(r#"{"type":"tools","items":[]}"#),
             Some(AiEvent::Tools { ref items, ref prompts, ref errors, .. })
                 if items.is_empty() && prompts.is_empty() && errors.is_empty()
+        ));
+    }
+
+    #[test]
+    fn reads_plugin_panels_and_keeps_only_what_it_can_draw() {
+        let event = line_event(
+            r#"{"type":"tools","items":[],"panels":[{"id":"budget","title":"本次构成","plugin":"demo","summary":[{"label":"窗口","value":"64000"},{"label":"轮次","value":3}],"sections":[{"title":"按类","kind":"bars","items":[{"label":"系统","value":12,"note":"chars"},{"label":"注入","value":"3.5"}]},{"title":"明细","kind":"table","columns":["项","值"],"rows":[["a","1"]]},{"title":"说明","kind":"text","items":[{"label":"提示","text":"先看 README"}]},{"title":"未知","kind":"chart","items":[]}]}]}"#,
+        );
+        let Some(AiEvent::Tools { ref panels, .. }) = event else {
+            panic!("expected the tools event");
+        };
+        assert_eq!(panels.len(), 1);
+        let panel = &panels[0];
+        assert_eq!(panel.id, "budget");
+        assert_eq!(panel.title, "本次构成");
+        assert_eq!(panel.plugin, "demo");
+        assert_eq!(
+            panel.summary,
+            vec![
+                ("窗口".to_string(), "64000".to_string()),
+                ("轮次".to_string(), "3".to_string())
+            ]
+        );
+        assert_eq!(panel.sections.len(), 4);
+        assert_eq!(panel.sections[0].kind, PanelKind::Bars);
+        assert_eq!(panel.sections[0].items[0].value, Some(12.0));
+        assert_eq!(panel.sections[0].items[0].note, "chars");
+        // A number sent as a string still draws a bar.
+        assert_eq!(panel.sections[0].items[1].value, Some(3.5));
+        assert_eq!(panel.sections[1].kind, PanelKind::Table);
+        assert_eq!(
+            panel.sections[1].columns,
+            vec!["项".to_string(), "值".to_string()]
+        );
+        assert_eq!(
+            panel.sections[1].rows,
+            vec![vec!["a".to_string(), "1".to_string()]]
+        );
+        assert_eq!(panel.sections[2].kind, PanelKind::Text);
+        assert_eq!(panel.sections[2].items[0].text, "先看 README");
+        // A shape this window does not know is drawn as text, not dropped.
+        assert_eq!(panel.sections[3].kind, PanelKind::Text);
+        // A panel with no id cannot be identified, so it is skipped.
+        assert!(matches!(
+            line_event(r#"{"type":"tools","items":[],"panels":[{"title":"x"}]}"#),
+            Some(AiEvent::Tools { ref panels, .. }) if panels.is_empty()
+        ));
+        // One that lost its heading still shows under its id.
+        assert!(matches!(
+            line_event(r#"{"type":"tools","items":[],"panels":[{"id":"bare"}]}"#),
+            Some(AiEvent::Tools { ref panels, .. })
+                if panels.len() == 1 && panels[0].title == "bare"
         ));
     }
 
@@ -1770,6 +2573,9 @@ mod tests {
     fn context_windows_follow_the_model_name() {
         assert_eq!(context_window("deepseek-chat"), 128_000);
         assert_eq!(context_window("DeepSeek-Reasoner"), 128_000);
+        // The 2026 lineup ships a 1M window.
+        assert_eq!(context_window("deepseek-flash"), 1_000_000);
+        assert_eq!(context_window("deepseek-v4-pro"), 1_000_000);
         assert_eq!(context_window("claude-sonnet-4"), 200_000);
         assert_eq!(context_window("kimi-k2"), 256_000);
         assert_eq!(context_window("gpt-4.1"), 1_000_000);
@@ -1937,10 +2743,12 @@ mod tests {
             Turn {
                 speaker: Speaker::User,
                 text: "这里有什么文件？".to_string(),
+                server_tool_calls: Vec::new(),
             },
             Turn {
                 speaker: Speaker::Assistant,
                 text: "看 a.txt".to_string(),
+                server_tool_calls: Vec::new(),
             },
         ];
         let text = payload(
@@ -1961,6 +2769,11 @@ mod tests {
         assert_eq!(value["confirmWrites"], false);
         assert_eq!(value["fileScope"], "full");
         assert_eq!(value["timeoutMs"], CHAT_TIMEOUT_MS);
+        assert_eq!(
+            value["windowTokens"],
+            serde_json::json!(crate::ai::context_window(&connection.model)),
+            "without an override the model name table answers"
+        );
         assert_eq!(value["model"], connection.model.as_str());
         assert_eq!(
             value["history"],
@@ -1969,6 +2782,28 @@ mod tests {
                 { "role": "assistant", "content": "看 a.txt" },
             ])
         );
+    }
+
+    #[test]
+    fn an_explicit_window_rides_with_the_request() {
+        // A local model the table does not know would otherwise be treated as
+        // 128k; the connection's own figure is what the engine must compact by.
+        let mut connection = Connection::from_preset("deepseek").expect("preset");
+        connection.model = "some-local-model".to_string();
+        connection.window = 32_768;
+        let value: serde_json::Value = serde_json::from_str(&payload(
+            "hi",
+            None,
+            &[],
+            &connection,
+            true,
+            None,
+            false,
+            None,
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(value["windowTokens"], 32_768);
     }
 
     #[test]
@@ -1991,7 +2826,7 @@ mod tests {
             "the default sends nothing"
         );
 
-        connection.sampling = crate::config::Sampling::Precise;
+        connection.temperature = Some(0.2);
         let value: serde_json::Value = serde_json::from_str(&payload(
             "hi",
             None,
@@ -2038,6 +2873,174 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(value["maxTokens"], 4096);
+    }
+
+    #[test]
+    fn the_thinking_choice_rides_along_only_when_it_is_not_the_default() {
+        let mut connection = Connection::from_preset("deepseek").expect("preset");
+        let value: serde_json::Value = serde_json::from_str(&payload(
+            "hi",
+            None,
+            &[],
+            &connection,
+            false,
+            None,
+            false,
+            None,
+            &[],
+        ))
+        .unwrap();
+        assert!(
+            value.get("reasoning").is_none(),
+            "the default leaves thinking to the endpoint"
+        );
+
+        for (choice, name) in [
+            (crate::config::Reasoning::Off, "off"),
+            (crate::config::Reasoning::Low, "low"),
+            (crate::config::Reasoning::High, "high"),
+            (crate::config::Reasoning::Max, "max"),
+        ] {
+            connection.reasoning = choice;
+            let value: serde_json::Value = serde_json::from_str(&payload(
+                "hi",
+                None,
+                &[],
+                &connection,
+                false,
+                None,
+                false,
+                None,
+                &[],
+            ))
+            .unwrap();
+            assert_eq!(value["reasoning"], name);
+        }
+    }
+
+    #[test]
+    fn web_search_is_sent_only_where_the_endpoint_offers_it() {
+        // Searching is on by default: the request asks for it wherever the
+        // endpoint has the tools, and leaves them out where it does not.
+        let mut connection = Connection::from_preset("deepseek").expect("preset");
+        let offered = payload_with_budgets(
+            "hi",
+            None,
+            &[],
+            &connection,
+            false,
+            None,
+            false,
+            None,
+            &[],
+            8,
+            20,
+            false,
+            true,
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&offered).unwrap();
+        assert_eq!(value["webSearch"], true);
+        // The conversation switched it off for itself.
+        let off = payload_with_budgets(
+            "hi",
+            None,
+            &[],
+            &connection,
+            false,
+            None,
+            false,
+            None,
+            &[],
+            8,
+            20,
+            false,
+            false,
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&off).unwrap();
+        assert!(value.get("webSearch").is_none(), "off sends nothing");
+
+        connection.model = "deepseek-v4-pro".to_string();
+        let unsupported = payload_with_budgets(
+            "hi",
+            None,
+            &[],
+            &connection,
+            false,
+            None,
+            false,
+            None,
+            &[],
+            8,
+            20,
+            false,
+            true,
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&unsupported).unwrap();
+        assert!(
+            value.get("webSearch").is_none(),
+            "only flash offers the tools"
+        );
+    }
+
+    #[test]
+    fn hands_the_server_calls_back_with_the_assistant_turn() {
+        // The provider restores the pages it read from these; a framework that
+        // drops them still gets an answer, but without that context.
+        let connection = Connection::from_preset("deepseek").expect("preset");
+        let call = serde_json::json!({
+            "id": "search_1",
+            "kind": "search",
+            "action": { "type": "search", "queries": ["x"] },
+            "status": "completed",
+            "sources": [{ "title": "X", "url": "https://example.com/x" }]
+        });
+        let history = vec![
+            Turn {
+                speaker: Speaker::User,
+                text: "问".to_string(),
+                server_tool_calls: Vec::new(),
+            },
+            Turn {
+                speaker: Speaker::Assistant,
+                text: "答".to_string(),
+                server_tool_calls: vec![call.clone()],
+            },
+        ];
+        let value: serde_json::Value = serde_json::from_str(&payload(
+            "下一个问题",
+            None,
+            &history,
+            &connection,
+            false,
+            None,
+            false,
+            None,
+            &[],
+        ))
+        .unwrap();
+        assert!(
+            value["history"][0].get("serverToolCalls").is_none(),
+            "a user turn has none"
+        );
+        assert_eq!(
+            value["history"][1]["serverToolCalls"],
+            serde_json::json!([call])
+        );
     }
 
     #[test]
@@ -2106,6 +3109,8 @@ mod tests {
             &[],
             12,
             40,
+            false,
+            true,
             &[],
             None,
             &[],
@@ -2129,6 +3134,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             Some(Path::new(
                 "C:\\Users\\me\\AppData\\Roaming\\dsh-flow-ui\\plugins",
@@ -2182,6 +3189,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             None,
             &[],
@@ -2210,6 +3219,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             None,
             &[],
@@ -2264,10 +3275,14 @@ mod tests {
                     AiEvent::ToolOutput { tool, .. } => format!("output:{tool}"),
                     AiEvent::Approval { tool, .. } => format!("approval:{tool}"),
                     AiEvent::Delta(text) => format!("delta:{text}"),
+                    AiEvent::Reasoning(text) => format!("reasoning:{text}"),
                     AiEvent::Tools { items, .. } => format!("tools:{}", items.len()),
                     AiEvent::Progress { round, calls } => format!("progress:{round}:{calls}"),
                     AiEvent::Done { text, .. } => format!("done:{text}"),
                     AiEvent::Failed(error) => format!("failed:{error}"),
+                    AiEvent::Question { question, .. } => format!("question:{question}"),
+                    AiEvent::Plan { .. } => "plan".to_string(),
+                    AiEvent::Todo { items } => format!("todo:{}", items.len()),
                 });
             }
             thread::sleep(std::time::Duration::from_millis(25));
@@ -2301,10 +3316,12 @@ mod tests {
             Turn {
                 speaker: Speaker::User,
                 text: "问题".to_string(),
+                server_tool_calls: Vec::new(),
             },
             Turn {
                 speaker: Speaker::Assistant,
                 text: "回答".to_string(),
+                server_tool_calls: Vec::new(),
             },
         ];
         let compacted = compact_span(&engine, &connection, &turns, "指令").expect("a checkpoint");
@@ -2365,6 +3382,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             None,
             &[],
@@ -2469,6 +3488,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             None,
             &[],
@@ -2535,6 +3556,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             None,
             &[],
@@ -2572,6 +3595,8 @@ mod tests {
             &[],
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
+            false,
+            true,
             &files,
             None,
             &[],

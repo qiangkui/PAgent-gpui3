@@ -124,6 +124,18 @@ impl DshFlowApp {
                 "mcp",
                 "连接并调用 MCP 服务器：list 看 mcpserver 目录，link 按 id 或 command/url 连接，tools 看本次已连接，call 调用工具，disconnect 断开；连接在本次提问内保持",
             ),
+            (
+                "ask_user_question",
+                "向用户提一个带选项的问题并等待回答；关键方案拿不准时使用",
+            ),
+            (
+                "todo_write",
+                "写入或替换本次对话的待办列表；开始多步任务时列计划，之后更新状态",
+            ),
+            (
+                "exit_plan_mode",
+                "计划模式下提交完整计划，等待用户批准后开始执行",
+            ),
         ];
         let planned = [
             ("approve / pause", "人工确认与 2FA 接管，拒绝则中止并留痕"),
@@ -235,10 +247,13 @@ impl DshFlowApp {
         let mut external_cards: Vec<AnyElement> = Vec::new();
         for (id, name, version, problem) in entries {
             let on = self.ai.plugin_enabled(&id);
+            // What this plugin added to the last request: two folders can look
+            // alike and do very different things, so the card says which.
+            let contribution = plugin_contribution(&id, &self.plugin_tools, &self.plugin_prompts);
             let detail = if version.is_empty() {
-                id.clone()
+                format!("{id}{contribution}")
             } else {
-                format!("{id} · {version}")
+                format!("{id} · {version}{contribution}")
             };
             let toggle_id = id.clone();
             let border = if problem.is_some() {
@@ -315,6 +330,7 @@ impl DshFlowApp {
                     .flex_1()
                         .min_h(px(0.))
                         .overflow_y_scroll()
+                        .contained_wheel()
                         .child(
                             div()
                                 .flex()
@@ -328,9 +344,9 @@ impl DshFlowApp {
                                     div()
                                         .flex()
                                         .flex_row()
-                                        .items_center()
+                                        .items_end()
                                         .flex_wrap()
-                                        .gap_2()
+                                        .gap(px(20.))
                                         .px_1()
                                         .pt_3()
                                         .child(
@@ -340,35 +356,42 @@ impl DshFlowApp {
                                                 .text_color(rgb(palette.text))
                                                 .child("外部插件"),
                                         )
-                                        .child(icon_button(
-                                            "plugins-folder",
-                                            "icons/folder-open.svg",
-                                            palette,
-                                            cx,
-                                            |view, cx| {
-                                                if let Some(dir) =
-                                                    crate::config::AiSettings::plugin_dir()
-                                                {
-                                                    let _ = std::fs::create_dir_all(&dir);
-                                                    let _ = open_path(&dir);
-                                                }
-                                                view.refresh_plugins(cx);
-                                            },
-                                        ))
-                                        .child(icon_button(
-                                            "plugins-rescan",
-                                            "icons/regenerate2.svg",
-                                            palette,
-                                            cx,
-                                            |view, cx| view.refresh_plugins(cx),
-                                        ))
-                                        .child(icon_button(
-                                            "plugins-example",
-                                            "icons/plus.svg",
-                                            palette,
-                                            cx,
-                                            |view, cx| view.create_example_plugin(cx),
-                                        ))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_end()
+                                                .gap_1()
+                                                .child(icon_button(
+                                                    "plugins-folder",
+                                                    "icons/folder-open.svg",
+                                                    palette,
+                                                    cx,
+                                                    |view, cx| {
+                                                        if let Some(dir) =
+                                                            crate::config::AiSettings::plugin_dir()
+                                                        {
+                                                            let _ = std::fs::create_dir_all(&dir);
+                                                            let _ = open_path(&dir);
+                                                        }
+                                                        view.refresh_plugins(cx);
+                                                    },
+                                                ))
+                                                .child(icon_button(
+                                                    "plugins-rescan",
+                                                    "icons/regenerate2.svg",
+                                                    palette,
+                                                    cx,
+                                                    |view, cx| view.refresh_plugins(cx),
+                                                ))
+                                                .child(icon_button(
+                                                    "plugins-add",
+                                                    "icons/plus.svg",
+                                                    palette,
+                                                    cx,
+                                                    |view, cx| view.add_plugin(cx),
+                                                )),
+                                        )
                                         .child(
                                             div()
                                                 .text_xs()
@@ -394,7 +417,8 @@ impl DshFlowApp {
                                         .text_color(rgb(palette.faint))
                                         .whitespace_normal()
                                         .child(
-                                            "还没有外部插件。点「外部插件」旁边的 + 生成示例，或自己建一个文件夹再点刷新图标。",
+                                            "还没有外部插件。点「外部插件」旁边的 + 选择一个插件文件夹（里面有 plugin.json），\
+                                             会复制到插件目录并启用；也可以自己建一个文件夹再点刷新图标。",
                                         )
                                         .into_any_element()
                                 } else {
@@ -632,38 +656,40 @@ impl DshFlowApp {
         cx.notify();
     }
 
-    /// Write a minimal, working plugin into the plugin folder.
-    ///
-    /// The fastest way to explain the format: a real folder with a real
-    /// `activate(api)`, which the reader can open, edit and switch on. An
-    /// existing folder is never overwritten.
-    pub(crate) fn create_example_plugin(&mut self, cx: &mut Context<Self>) {
-        let Some(dir) = crate::config::AiSettings::plugin_dir() else {
-            self.plugin_note = "找不到插件目录".to_string();
+    /// Ask for a plugin folder to copy into the plugin folder.
+    pub(crate) fn add_plugin(&mut self, cx: &mut Context<Self>) {
+        let opened = self.open_picker(
+            PickPurpose::Plugin,
+            || match crate::folder::pick_folder("Add plugin folder") {
+                Some(folder) => PickResult::Folder(folder),
+                None => PickResult::Cancelled,
+            },
+            cx,
+        );
+        if !opened {
+            self.plugin_note = "已经有一个选择对话框打开了，先处理它。".to_string();
             cx.notify();
-            return;
-        };
-        let folder = dir.join(EXAMPLE_PLUGIN_ID);
-        if folder.exists() {
-            let _ = open_path(&folder);
-            self.plugin_note = format!(
-                "{} 已存在，已打开它的文件夹（不会覆盖你改过的内容）。",
-                EXAMPLE_PLUGIN_ID
-            );
-            self.refresh_plugins(cx);
-            return;
         }
-        let result = std::fs::create_dir_all(&folder)
-            .and_then(|()| std::fs::write(folder.join("plugin.json"), EXAMPLE_PLUGIN_MANIFEST))
-            .and_then(|()| std::fs::write(folder.join("index.js"), EXAMPLE_PLUGIN_SOURCE));
-        self.plugin_note = match result {
-            Ok(()) => format!(
-                "已生成 {}：打开右边的开关，下一轮提问就能用 plugin_echo（每次调用会先弹确认卡）。",
-                EXAMPLE_PLUGIN_ID
-            ),
-            Err(error) => format!("生成示例插件失败：{error}"),
-        };
+    }
+
+    /// Copy the chosen plugin folder in, switch it on and rescan.
+    ///
+    /// The folder keeps its own name as the id, and the manifest is checked the
+    /// way the scan checks it, so a folder that would not load is refused
+    /// before it reaches the plugin directory.
+    pub(crate) fn install_plugin_folder(&mut self, source: &Path, cx: &mut Context<Self>) {
+        match crate::config::import_plugin(source) {
+            Ok(id) => {
+                self.ai.set_plugin(&id, true);
+                if let Err(error) = self.ai.save() {
+                    self.banner = Some(Banner::error(error));
+                }
+                self.plugin_note = format!("已添加插件「{id}」并启用：下一轮提问会带上它。");
+            }
+            Err(error) => self.plugin_note = error,
+        }
         self.refresh_plugins(cx);
+        cx.notify();
     }
 
     /// The one-item card menu: delete this external plugin from disk.

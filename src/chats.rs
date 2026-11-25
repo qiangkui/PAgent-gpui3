@@ -92,12 +92,30 @@ pub struct StoredChat {
     pub full_access: bool,
     /// Whether commands and destructive actions run without asking.
     pub auto_actions: bool,
+    /// Whether low-risk writes and read-only commands skip the approval card.
+    pub auto_review: bool,
     /// Model round-trips one question may take.
     pub max_rounds: u32,
     /// Tool calls one question may make.
     pub max_calls: u32,
     /// Mode id selecting external plugins, skills and MCP servers.
     pub mode: String,
+    /// This chat's web-search override; absent means it follows the
+    /// connection's own switch.
+    pub web_search: Option<bool>,
+    /// True while the conversation runs in plan mode.
+    pub plan: bool,
+    /// The conversation's standing todo list, newest write wins.
+    pub todos: Vec<StoredTodo>,
+}
+
+/// One todo item as it is written to `chat.json`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredTodo {
+    /// What has to be done.
+    pub text: String,
+    /// `pending`, `in_progress` or `completed`.
+    pub status: String,
 }
 
 /// One request's detail, as one line of `requests.jsonl`.
@@ -114,6 +132,25 @@ pub struct StoredRequest {
     pub context: u64,
     /// Tool calls the question made; zero for lines written before it was kept.
     pub calls: u64,
+    /// Prompt tokens the provider served from its cache.
+    pub cache_hits: u64,
+    /// Prompt tokens the question sent, summed over its rounds: the denominator
+    /// of the cache rate. Zero for lines written before it was kept.
+    pub prompt_tokens: u64,
+    /// Wall clock spent waiting for model round trips, in milliseconds.
+    pub model_ms: u64,
+    /// Wall clock spent running tools, in milliseconds.
+    pub tool_ms: u64,
+    /// Searches the provider ran on its side for this question; zero when the
+    /// server tools were off or the file predates the field.
+    pub web_searches: u32,
+    /// Pages the provider opened or read for this question.
+    pub web_fetches: u32,
+    /// The thinking text the question produced, in order; empty when the
+    /// provider streamed none. Kept so the context panel can open it.
+    pub reasoning: String,
+    /// Estimated thinking tokens the question produced, summed over rounds.
+    pub reasoning_tokens: u32,
     /// Every counted piece of the request, in the order it was sent.
     pub items: Vec<StoredRequestItem>,
 }
@@ -235,9 +272,37 @@ fn clip_items(value: &mut serde_json::Value) {
 /// Read one request's detail back, or `None` when it was never stored.
 ///
 /// The last matching line wins, so a repeated turn (a rewritten conversation)
-/// still opens the newest record.
+/// still opens the newest record. Only lines carrying that turn reach the JSON
+/// parser, so opening one old request does not deserialize every other prompt
+/// in the file.
 pub fn load_request(dir: &Path, chat: &str, turn: u64) -> Option<StoredRequest> {
-    load_requests(dir, chat).remove(&turn)
+    let path = dir.join(FOLDER).join(chat).join(REQUESTS);
+    let body = std::fs::read_to_string(path).ok()?;
+    // The panel opens one request at a time. Parsing every line's prompt text
+    // just to throw all but one away is the expensive part, so skip lines that
+    // cannot be this turn before touching the JSON parser. A text field that
+    // happens to contain the marker only costs one parse; the turn check below
+    // still decides.
+    let marker = format!("\"turn\":{turn},");
+    let last = format!("\"turn\":{turn}}}");
+    let spaced = format!("\"turn\": {turn}");
+    let mut found = None;
+    for line in body.lines() {
+        if !line.contains(&marker) && !line.contains(&last) && !line.contains(&spaced) {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let request = stored_request(&value);
+        if request.turn == turn {
+            found = Some(request);
+        }
+    }
+    // A file written by an older version (or edited by hand) may order or space
+    // the fields differently; fall back to the full read only then, so the
+    // common case stays a filtered scan.
+    found.or_else(|| load_requests(dir, chat).remove(&turn))
 }
 
 /// Read every request detail of a conversation, keyed by turn.
@@ -271,6 +336,14 @@ fn request_value(request: &StoredRequest) -> serde_json::Value {
         "tokens": request.tokens,
         "context": request.context,
         "calls": request.calls,
+        "cacheHits": request.cache_hits,
+        "promptTokens": request.prompt_tokens,
+        "modelMs": request.model_ms,
+        "toolMs": request.tool_ms,
+        "webSearches": request.web_searches,
+        "webFetches": request.web_fetches,
+        "reasoning": request.reasoning,
+        "reasoningTokens": request.reasoning_tokens,
         "items": request
             .items
             .iter()
@@ -325,6 +398,35 @@ fn stored_request(value: &serde_json::Value) -> StoredRequest {
             .get("calls")
             .and_then(|calls| calls.as_u64())
             .unwrap_or(0),
+        cache_hits: value
+            .get("cacheHits")
+            .and_then(|hits| hits.as_u64())
+            .unwrap_or(0),
+        prompt_tokens: value
+            .get("promptTokens")
+            .and_then(|tokens| tokens.as_u64())
+            .unwrap_or(0),
+        model_ms: value
+            .get("modelMs")
+            .and_then(|ms| ms.as_u64())
+            .unwrap_or(0),
+        tool_ms: value.get("toolMs").and_then(|ms| ms.as_u64()).unwrap_or(0),
+        web_searches: value
+            .get("webSearches")
+            .and_then(|count| count.as_u64())
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32,
+        web_fetches: value
+            .get("webFetches")
+            .and_then(|count| count.as_u64())
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32,
+        reasoning: text_of(value.get("reasoning")),
+        reasoning_tokens: value
+            .get("reasoningTokens")
+            .and_then(|tokens| tokens.as_u64())
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32,
         items,
     }
 }
@@ -341,6 +443,13 @@ pub struct StoredMessage {
     pub model: String,
     /// How long the answer took, in milliseconds; zero when unknown.
     pub elapsed_ms: u64,
+    /// Wall clock the engine spent waiting for model round trips, in
+    /// milliseconds; zero for older files and for engines that did not report
+    /// timing.
+    pub model_ms: u64,
+    /// Wall clock the engine spent running tools, in milliseconds; zero for the
+    /// same reason.
+    pub tool_ms: u64,
     /// Tokens the answer cost; zero when the endpoint did not say.
     pub tokens: u64,
     /// Tokens the last request carried; zero for older files.
@@ -352,14 +461,30 @@ pub struct StoredMessage {
     pub rounds: u32,
     /// What each round cost, oldest first, as `[prompt, completion, calls]`.
     pub round_tokens: Vec<(u64, u64, u32)>,
+    /// Estimated thinking tokens of each round, oldest first; empty for files
+    /// written before reasoning was measured.
+    pub round_reasoning: Vec<u32>,
     /// What that request was made of, as the category estimates in
     /// `ContextKind` order; empty for older files and for non-answers.
     pub composition: Vec<u32>,
     /// Estimated tokens its tools cost (arguments + what came back); zero for
     /// older files and for answers that used none.
     pub tools_tokens: u32,
+    /// Which compaction layer ran just before that answer (`prune`, `summary`,
+    /// `drop`); empty when nothing was compressed or the file predates it.
+    pub compaction_layer: String,
+    /// Tokens that compaction saved; zero when none ran.
+    pub compaction_saved: u64,
     /// True when the answer was cut short and can be continued.
     pub interrupted: bool,
+    /// Thinking the model streamed for the answer, in order; empty for files
+    /// written before it was kept, and for providers that send none.
+    pub reasoning: String,
+    /// Raw server-tool calls of the answer, kept so the next question can pass
+    /// them back and the provider can restore the pages it read.
+    pub server_tool_calls: Vec<serde_json::Value>,
+    /// For a thinking row: the round trip it belongs to, counting from one.
+    pub round: u32,
     /// What kind of attachment a file message carries: `text`, `image` or `pdf`.
     pub kind: String,
     /// Arguments of a tool call, for the expanded row.
@@ -566,6 +691,10 @@ fn read_chat(value: &serde_json::Value) -> Option<StoredChat> {
         .get("autoActions")
         .and_then(|flag| flag.as_bool())
         .unwrap_or(false);
+    let auto_review = value
+        .get("autoReview")
+        .and_then(|flag| flag.as_bool())
+        .unwrap_or(false);
     let max_rounds = value
         .get("maxRounds")
         .and_then(|item| item.as_u64())
@@ -608,6 +737,7 @@ fn read_chat(value: &serde_json::Value) -> Option<StoredChat> {
         read_only,
         full_access,
         auto_actions,
+        auto_review,
         max_rounds,
         max_calls,
         mode: {
@@ -618,6 +748,32 @@ fn read_chat(value: &serde_json::Value) -> Option<StoredChat> {
                 mode
             }
         },
+        web_search: value
+            .get("webSearch")
+            .and_then(|flag| flag.as_bool()),
+        plan: value
+            .get("plan")
+            .and_then(|flag| flag.as_bool())
+            .unwrap_or(false),
+        todos: value
+            .get("todos")
+            .and_then(|items| items.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let text = text_of(item.get("text"));
+                        if text.is_empty() {
+                            return None;
+                        }
+                        Some(StoredTodo {
+                            text,
+                            status: text_of(item.get("status")),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -662,8 +818,11 @@ fn read_message(value: &serde_json::Value) -> Option<StoredMessage> {
         "user" => "user",
         "assistant" => "assistant",
         "tool" => "tool",
+        "thinking" => "thinking",
         "attachment" => "attachment",
         "approval" => "approval",
+        "question" => "question",
+        "plan" => "plan",
         _ => "note",
     };
     Some(StoredMessage {
@@ -676,6 +835,14 @@ fn read_message(value: &serde_json::Value) -> Option<StoredMessage> {
         model: text_of(value.get("model")),
         elapsed_ms: value
             .get("elapsedMs")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0),
+        model_ms: value
+            .get("modelMs")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0),
+        tool_ms: value
+            .get("toolMs")
             .and_then(|item| item.as_u64())
             .unwrap_or(0),
         tokens: value
@@ -715,6 +882,18 @@ fn read_message(value: &serde_json::Value) -> Option<StoredMessage> {
                     .collect()
             })
             .unwrap_or_default(),
+        round_reasoning: value
+            .get("roundReasoning")
+            .and_then(|items| items.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|count| {
+                        count.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         composition: value
             .get("composition")
             .and_then(|item| item.as_array())
@@ -729,10 +908,26 @@ fn read_message(value: &serde_json::Value) -> Option<StoredMessage> {
             .and_then(|item| item.as_u64())
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32,
+        compaction_layer: text_of(value.get("compactionLayer")),
+        compaction_saved: value
+            .get("compactionSaved")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0),
         interrupted: value
             .get("interrupted")
             .and_then(|flag| flag.as_bool())
             .unwrap_or(false),
+        reasoning: text_of(value.get("reasoning")),
+        server_tool_calls: value
+            .get("serverToolCalls")
+            .and_then(|calls| calls.as_array())
+            .cloned()
+            .unwrap_or_default(),
+        round: value
+            .get("round")
+            .and_then(|round| round.as_u64())
+            .unwrap_or(0)
+            .min(u64::from(u32::MAX)) as u32,
         kind: text_of(value.get("kind")),
         input: text_of(value.get("input")),
         output: text_of(value.get("output")),
@@ -783,6 +978,8 @@ fn chat_value(chat: &StoredChat) -> serde_json::Value {
                 "failed": message.failed,
                 "model": message.model,
                 "elapsedMs": message.elapsed_ms,
+                "modelMs": message.model_ms,
+                "toolMs": message.tool_ms,
                 "tokens": message.tokens,
                 "context": message.context,
                 "cacheHits": message.cache_hits,
@@ -792,9 +989,15 @@ fn chat_value(chat: &StoredChat) -> serde_json::Value {
                     .iter()
                     .map(|(prompt, completion, calls)| serde_json::json!([prompt, completion, calls]))
                     .collect::<Vec<_>>(),
+                "roundReasoning": message.round_reasoning,
                 "composition": message.composition,
                 "toolsTokens": message.tools_tokens,
+                "compactionLayer": message.compaction_layer,
+                "compactionSaved": message.compaction_saved,
                 "interrupted": message.interrupted,
+                "reasoning": message.reasoning,
+                "serverToolCalls": message.server_tool_calls,
+                "round": message.round,
                 "kind": message.kind,
                 "input": message.input,
                 "output": message.output,
@@ -830,9 +1033,17 @@ fn chat_value(chat: &StoredChat) -> serde_json::Value {
         "toolsReadOnly": chat.read_only,
         "fullAccess": chat.full_access,
         "autoActions": chat.auto_actions,
+        "autoReview": chat.auto_review,
         "maxRounds": chat.max_rounds,
         "maxCalls": chat.max_calls,
         "mode": chat.mode,
+        "webSearch": chat.web_search,
+        "plan": chat.plan,
+        "todos": chat
+            .todos
+            .iter()
+            .map(|todo| serde_json::json!({ "text": todo.text, "status": todo.status }))
+            .collect::<Vec<_>>(),
         "messages": messages,
     })
 }
@@ -891,14 +1102,22 @@ mod tests {
             failed,
             model: String::new(),
             elapsed_ms: 0,
+            model_ms: 0,
+            tool_ms: 0,
             tokens: 0,
             context: 0,
             cache_hits: 0,
+            compaction_layer: String::new(),
+            compaction_saved: 0,
             rounds: 0,
             round_tokens: Vec::new(),
+            round_reasoning: Vec::new(),
             composition: Vec::new(),
             tools_tokens: 0,
             interrupted: false,
+            reasoning: String::new(),
+            server_tool_calls: Vec::new(),
+            round: 0,
             kind: "text".to_string(),
             input: String::new(),
             output: String::new(),
@@ -929,9 +1148,13 @@ mod tests {
             read_only: false,
             full_access: true,
             auto_actions: false,
+            auto_review: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
-mode: crate::config::MODE_FULL.to_string(),
+            mode: crate::config::MODE_FULL.to_string(),
+            web_search: None,
+        plan: false,
+        todos: Vec::new(),
         }
     }
 
@@ -948,6 +1171,14 @@ mode: crate::config::MODE_FULL.to_string(),
             tokens: 1840,
             context: 1750,
             calls: 2,
+            cache_hits: 640,
+            prompt_tokens: 1_000,
+            model_ms: 2_100,
+            tool_ms: 640,
+            web_searches: 0,
+            web_fetches: 0,
+            reasoning: "先想一想".to_string(),
+            reasoning_tokens: 120,
             items: vec![
                 StoredRequestItem {
                     kind: "system".to_string(),
@@ -969,6 +1200,15 @@ mode: crate::config::MODE_FULL.to_string(),
         assert_eq!(loaded.tokens, 1840);
         assert_eq!(loaded.context, 1750);
         assert_eq!(loaded.calls, 2);
+        // The cache and timing figures travel with the line, so a reopened
+        // request still knows where its time went and how much was cached.
+        assert_eq!(loaded.cache_hits, 640);
+        assert_eq!(loaded.prompt_tokens, 1_000);
+        assert_eq!(loaded.model_ms, 2_100);
+        assert_eq!(loaded.tool_ms, 640);
+        // The thinking text and its estimate travel with the line too.
+        assert_eq!(loaded.reasoning, "先想一想");
+        assert_eq!(loaded.reasoning_tokens, 120);
         assert_eq!(loaded.items.len(), 2);
         // The text is kept whole: the panel shows it, so cutting it here would
         // silently hide the end of a prompt.
@@ -984,6 +1224,14 @@ mode: crate::config::MODE_FULL.to_string(),
             tokens: 2000,
             context: 1900,
             calls: 0,
+            cache_hits: 0,
+            prompt_tokens: 0,
+            model_ms: 0,
+            tool_ms: 0,
+            web_searches: 0,
+            web_fetches: 0,
+            reasoning: String::new(),
+            reasoning_tokens: 0,
             items: Vec::new(),
         };
         append_request(&dir, "chat-1", &second).expect("second append");
@@ -1031,6 +1279,14 @@ mode: crate::config::MODE_FULL.to_string(),
                 tokens: 100 + turn,
                 context: 90 + turn,
                 calls: 0,
+                cache_hits: 0,
+                prompt_tokens: 0,
+                model_ms: 0,
+                tool_ms: 0,
+                web_searches: 0,
+                web_fetches: 0,
+                reasoning: String::new(),
+                reasoning_tokens: 0,
                 items: vec![
                     StoredRequestItem {
                         kind: "user".to_string(),
@@ -1091,12 +1347,18 @@ mode: crate::config::MODE_FULL.to_string(),
         let mut answer = message("assistant", "## 标题\n正文", false);
         answer.model = "deepseek-chat".to_string();
         answer.elapsed_ms = 2400;
+        answer.model_ms = 1700;
+        answer.tool_ms = 450;
+        answer.compaction_layer = "summary".to_string();
+        answer.compaction_saved = 900;
+        answer.reasoning = "先想一想".to_string();
         answer.tokens = 1840;
         answer.context = 1750;
         answer.composition = vec![210, 780, 90, 320, 0, 260, 90];
         answer.tools_tokens = 412;
         answer.rounds = 3;
         answer.round_tokens = vec![(1200, 100, 2), (1500, 120, 1), (1750, 140, 0)];
+        answer.round_reasoning = vec![120, 0, 40];
         let chat = StoredChat {
             title: "统计文件".to_string(),
             dir: "chat-3".to_string(),
@@ -1111,9 +1373,13 @@ mode: crate::config::MODE_FULL.to_string(),
             read_only: true,
             full_access: false,
             auto_actions: false,
+            auto_review: false,
             max_rounds: 12,
             max_calls: 40,
-mode: crate::config::MODE_FULL.to_string(),
+            mode: crate::config::MODE_FULL.to_string(),
+            web_search: Some(false),
+            plan: false,
+            todos: Vec::new(),
             messages: vec![
                 message("user", "你好", false),
                 {
@@ -1130,6 +1396,11 @@ mode: crate::config::MODE_FULL.to_string(),
                     tool
                 },
                 answer,
+                {
+                    let mut thinking = message("thinking", "再想一想", false);
+                    thinking.round = 2;
+                    thinking
+                },
                 message("note", "出错了", true),
             ],
         };
@@ -1143,10 +1414,28 @@ mode: crate::config::MODE_FULL.to_string(),
         assert_eq!(restored.title, "统计文件");
         assert_eq!(restored.dir, "chat-3");
         assert_eq!(restored.category, "c1");
-        assert_eq!(restored.messages.len(), 4);
+        assert_eq!(restored.messages.len(), 5);
+        // A thinking row keeps its round and its words, so the transcript can put
+        // it back where it happened.
+        assert_eq!(restored.messages[3].role, "thinking");
+        assert_eq!(restored.messages[3].round, 2);
+        assert_eq!(restored.messages[3].text, "再想一想");
         // The model that wrote an answer is worth keeping with it.
         assert_eq!(restored.messages[2].model, "deepseek-chat");
         assert_eq!(restored.messages[2].elapsed_ms, 2400);
+        // The engine's timing split survives a restart too, so a past request
+        // can still say where its time went.
+        assert_eq!(restored.messages[2].model_ms, 1700);
+        assert_eq!(restored.messages[2].tool_ms, 450);
+        // The compaction the answer followed is data now, not a note to parse.
+        assert_eq!(restored.messages[2].compaction_layer, "summary");
+        assert_eq!(restored.messages[2].compaction_saved, 900);
+        // The thinking text survives a restart, so the transcript block still
+        // opens to the same words.
+        assert_eq!(restored.messages[2].reasoning, "先想一想");
+        // Thinking tokens ride with their rounds, so a reopened answer still
+        // shows the reasoning category it was billed for.
+        assert_eq!(restored.messages[2].round_reasoning, vec![120, 0, 40]);
         assert_eq!(restored.messages[2].tokens, 1840);
         // The request size travels with it, so the header's gauge survives a
         // restart instead of reading "上下文 —".
@@ -1191,6 +1480,9 @@ mode: crate::config::MODE_FULL.to_string(),
         assert!(!restored.auto_actions);
         assert_eq!(restored.max_rounds, 12);
         assert_eq!(restored.max_calls, 40);
+        // A conversation keeps searching off (or on) whatever the connection
+        // itself says; `None` would mean it follows the connection.
+        assert_eq!(restored.web_search, Some(false));
         assert!(restored.messages[0].model.is_empty());
         assert_eq!(restored.messages[0].role, "user");
         assert_eq!(restored.messages[1].text, "read · a.txt — 已读取 2 行");
@@ -1204,7 +1496,7 @@ mode: crate::config::MODE_FULL.to_string(),
         assert!(restored.messages[1].existed);
         assert!(restored.messages[1].undoable);
         assert_eq!(restored.messages[2].text, "## 标题\n正文");
-        assert!(restored.messages[3].failed);
+        assert!(restored.messages[4].failed);
     }
 
     #[test]
@@ -1294,9 +1586,13 @@ mode: crate::config::MODE_FULL.to_string(),
             read_only: false,
             full_access: true,
             auto_actions: false,
+            auto_review: false,
             max_rounds: crate::config::MAX_ROUNDS_CHOICE,
             max_calls: crate::config::MAX_CALLS_CHOICE,
-mode: crate::config::MODE_FULL.to_string(),
+            mode: crate::config::MODE_FULL.to_string(),
+            web_search: None,
+        plan: false,
+        todos: Vec::new(),
         };
         save_to(&file, std::slice::from_ref(&chat)).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
@@ -1450,5 +1746,33 @@ mode: crate::config::MODE_FULL.to_string(),
         let _ = std::fs::remove_dir_all(&dir);
         assert!(good_known, "a readable transcript counts as known");
         assert!(!broken_known, "a broken one must not be treated as an orphan");
+    }
+
+    #[test]
+    fn plan_and_todos_survive_a_round_trip() {
+        use super::{StoredTodo, load_from, save_to};
+
+        let dir = temp_dir("plan");
+        let file = dir.join("chats.json");
+        let mut chat = named("chat-1", "计划");
+        chat.plan = true;
+        chat.todos = vec![
+            StoredTodo {
+                text: "读代码".to_string(),
+                status: "completed".to_string(),
+            },
+            StoredTodo {
+                text: "改实现".to_string(),
+                status: "in_progress".to_string(),
+            },
+        ];
+        save_to(&file, &[chat]).unwrap();
+        let loaded = load_from(&file);
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].plan, "plan mode survives the file");
+        assert_eq!(loaded[0].todos.len(), 2);
+        assert_eq!(loaded[0].todos[1].text, "改实现");
+        assert_eq!(loaded[0].todos[1].status, "in_progress");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

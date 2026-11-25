@@ -64,6 +64,9 @@ impl Render for SettingsWindow {
         }
         self.app.update(cx, |app, cx| {
             let palette = app.palette();
+            // The page is drawn from this window, so its text system is the one
+            // the instruction editor folds against.
+            app.window_text = Some(window.text_system().clone());
             div()
                 .id("settings-window")
                 .flex()

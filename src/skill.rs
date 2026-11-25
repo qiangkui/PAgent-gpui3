@@ -213,46 +213,49 @@ pub fn delete_skill_in(dir: &Path, id: &str) -> Result<(), String> {
         .map_err(|error| format!("无法删除 {}：{error}", folder.display()))
 }
 
-/// Write the example skill unless that folder already exists.
+/// Copy a skill folder in from anywhere on disk, then return its id.
 ///
-/// @returns the folder and whether it was created.
-pub fn create_example() -> Result<(PathBuf, bool), String> {
+/// The folder name is the id, and the id is what `config.json` keeps, so the
+/// import checks it the way the scanner does: an unusable name, a manifest the
+/// page would report as broken, and an id that is already installed are all
+/// refused before anything is copied.
+pub fn import_skill(source: &Path) -> Result<String, String> {
     let Some(dir) = skill_dir() else {
         return Err("找不到技能目录".to_string());
     };
-    create_example_in(&dir)
+    import_skill_into(source, &dir)
 }
 
-/// The same example against an arbitrary folder (the tests use this one).
-pub fn create_example_in(dir: &Path) -> Result<(PathBuf, bool), String> {
-    let folder = dir.join(EXAMPLE_SKILL_ID);
-    if folder.exists() {
-        return Ok((folder, false));
+/// The same import against an arbitrary folder (the tests use this one).
+pub fn import_skill_into(source: &Path, dir: &Path) -> Result<String, String> {
+    if !source.is_dir() {
+        return Err("请选择一个技能文件夹（里面放 skill.json）。".to_string());
     }
-    std::fs::create_dir_all(&folder)
-        .and_then(|()| std::fs::write(folder.join("skill.json"), EXAMPLE_SKILL_MANIFEST))
-        .and_then(|()| std::fs::write(folder.join("SKILL.md"), EXAMPLE_SKILL_TEXT))
-        .map_err(|error| format!("无法写入 {}：{error}", folder.display()))?;
-    Ok((folder, true))
+    let Some(id) = source
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+    else {
+        return Err(format!("读不出 {} 的文件夹名", source.display()));
+    };
+    if !is_plugin_id(&id) {
+        return Err(format!(
+            "文件夹名「{id}」不能当技能 id：只能用字母、数字、-、_、.，且不能以 . 开头或结尾"
+        ));
+    }
+    let skill = read_skill(&id, source);
+    if !skill.problem.is_empty() {
+        return Err(format!("这个文件夹不是可用的技能：{}", skill.problem));
+    }
+    if scanned_skills(dir).len() >= MAX_SKILLS {
+        return Err(format!("技能已经有 {MAX_SKILLS} 个，先删掉一个再添加"));
+    }
+    let target = dir.join(&id);
+    if target.exists() {
+        return Err(format!("技能「{id}」已经存在，先删除它再添加"));
+    }
+    crate::folder::copy_dir(source, &target)?;
+    Ok(id)
 }
-
-/// Folder name of the generated example.
-pub const EXAMPLE_SKILL_ID: &str = "example-skill";
-
-const EXAMPLE_SKILL_MANIFEST: &str = r#"{
-  "name": "示例技能",
-  "description": "回答代码问题时先给结论，再给一个最小可运行示例。"
-}
-"#;
-
-const EXAMPLE_SKILL_TEXT: &str = r#"# 示例技能
-
-回答代码问题时：
-
-1. 先用一句话给出结论。
-2. 再给一个最小、可直接运行的示例。
-3. 不要重复用户已经说过的内容。
-"#;
 
 #[cfg(test)]
 mod tests {
@@ -338,19 +341,65 @@ mod tests {
     }
 
     #[test]
-    fn writes_the_example_once_and_keeps_its_instructions() {
-        let dir = temp_dir("example");
-        let (folder, created) = create_example_in(&dir).unwrap();
-        assert!(created);
-        assert!(folder.join("skill.json").exists());
-        assert!(folder.join("SKILL.md").exists());
-        let found = scanned_skills(&dir);
+    fn imports_a_valid_skill_folder() {
+        let dir = temp_dir("import");
+        let source = dir.join("source").join("polish");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("skill.json"),
+            r#"{"name":"润色","description":"改文案"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("SKILL.md"), "先通读，再改。").unwrap();
+        let target = dir.join("skills");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let id = import_skill_into(&source, &target).unwrap();
+        assert_eq!(id, "polish");
+        assert_eq!(
+            std::fs::read_to_string(target.join("polish").join("SKILL.md")).unwrap(),
+            "先通读，再改。"
+        );
+        let found = scanned_skills(&target);
         assert_eq!(found.len(), 1);
-        assert_eq!(found[0].id, EXAMPLE_SKILL_ID);
         assert!(found[0].problem.is_empty());
-        assert!(found[0].instructions.contains("结论"));
-        let (_, created_again) = create_example_in(&dir).unwrap();
-        assert!(!created_again);
+        // The original is left alone, and the same id cannot land twice.
+        assert!(source.join("SKILL.md").is_file());
+        assert!(import_skill_into(&source, &target).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_a_folder_that_is_not_a_skill() {
+        let dir = temp_dir("import-broken");
+        let target = dir.join("skills");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let missing = dir.join("missing");
+        std::fs::create_dir_all(&missing).unwrap();
+        assert!(
+            import_skill_into(&missing, &target)
+                .unwrap_err()
+                .contains("skill.json")
+        );
+
+        let spaced = dir.join("有 空格");
+        std::fs::create_dir_all(&spaced).unwrap();
+        std::fs::write(spaced.join("skill.json"), r#"{"instructions":"x"}"#).unwrap();
+        assert!(
+            import_skill_into(&spaced, &target)
+                .unwrap_err()
+                .contains("技能 id")
+        );
+
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::write(empty.join("skill.json"), r#"{"name":"空"}"#).unwrap();
+        assert!(
+            import_skill_into(&empty, &target)
+                .unwrap_err()
+                .contains("instructions")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

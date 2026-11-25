@@ -555,18 +555,24 @@ test('runs a command in the background, reads it, and ends it', async () => {
   assert.equal(started.ok, true, started.text)
   assert.match(started.text, /已在后台启动 task-1（ticker）/)
   try {
-    // The log is written by the task itself, so give it a moment to land.
-    await new Promise((resolve) => setTimeout(resolve, 600))
+    // The log is written by the task itself. Poll for the first tick instead of
+    // sleeping a fixed time: under a loaded test run, starting `node` and its
+    // timer can take longer than any single guess, which used to fail here.
+    let output = { ok: false, text: '' }
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline && !/tick\d/.test(output.text)) {
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      output = await runTool(root, {
+        id: '3',
+        name: 'task',
+        args: { action: 'output', id: 'task-1', lines: 5 }
+      })
+    }
+    assert.equal(output.ok, true, output.text)
+    assert.match(output.text, /tick\d/)
     const listed = await runTool(root, { id: '2', name: 'task', args: { action: 'list' } })
     assert.equal(listed.ok, true, listed.text)
     assert.match(listed.text, /task-1 \[running\]/)
-    const output = await runTool(root, {
-      id: '3',
-      name: 'task',
-      args: { action: 'output', id: 'task-1', lines: 5 }
-    })
-    assert.equal(output.ok, true, output.text)
-    assert.match(output.text, /tick\d/)
   } finally {
     const stopped = await runTool(root, {
       id: '4',
@@ -754,6 +760,32 @@ test('decodes GBK output from a Windows command', async () => {
   assert.doesNotMatch(result.text, /\uFFFD/)
   assert.match(chunks.join(''), /中文/, 'live output falls back to GB18030')
   assert.doesNotMatch(chunks.join(''), /\uFFFD/)
+})
+
+test('a GBK pair split by a live flush is not broken', async () => {
+  const root = await workspace()
+  const chunks: string[] = []
+  // The GBK bytes arrive after the live-flush interval has elapsed, so this
+  // chunk goes through the preview decoder without the final flush: that path
+  // used to hold back the last byte as a UTF-8 lead and paint a replacement
+  // character where the second half of the character should be.
+  const result = await runToolScoped(
+    root,
+    root,
+    {
+      id: '1',
+      name: 'shell',
+      args: {
+        command: `node -e "process.stdout.write('name: '); setTimeout(() => process.stdout.write(Buffer.from([0xD6,0xD0,0xCE,0xC4])), 260)"`
+      }
+    },
+    [],
+    (text) => chunks.push(text)
+  )
+  assert.equal(result.ok, true, result.text)
+  assert.match(result.text, /name: 中文/)
+  assert.match(chunks.join(''), /中文/, `live output was ${JSON.stringify(chunks.join(''))}`)
+  assert.doesNotMatch(chunks.join(''), /\uFFFD/, 'no replacement characters in the preview')
 })
 
 test('reads a GBK file as text instead of mojibake', async () => {

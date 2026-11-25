@@ -9,7 +9,7 @@ impl DshFlowApp {
     /// looks up which control area is under the cursor and stops at the first
     /// match, so nesting the buttons inside the drag area would turn every click
     /// into "start dragging the window".
-    pub(crate) fn render_titlebar(&self, palette: Palette) -> Div {
+    pub(crate) fn render_titlebar(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .flex_row()
@@ -49,9 +49,54 @@ impl DshFlowApp {
                     .items_center()
                     .h_full()
                     .flex_shrink_0()
-                    .child(window_button(WindowControlArea::Min, "−", palette))
-                    .child(window_button(WindowControlArea::Max, "□", palette))
-                    .child(window_button(WindowControlArea::Close, "×", palette)),
+                    // The help sheet lives beside the window buttons: the three
+                    // to its right are the platform's control areas, this one is
+                    // the app's own, so it must not claim one of them.
+                    .child(
+                        div()
+                            .id("title-help")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .flex_shrink_0()
+                            .w(px(34.))
+                            .h_full()
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.shortcuts_open = !view.shortcuts_open;
+                                cx.notify();
+                            }))
+                            .child(
+                                svg()
+                                    .path("icons/help.svg")
+                                    .w(px(15.))
+                                    .h(px(15.))
+                                    .text_color(rgb(if self.shortcuts_open {
+                                        palette.accent
+                                    } else {
+                                        palette.muted
+                                    })),
+                            ),
+                    )
+                    .child(window_button(
+                        WindowControlArea::Min,
+                        "−",
+                        palette,
+                        self.title_hover == Some(WindowControlArea::Min),
+                    ))
+                    .child(window_button(
+                        WindowControlArea::Max,
+                        "□",
+                        palette,
+                        self.title_hover == Some(WindowControlArea::Max),
+                    ))
+                    .child(window_button(
+                        WindowControlArea::Close,
+                        "×",
+                        palette,
+                        self.title_hover == Some(WindowControlArea::Close),
+                    )),
             )
     }
 
@@ -535,7 +580,7 @@ impl DshFlowApp {
                             }))
                             .child(
                                 svg()
-                                    .path("icons/plus.svg")
+                                    .path("icons/new-chat.svg")
                                     .w(px(18.))
                                     .h(px(18.))
                                     .text_color(rgb(palette.muted)),
@@ -561,17 +606,6 @@ impl DshFlowApp {
                             // Plugins come and go outside the window, so the
                             // list is read again each time the page is opened.
                             view.refresh_plugins(cx);
-                        },
-                    ))
-                    .child(nav_row(
-                        "stats",
-                        "icons/stats.svg",
-                        "统计",
-                        self.view == View::Stats,
-                        palette,
-                        cx,
-                        |view, _| {
-                            view.view = View::Stats;
                         },
                     ))
                     .child(nav_row(
@@ -602,8 +636,8 @@ impl DshFlowApp {
                             view.refresh_skills(cx);
                         },
                     ))
-                    // 设置 opens its own window, so its row is never selected and
-                    // it closes the page links (after Skill, as asked).
+                    // 设置 opens its own window, so its row is never selected; the
+                    // 统计 page link follows it, and that closes the list (as asked).
                     .child(nav_row(
                         "settings",
                         "icons/settings.svg",
@@ -612,6 +646,17 @@ impl DshFlowApp {
                         palette,
                         cx,
                         |view, cx| view.open_settings(cx),
+                    ))
+                    .child(nav_row(
+                        "stats",
+                        "icons/stats.svg",
+                        "统计",
+                        self.view == View::Stats,
+                        palette,
+                        cx,
+                        |view, _| {
+                            view.view = View::Stats;
+                        },
                     )),
             )
             .child(
@@ -855,8 +900,8 @@ impl DshFlowApp {
                     } else {
                         "icons/folder.svg"
                     })
-                    .w(px(14.))
-                    .h(px(14.))
+                    .w(px(16.))
+                    .h(px(16.))
                     .flex_shrink_0()
                     .text_color(rgb(if open { palette.accent } else { palette.muted })),
             )
@@ -1413,7 +1458,7 @@ impl RunBadge {
 
 /// One sidebar navigation row: icon then label.
 ///
-/// 新建对话 and the 插件 / 统计 / MCP / Skill / 设置 links share this shape, so
+/// 新建对话 and the 插件 / MCP / Skill / 设置 / 统计 links share this shape, so
 /// the block above 工作区 reads as one list: 34px rows, 18px icon, flat until
 /// hovered. The conversation search lives under the 工作区 title instead.
 fn nav_row(

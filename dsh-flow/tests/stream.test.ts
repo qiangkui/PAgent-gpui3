@@ -73,6 +73,49 @@ test('reports text fragments as they arrive', async () => {
   assert.equal(body.stream, true)
 })
 
+test('keeps a reasoner thinking apart from its answer', async () => {
+  const stub = stubFetch(
+    sse([
+      'data: {"choices":[{"delta":{"reasoning_content":"先想"}}]}\n\n',
+      'data: {"choices":[{"delta":{"reasoning_content":"一下"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"答案"}}]}\n\n',
+      'data: [DONE]\n\n'
+    ])
+  )
+  const seen: string[] = []
+  const live: string[] = []
+  const result = await streamCompletion({
+    url: 'https://example.test/chat/completions',
+    apiKey: 'sk-test',
+    label: 'deepseek-reasoner',
+    body: { model: 'deepseek-reasoner', stream: true },
+    fetchImpl: stub.fetchImpl,
+    onDelta: (text) => seen.push(text),
+    onReasoning: (text) => live.push(text)
+  })
+  // Thinking is not the answer: the transcript shows only what the model said,
+  // while the panel counts what the thinking cost.
+  assert.equal(result.content, '答案')
+  assert.equal(result.reasoning, '先想一下')
+  assert.deepEqual(seen, ['答案'])
+  // The same fragments reach the live callback, so a window can show them as
+  // they arrive instead of waiting for the whole round.
+  assert.deepEqual(live, ['先想', '一下'])
+
+  // Some gateways spell the field `reasoning` instead.
+  const alt = stubFetch(
+    sse(['data: {"choices":[{"delta":{"reasoning":"想想"}}]}\n\n', 'data: [DONE]\n\n'])
+  )
+  const spelled = await streamCompletion({
+    url: 'https://example.test/chat/completions',
+    apiKey: 'sk-test',
+    label: 'gateway',
+    body: { model: 'gateway', stream: true },
+    fetchImpl: alt.fetchImpl
+  })
+  assert.equal(spelled.reasoning, '想想')
+})
+
 test('puts a tool call back together from its pieces', async () => {
   const stub = stubFetch(
     sse([

@@ -32,6 +32,10 @@ impl Render for DshFlowApp {
         }
 
         let palette = self.palette();
+        // The composer's wrapped height is needed before it is drawn (the
+        // transcript leaves room for it), so the frame's text system is kept and
+        // the rows are measured on demand.
+        self.window_text = Some(window.text_system().clone());
         // The OS title (taskbar, Alt+Tab) follows the conversation; the drawn title
         // bar stays the brand. Only set it when it changes.
         let want_title = {
@@ -60,6 +64,28 @@ impl Render for DshFlowApp {
             // main panel lets it show, and it matches the chrome.
             .bg(rgb(palette.chrome))
             .text_color(rgb(palette.text))
+            // Caption buttons are non-client cells: the pointer over them sends
+            // `WM_NCMOUSEMOVE`, and gpui's hover hit-test does not follow every
+            // such move, so the same button lit up only sometimes. Reading the
+            // pointer here keeps the highlight steady, and the title bar paints
+            // it from this one piece of state.
+            .on_mouse_move(cx.listener(|view, event: &MouseMoveEvent, window, cx| {
+                let next = window_button_at(
+                    f32::from(event.position.x),
+                    f32::from(event.position.y),
+                    f32::from(window.viewport_size().width),
+                    TITLEBAR_HEIGHT,
+                );
+                if next != view.title_hover {
+                    view.title_hover = next;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_exit(cx.listener(|view, _, _, cx| {
+                if view.title_hover.take().is_some() {
+                    cx.notify();
+                }
+            }))
             .on_key_down(cx.listener(|view, event, window, cx| {
                 view.handle_shortcut(event, window, cx);
             }))
@@ -105,13 +131,9 @@ impl Render for DshFlowApp {
                         view.skill_delete_confirm = None;
                         changed = true;
                     }
-                    // The round picker in the 上下文 tab is a dropdown too.
-                    if view.context_round_menu.take().is_some() {
-                        changed = true;
-                    }
                     // The composer's pickers close on a press outside them; the
                     // chips stop propagation, so this never toggles one twice.
-                    if view.model_menu || view.tools_menu || view.budget_menu || view.mode_menu || view.attach_menu {
+                    if view.model_menu || view.tools_menu || view.mode_menu || view.attach_menu {
                         view.close_composer_menus();
                         changed = true;
                     }
@@ -124,7 +146,7 @@ impl Render for DshFlowApp {
                     }
                 }),
             )
-            .child(self.render_titlebar(palette))
+            .child(self.render_titlebar(palette, cx))
             .child(
                 div()
                     .flex()
@@ -194,6 +216,7 @@ impl Render for DshFlowApp {
             || self.tool_drag.is_some()
             || self.mcp_skills_drag.is_some()
             || self.totals_drag.is_some()
+            || self.context_item_drag.is_some()
             || self.table_drag.is_some()
         {
             root = root.child(
@@ -211,6 +234,8 @@ impl Render for DshFlowApp {
                             view.drag_mcp_skills_bar(event.position.y, cx);
                         } else if view.totals_drag.is_some() {
                             view.drag_totals_bar(event.position.y, cx);
+                        } else if view.context_item_drag.is_some() {
+                            view.drag_item_bar(event.position.y, cx);
                         } else if view.table_drag.is_some() {
                             view.drag_table_bar(event.position.y, cx);
                         } else {
@@ -224,6 +249,7 @@ impl Render for DshFlowApp {
                             view.tool_drag = None;
                             view.mcp_skills_drag = None;
                             view.totals_drag = None;
+                            view.context_item_drag = None;
                             view.table_drag = None;
                             cx.notify();
                         }),
@@ -235,6 +261,7 @@ impl Render for DshFlowApp {
                             view.tool_drag = None;
                             view.mcp_skills_drag = None;
                             view.totals_drag = None;
+                            view.context_item_drag = None;
                             view.table_drag = None;
                             cx.notify();
                         }),
@@ -311,17 +338,6 @@ impl Render for DshFlowApp {
             root = root.child(self.render_skill_menu(&id, at, palette, cx));
         }
 
-        if let Some(position) = self.context_round_menu {
-            let at = point(
-                position.x.min(viewport.width - px(316.)).max(px(0.)),
-                position
-                    .y
-                    .min(viewport.height - px(376.))
-                    .max(px(TITLEBAR_HEIGHT)),
-            );
-            root = root.child(self.render_context_round_menu(at, palette, cx));
-        }
-
         if let Some((slot, position)) = self.field_menu {
             let at = point(
                 position.x.min(viewport.width - px(130.)).max(px(0.)),
@@ -365,6 +381,32 @@ impl Render for DshFlowApp {
 
         if self.renaming.is_some() {
             root = root.child(self.render_rename_dialog(viewport.height, palette, cx));
+        }
+
+        if self.shortcuts_open {
+            // The sheet is the dismiss layer: a click on the dim area closes it,
+            // the card stops its own clicks.
+            root = root.child(
+                div()
+                    .id("shortcuts-sheet")
+                    .absolute()
+                    .top(px(TITLEBAR_HEIGHT))
+                    .left(px(0.))
+                    .w(viewport.width)
+                    .h(viewport.height - px(TITLEBAR_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(gpui::hsla(0., 0., 0., 0.35))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.shortcuts_open = false;
+                            cx.notify();
+                        }),
+                    )
+                    .child(self.render_shortcuts(palette, cx)),
+            );
         }
 
         root

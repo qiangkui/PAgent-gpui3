@@ -4,37 +4,44 @@
 //! so they keep a consistent shape instead of depending on which glyph the system
 //! font happens to have. The files live in `assets/icons` and are compiled in, so
 //! the binary has no runtime asset folder.
+//!
+//! The interface glyphs are the dsh product icon set: one 16-unit grid, a 1px
+//! stroke, and the same geometry the reference app draws, so a button looks the
+//! same here as it does there. The few glyphs the set does not carry (the
+//! picture, the bare question mark) are drawn on that same grid.
 
 use std::borrow::Cow;
 
 use gpui::{AssetSource, Result, SharedString};
 
-/// Settings: two sliders.
+/// Settings: a gear.
 const SETTINGS: &[u8] = include_bytes!("../assets/icons/settings.svg");
-/// Plugins: a puzzle piece.
+/// Plugins: a plug with sparks.
 const PLUGINS: &[u8] = include_bytes!("../assets/icons/plugins.svg");
-/// Theme: clothing, the "change the outfit" metaphor.
+/// Theme: a sun, for light and dark.
 const THEME: &[u8] = include_bytes!("../assets/icons/theme.svg");
 /// The product mark: a robot head, drawn at the left of the title bar.
 const APP: &[u8] = include_bytes!("../assets/icons/app.svg");
-/// Stats: three bars.
+/// Stats: a list with a pen, the ledger the page reads.
 const STATS: &[u8] = include_bytes!("../assets/icons/stats.svg");
-/// MCP: two linked nodes.
+/// MCP: a chain link, one half of a connection.
 const MCP: &[u8] = include_bytes!("../assets/icons/mcp.svg");
-/// Skill: a lightbulb.
+/// Skill: a page with a spark.
 const SKILL: &[u8] = include_bytes!("../assets/icons/skill.svg");
 /// Copy: two sheets, beside a message.
 const COPY: &[u8] = include_bytes!("../assets/icons/copy.svg");
-/// Save: an arrow into a tray, beside the copy button.
+/// Save: a disk, beside the copy button.
 const SAVE: &[u8] = include_bytes!("../assets/icons/save.svg");
 /// Regenerate: a circular arrow, under an answer.
 const REGENERATE: &[u8] = include_bytes!("../assets/icons/regenerate2.svg");
 /// Submit: the arrow in the round send button at the composer's end.
 const SUBMIT: &[u8] = include_bytes!("../assets/icons/submit.svg");
-/// Rename: a pencil, beside a conversation title.
+/// Rename: a pencil in a frame, beside a conversation title.
 const RENAME: &[u8] = include_bytes!("../assets/icons/rename.svg");
-/// Plus: starts a new conversation, in the sidebar's list.
+/// Plus: starts a category, in the sidebar's lists.
 const PLUS: &[u8] = include_bytes!("../assets/icons/plus.svg");
+/// New chat: a plus inside a ring, at the top of the conversation list.
+const NEW_CHAT: &[u8] = include_bytes!("../assets/icons/new-chat.svg");
 /// Search: the magnifier beside the conversation filter.
 const SEARCH: &[u8] = include_bytes!("../assets/icons/search.svg");
 /// Folder: a folded category in the 工作区 tree.
@@ -43,26 +50,26 @@ const FOLDER: &[u8] = include_bytes!("../assets/icons/folder.svg");
 const FOLDER_OPEN: &[u8] = include_bytes!("../assets/icons/folder-open.svg");
 /// Ellipsis: the menu button at the end of a folder row.
 const ELLIPSIS: &[u8] = include_bytes!("../assets/icons/ellipsis.svg");
-/// Tasks: a terminal window, beside the conversation header's find button.
+/// Tasks: a checklist, for the work a run left behind.
 const TASKS: &[u8] = include_bytes!("../assets/icons/tasks.svg");
-/// Layers: three stacked sheets, beside the composer capsule's context figure.
+/// Layers: stacked sheets, beside the composer capsule's context figure.
 const LAYERS: &[u8] = include_bytes!("../assets/icons/layers.svg");
-/// Text file: the 文本 option in the composer's attach menu.
+/// Text file: wrapped lines, the 文本 option in the composer's attach menu.
 const FILE_TEXT: &[u8] = include_bytes!("../assets/icons/file-text.svg");
-/// Image file: the 图片 option in the composer's attach menu.
+/// Image file: a framed landscape, the 图片 option in the composer's attach menu.
 const IMAGE: &[u8] = include_bytes!("../assets/icons/image.svg");
-/// PDF file: the PDF option in the composer's attach menu.
+/// PDF file: a page, the PDF option in the composer's attach menu.
 const PDF: &[u8] = include_bytes!("../assets/icons/pdf.svg");
 /// Compress: the active-compaction command in the composer's attach menu.
 const COMPRESS: &[u8] = include_bytes!("../assets/icons/compress.svg");
-/// Plus (thin): the round add button beside the composer's model chip.
-const PLUS_THIN: &[u8] = include_bytes!("../assets/icons/plus-thin.svg");
 /// Permission 仅可查看: the shield-with-check glyph dsh uses for `read-only`.
 const PERMISSION_READ_ONLY: &[u8] = include_bytes!("../assets/icons/permission-read-only.svg");
 /// Permission 工作区内修改: dsh's shield-with-pencil glyph.
 const PERMISSION_WORKSPACE: &[u8] = include_bytes!("../assets/icons/permission-workspace.svg");
 /// Permission 完全权限: dsh's shield-with-bar glyph.
 const PERMISSION_FULL: &[u8] = include_bytes!("../assets/icons/permission-full.svg");
+/// Help: the info ring a settings row shows; the chip itself draws no ring.
+const HELP: &[u8] = include_bytes!("../assets/icons/help.svg");
 
 /// The icons the window can draw.
 pub struct Assets;
@@ -83,6 +90,7 @@ impl AssetSource for Assets {
             "icons/submit.svg" => Some(Cow::Borrowed(SUBMIT)),
             "icons/rename.svg" => Some(Cow::Borrowed(RENAME)),
             "icons/plus.svg" => Some(Cow::Borrowed(PLUS)),
+            "icons/new-chat.svg" => Some(Cow::Borrowed(NEW_CHAT)),
             "icons/search.svg" => Some(Cow::Borrowed(SEARCH)),
             "icons/folder.svg" => Some(Cow::Borrowed(FOLDER)),
             "icons/folder-open.svg" => Some(Cow::Borrowed(FOLDER_OPEN)),
@@ -93,10 +101,10 @@ impl AssetSource for Assets {
             "icons/image.svg" => Some(Cow::Borrowed(IMAGE)),
             "icons/pdf.svg" => Some(Cow::Borrowed(PDF)),
             "icons/compress.svg" => Some(Cow::Borrowed(COMPRESS)),
-            "icons/plus-thin.svg" => Some(Cow::Borrowed(PLUS_THIN)),
             "icons/permission-read-only.svg" => Some(Cow::Borrowed(PERMISSION_READ_ONLY)),
             "icons/permission-workspace.svg" => Some(Cow::Borrowed(PERMISSION_WORKSPACE)),
             "icons/permission-full.svg" => Some(Cow::Borrowed(PERMISSION_FULL)),
+            "icons/help.svg" => Some(Cow::Borrowed(HELP)),
             _ => None,
         })
     }
@@ -127,6 +135,7 @@ mod tests {
             "icons/submit.svg",
             "icons/rename.svg",
             "icons/plus.svg",
+            "icons/new-chat.svg",
             "icons/search.svg",
             "icons/folder.svg",
             "icons/folder-open.svg",
@@ -137,10 +146,10 @@ mod tests {
             "icons/image.svg",
             "icons/pdf.svg",
             "icons/compress.svg",
-            "icons/plus-thin.svg",
             "icons/permission-read-only.svg",
             "icons/permission-workspace.svg",
             "icons/permission-full.svg",
+            "icons/help.svg",
         ] {
             let bytes = assets.load(path).expect("load").expect("icon present");
             // Icons drawn by hand start with `<svg`; the ones taken from an icon

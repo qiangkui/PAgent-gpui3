@@ -24,10 +24,29 @@ export interface WireToolCall {
 export interface StreamResult {
   /** Assistant text of this round, already concatenated. */
   content: string
+  /**
+   * Thinking text the provider streamed before the answer, when it has one.
+   *
+   * DeepSeek's reasoner sends it as `reasoning_content`, some gateways as
+   * `reasoning`. It is output the bill includes but never a prompt, which is
+   * why it is measured and kept apart from {@link content}.
+   */
+  reasoning: string
   /** Tool calls the model asked for; empty when it answered in prose. */
   toolCalls: WireToolCall[]
   /** Token accounting, when the provider reports it. */
   usage?: unknown
+  /**
+   * Server tools the provider ran on its own side this round (web search, page
+   * reads), raw as they came. Nothing in this client executes them; they are
+   * kept so the transcript can show what was searched and so a caller can list
+   * the sources.
+   */
+  serverCalls: unknown[]
+  /** Citation entries (`url_citation`) of the answer, raw as they came. */
+  annotations: unknown[]
+  /** Why the round ended: `stop`, `length`, `content_filter`, or `''`. */
+  finishReason: string
 }
 
 /**
@@ -101,6 +120,14 @@ export interface StreamRequest {
   timeoutMs?: number
   /** Called for every text fragment, as it arrives. */
   onDelta?: (text: string) => void
+  /** Called for every fragment of the model's thinking, when it streams one. */
+  onReasoning?: (text: string) => void
+  /**
+   * Called with each `server_tool_event` the provider sends (`call_started`,
+   * `call_completed`, `step_reasoning_done`): the search or page read is running
+   * on its side, so this is the only progress there is.
+   */
+  onServerEvent?: (event: unknown) => void
 }
 
 /** Shape of a streaming chunk this module reads. */
@@ -108,8 +135,24 @@ interface Chunk {
   choices?: Array<{
     delta?: {
       content?: string | null
+      /** DeepSeek's spelling of the thinking stream. */
+      reasoning_content?: string | null
+      /** The spelling other gateways use. */
+      reasoning?: string | null
       tool_calls?: unknown
+      /** Server tools the provider ran (web search, page reads). */
+      server_tool_calls?: unknown
+      /** Citations of the answer, once per search. */
+      annotations?: unknown
     }
+    /** `stop`, `length` or `content_filter`; absent while streaming. */
+    finish_reason?: string | null
+    /** Progress of a server tool, next to `delta` rather than inside it. */
+    server_tool_event?: unknown
+    /** Server tools the provider ran, when a gateway puts them here. */
+    server_tool_calls?: unknown
+    /** Citations of the answer, when a gateway puts them here. */
+    annotations?: unknown
   }>
   usage?: unknown
   error?: { message?: string }
@@ -119,7 +162,17 @@ interface Chunk {
 /** Shape of a whole JSON answer, when the provider does not stream. */
 interface CompletionBody {
   choices?: Array<{
-    message?: { content?: string | null; tool_calls?: unknown }
+    message?: {
+      content?: string | null
+      reasoning_content?: string | null
+      reasoning?: string | null
+      tool_calls?: unknown
+      /** Server tools the provider ran (web search, page reads). */
+      server_tool_calls?: unknown
+      /** Citations of the answer, once per search. */
+      annotations?: unknown
+    }
+    finish_reason?: string | null
   }>
   usage?: unknown
   error?: { message?: string }
@@ -131,6 +184,16 @@ interface PartialCall {
   id: string
   name: string
   arguments: string
+}
+
+/** Read one value as a list; empty when it is not an array. */
+function listOf(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+/** Read one value as a non-empty string, or `''`. */
+function finishOf(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 /**
@@ -156,8 +219,10 @@ export async function streamCompletion(request: StreamRequest): Promise<StreamRe
   if (!response.ok) {
     let detail = await failureDetail(response)
     // An endpoint that refuses the token-accounting field still has an answer
-    // worth showing; ask again without it instead of failing the question.
-    const retry = withoutUsageRequest(request.body, detail)
+    // worth showing; ask again without it instead of failing the question. The
+    // same goes for the server tools: a gateway that does not know them still
+    // answers, just without search.
+    const retry = withoutUsageRequest(request.body, detail) ?? withoutServerTools(request.body, detail)
     if (retry) {
       response = await send(retry)
       if (!response.ok) detail = await failureDetail(response)
@@ -176,11 +241,16 @@ export async function streamCompletion(request: StreamRequest): Promise<StreamRe
       if (replay.body) return await readStream(replay.body, request)
     }
     const payload = parse<CompletionBody>(raw)
-    const message = payload?.choices?.[0]?.message ?? {}
+    const choice = payload?.choices?.[0]
+    const message = choice?.message ?? {}
     return {
       content: typeof message.content === 'string' ? message.content : '',
+      reasoning: thinkingOf(message),
       toolCalls: readToolCalls(message.tool_calls),
-      usage: payload?.usage
+      usage: payload?.usage,
+      serverCalls: listOf(message.server_tool_calls),
+      annotations: listOf(message.annotations),
+      finishReason: finishOf(choice?.finish_reason)
     }
   }
 
@@ -193,8 +263,22 @@ const RETRY_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504])
 /** How many times one round may be sent. */
 const RETRY_ATTEMPTS = 3
 
-/** First backoff, in milliseconds; each later attempt waits once more. */
+/** The first backoff, in milliseconds; each later attempt waits once more. */
 const RETRY_BASE_MS = 400
+
+/**
+ * The thinking text a message carries, in whichever spelling the provider used.
+ * @param message - a whole message or one stream delta.
+ * @returns the thinking text, or an empty string when there is none.
+ */
+function thinkingOf(message: {
+  reasoning_content?: string | null
+  reasoning?: string | null
+}): string {
+  if (typeof message.reasoning_content === 'string') return message.reasoning_content
+  if (typeof message.reasoning === 'string') return message.reasoning
+  return ''
+}
 
 /**
  * Send one round, retrying transient rejections.
@@ -264,6 +348,36 @@ function withoutUsageRequest(body: unknown, detail: string): unknown {
 }
 
 /**
+ * The same body without the server tools, for an endpoint that refuses them.
+ *
+ * Some gateways reject a `tools` entry whose `type` they do not know, and the
+ * question is still answerable without search. The round is sent once more
+ * without those entries instead of failing; no search row appears, which is the
+ * truth of what happened.
+ * @param body - the body that was refused.
+ * @param detail - what the endpoint said about it.
+ * @returns a body to send again, or `undefined`.
+ */
+function withoutServerTools(body: unknown, detail: string): unknown {
+  if (!body || typeof body !== 'object') return undefined
+  const fields = body as Record<string, unknown>
+  const tools = fields.tools
+  if (!Array.isArray(tools)) return undefined
+  if (!/tool|type|unknown|unsupported|invalid|web_search|read_url/i.test(detail)) return undefined
+  const kept = tools.filter((tool) => {
+    const type = typeof (tool as { type?: unknown } | null)?.type === 'string'
+      ? String((tool as { type?: unknown }).type)
+      : ''
+    return type !== 'deepseek_web_search' && type !== 'deepseek_read_url'
+  })
+  if (kept.length === tools.length) return undefined
+  const retry = { ...fields }
+  if (kept.length === 0) delete retry.tools
+  else retry.tools = kept
+  return retry
+}
+
+/**
  * Walk the event stream line by line.
  * @param body - the response body.
  * @param request - the original request, for the error prefix and `onDelta`.
@@ -279,12 +393,20 @@ async function readStream(
   let buffer = ''
   let rawText = ''
   let content = ''
+  let reasoning = ''
   let usage: unknown
+  const serverCalls: unknown[] = []
+  const annotations: unknown[] = []
+  let finishReason = ''
 
   const result = (): StreamResult => ({
     content,
+    reasoning,
     toolCalls: toWireCalls(calls),
-    usage
+    usage,
+    serverCalls,
+    annotations,
+    finishReason
   })
 
   /** Fold one SSE line in; true when it was the `[DONE]` marker. */
@@ -303,7 +425,27 @@ async function readStream(
       content += delta.content
       request.onDelta?.(delta.content)
     }
+    // A reasoner streams its thinking before the answer; it is billed output,
+    // so it is kept apart instead of being folded into the answer text.
+    const thinking = thinkingOf(delta)
+    if (thinking) {
+      reasoning += thinking
+      request.onReasoning?.(thinking)
+    }
     collect(calls, delta.tool_calls)
+    // Server tools run on the provider's side; the finished calls and the
+    // citations arrive in the last chunk, before `[DONE]`. Some gateways put
+    // them inside the delta, others beside it on the choice, so both are read.
+    for (const call of listOf(delta.server_tool_calls ?? chunk.choices?.[0]?.server_tool_calls)) {
+      serverCalls.push(call)
+    }
+    for (const note of listOf(delta.annotations ?? chunk.choices?.[0]?.annotations)) {
+      annotations.push(note)
+    }
+    const finished = finishOf(chunk.choices?.[0]?.finish_reason)
+    if (finished !== '') finishReason = finished
+    const serverEvent = chunk.choices?.[0]?.server_tool_event
+    if (serverEvent !== undefined && serverEvent !== null) request.onServerEvent?.(serverEvent)
     return false
   }
 
@@ -334,11 +476,16 @@ async function readStream(
   // answer. Without this the round would look empty and the answer would throw.
   if (content === '' && calls.size === 0) {
     const whole = parse<CompletionBody>(rawText.trim())
-    const message = whole?.choices?.[0]?.message
+    const choice = whole?.choices?.[0]
+    const message = choice?.message
     if (message) {
       if (typeof message.content === 'string') content = message.content
+      reasoning = thinkingOf(message)
       collect(calls, message.tool_calls)
+      for (const call of listOf(message.server_tool_calls)) serverCalls.push(call)
+      for (const note of listOf(message.annotations)) annotations.push(note)
     }
+    finishReason = finishOf(choice?.finish_reason) || finishReason
     if (whole?.usage) usage = whole.usage
   }
   return result()

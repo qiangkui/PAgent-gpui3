@@ -1312,8 +1312,14 @@ fn index_for_position(
             continue;
         }
         let within = point(position.x - line_origin.x, position.y - line_origin.y);
+        // `index_for_position` answers "which character is under x", so pointing
+        // anywhere inside the last character still returns that character's own
+        // start; only the sub-pixel strip past the line's measured width reaches
+        // the end. A selection dragged to the right edge therefore kept dropping
+        // the last character. Selection needs the nearest caret boundary, which
+        // is the rule the composer's field already uses for the same gesture.
         let index = line
-            .index_for_position(within, line_height)
+            .closest_index_for_position(within, line_height)
             .unwrap_or_else(|index| index);
         return line_start + index;
     }

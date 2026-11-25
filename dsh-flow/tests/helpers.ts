@@ -20,6 +20,10 @@ export interface CapturedRequest {
     tools?: unknown[]
     temperature?: number
     max_tokens?: number
+    /** Thinking effort the engine sent, when the window chose one. */
+    reasoning_effort?: string
+    /** The thinking switch, when the window turned thinking off. */
+    thinking?: { type: string }
   }
 }
 

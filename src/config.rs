@@ -35,8 +35,11 @@ pub const PRESETS: [Preset; 6] = [
         id: "deepseek",
         label: "DeepSeek",
         base_url: "https://api.deepseek.com",
-        model: "deepseek-chat",
-        models: &["deepseek-chat", "deepseek-reasoner"],
+        model: "deepseek-flash",
+        // The 2026 lineup: thinking is a mode of these two, not a separate
+        // `deepseek-reasoner` model. The legacy ids still resolve for older
+        // keys, but they are not offered as choices.
+        models: &["deepseek-flash", "deepseek-v4-pro"],
     },
     Preset {
         id: "openai",
@@ -85,54 +88,97 @@ pub fn model_versions(provider: &str) -> &'static [&'static str] {
     preset(provider).map_or(&[], |preset| preset.models)
 }
 
-/// How much variety a connection asks the model for.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Sampling {
-    /// Send no temperature: whatever the endpoint defaults to.
-    #[default]
-    Default,
-    /// Code and precise edits.
-    Precise,
-    /// Everyday answers.
-    Balanced,
-    /// Brainstorming.
-    Loose,
-}
-
-impl Sampling {
-    /// The temperature this asks for, or `None` to leave it to the endpoint.
-    pub fn temperature(self) -> Option<f64> {
-        match self {
-            Self::Default => None,
-            Self::Precise => Some(0.2),
-            Self::Balanced => Some(0.7),
-            Self::Loose => Some(1.0),
+/// The models worth offering for one connection: the shipped list, then
+/// whatever the endpoint reported that the list does not already have.
+///
+/// The endpoint's answer cannot be the only source. A gateway may hide a model,
+/// an older fetch predates one, and a custom entry can point at a preset host —
+/// in all three cases the picker would otherwise be missing a model the provider
+/// does offer. The shipped list stays authoritative for order, the fetch adds
+/// the rest.
+///
+/// @param provider - the connection's preset id, for example `deepseek`.
+/// @param base_url - the endpoint base; a DeepSeek address counts even when the
+///   connection was created as a custom OpenAI-compatible one.
+/// @param fetched - model ids the endpoint reported the last time it was asked.
+pub fn offered_models(provider: &str, base_url: &str, fetched: &[String]) -> Vec<String> {
+    let mut shipped: Vec<&str> = model_versions(provider).to_vec();
+    if shipped.is_empty() && base_url.to_ascii_lowercase().contains("deepseek") {
+        shipped = preset("deepseek").map_or(Vec::new(), |preset| preset.models.to_vec());
+    }
+    let mut names: Vec<String> = shipped.iter().map(|name| (*name).to_string()).collect();
+    for name in fetched {
+        if !names.iter().any(|known| known == name) {
+            names.push(name.clone());
         }
     }
+    names
+}
 
-    /// The name written to `config.json`.
+/// Temperature presets an older `config.json` may still name.
+///
+/// The slider stores the figure itself, so this only exists to read a file
+/// written before that: each name maps to the number it used to send.
+pub fn legacy_temperature(name: &str) -> Option<f64> {
+    match name {
+        "precise" => Some(0.2),
+        "balanced" => Some(0.7),
+        "loose" => Some(1.0),
+        _ => None,
+    }
+}
+
+/// Whether the model thinks before it answers, and how hard.
+///
+/// DeepSeek's `deepseek-flash` and `deepseek-v4-pro` think by default. The API
+/// switches thinking with `{"thinking": {"type": "disabled"}}` and trades depth
+/// for latency with `reasoning_effort` (`low` / `high` / `max`). Other endpoints
+/// take neither, so [`Self::Default`] sends nothing and leaves the choice to the
+/// provider.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reasoning {
+    /// Send nothing: the endpoint's own default (DeepSeek: thinking on, effort
+    /// high).
+    #[default]
+    Default,
+    /// Think briefly, so easy questions come back sooner.
+    Low,
+    /// The effort the endpoint picks when thinking is on and nothing else is
+    /// said.
+    High,
+    /// Spend the most on thinking, for questions worth the wait.
+    Max,
+    /// Answer without thinking: faster and cheaper, and nothing to show in the
+    /// transcript's thinking rows.
+    Off,
+}
+
+impl Reasoning {
+    /// The name written to `config.json` and sent to the engine.
     pub fn name(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Precise => "precise",
-            Self::Balanced => "balanced",
-            Self::Loose => "loose",
+            Self::Low => "low",
+            Self::High => "high",
+            Self::Max => "max",
+            Self::Off => "off",
         }
     }
 
     /// Read a stored name; unknown names mean the endpoint default.
     pub fn from_name(name: &str) -> Self {
         match name {
-            "precise" => Self::Precise,
-            "balanced" => Self::Balanced,
-            "loose" => Self::Loose,
+            "low" => Self::Low,
+            "high" => Self::High,
+            "max" => Self::Max,
+            "off" => Self::Off,
             _ => Self::Default,
         }
     }
 }
 
 /// One configured model endpoint.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Connection {
     /// Stable id the key is filed under in the credential store (`c1`, `c2`, …).
     pub id: String,
@@ -149,10 +195,19 @@ pub struct Connection {
     /// Model ids the endpoint reported the last time it was asked, so the
     /// versions on offer survive a restart without another request.
     pub models: Vec<String>,
-    /// Temperature preset sent with every question.
-    pub sampling: Sampling,
+    /// Temperature sent with every question; `None` leaves it to the endpoint.
+    pub temperature: Option<f64>,
+    /// Whether the model thinks first; `Default` sends no switch at all.
+    pub reasoning: Reasoning,
     /// Cap on generated tokens; zero leaves it to the endpoint.
     pub max_tokens: u32,
+    /// Context window in tokens, when the endpoint's own figure is known better
+    /// than the name table in [`crate::ai::context_window`]; zero means auto.
+    ///
+    /// A local or self-hosted model is usually much smaller than the 128k
+    /// default, and a model newer than the table is usually larger; either way
+    /// the compaction point would be wrong without this.
+    pub window: u64,
 }
 
 impl Connection {
@@ -167,9 +222,34 @@ impl Connection {
             base_url: preset.base_url.to_string(),
             verified: false,
             models: Vec::new(),
-            sampling: Sampling::Default,
+            temperature: None,
+            reasoning: Reasoning::Default,
             max_tokens: 0,
+            window: 0,
         })
+    }
+
+    /// The window the engine should compact against.
+    ///
+    /// An explicit setting wins; otherwise the name table answers, with its
+    /// conservative default for models it does not know.
+    pub fn window_tokens(&self) -> u64 {
+        if self.window > 0 {
+            self.window
+        } else {
+            crate::ai::context_window(&self.model)
+        }
+    }
+
+    /// Whether this connection can declare DeepSeek's server tools.
+    ///
+    /// Only DeepSeek's `deepseek-flash` offers `deepseek_web_search` and
+    /// `deepseek_read_url`; sending those entries anywhere else is a rejected
+    /// request, so the payload leaves them out instead.
+    pub fn supports_web_search(&self) -> bool {
+        let host = self.base_url.to_ascii_lowercase();
+        let deepseek = self.provider == "deepseek" || host.contains("deepseek");
+        deepseek && self.model.to_ascii_lowercase().contains("flash")
     }
 
     /// Name of the provider, for the picker and the card header.
@@ -194,17 +274,28 @@ impl Connection {
             base_url: self.base_url.trim().trim_end_matches('/').to_string(),
             verified: self.verified,
             models: self.models.clone(),
-            sampling: self.sampling,
+            // A hand-edited file could ask for a temperature no endpoint takes;
+            // 0–2 is the range every provider reads as "reasonable".
+            temperature: self
+                .temperature
+                .filter(|value| value.is_finite())
+                .map(|value| value.clamp(0., 2.)),
+            reasoning: self.reasoning,
             max_tokens: self.max_tokens,
+            // A hand-edited file could ask for an absurd window; the engine
+            // clamps its own budgets anyway, but keeping the figure sane here
+            // stops a bad number from reaching the gauge.
+            window: self.window.min(10_000_000),
         }
     }
 }
 
-/// Default model round-trips per question.
-pub const DEFAULT_MAX_ROUNDS: u32 = 6;
+/// Default model round-trips per question: the highest the menu offers, so a
+/// fresh conversation is never cut short by a budget nobody chose.
+pub const DEFAULT_MAX_ROUNDS: u32 = MAX_ROUNDS_CHOICE;
 
-/// Default tool calls per question.
-pub const DEFAULT_MAX_CALLS: u32 = 20;
+/// Default tool calls per question, likewise the highest on offer.
+pub const DEFAULT_MAX_CALLS: u32 = MAX_CALLS_CHOICE;
 
 /// Highest budgets the settings page offers; the engine clamps again.
 pub const MAX_ROUNDS_CHOICE: u32 = 24;
@@ -347,57 +438,115 @@ pub fn scanned_plugins(dir: &Path) -> Vec<InstalledPlugin> {
         if !is_plugin_id(&id) {
             continue;
         }
-        let empty = |problem: String| InstalledPlugin {
-            id: id.clone(),
-            name: id.clone(),
-            version: String::new(),
-            problem,
-        };
-        let text = match std::fs::read_to_string(entry.path().join("plugin.json")) {
-            Ok(text) => text,
-            Err(_) => {
-                found.push(empty("缺少 plugin.json".to_string()));
-                continue;
-            }
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-            found.push(empty("plugin.json 不是合法 JSON".to_string()));
-            continue;
-        };
-        let field = |name: &str| {
-            value
-                .get(name)
-                .and_then(|item| item.as_str())
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-        let api = value.get("api").and_then(|item| item.as_u64()).unwrap_or(0);
-        let main = match field("main") {
-            entry if entry.is_empty() => "index.js".to_string(),
-            entry => entry,
-        };
-        let name = match field("name") {
-            printed if printed.is_empty() => id.clone(),
-            printed => printed,
-        };
-        let problem = if api != 1 {
-            format!("plugin.json 的 api 是 {api}，这个版本只支持 1")
-        } else if !entry.path().join(&main).is_file() {
-            format!("找不到入口文件 {main}")
-        } else {
-            String::new()
-        };
-        found.push(InstalledPlugin {
-            id,
-            name,
-            version: field("version"),
-            problem,
-        });
+        found.push(read_plugin(&id, &entry.path()));
     }
     found.sort_by(|left, right| left.id.cmp(&right.id));
     found.truncate(MAX_PLUGINS);
     found
+}
+
+/// Read one plugin folder's manifest the way the engine will read it.
+///
+/// Shared by the page's scan and by the import, so a folder the page would call
+/// broken can never be copied in as if it worked.
+fn read_plugin(id: &str, folder: &Path) -> InstalledPlugin {
+    let empty = |problem: String| InstalledPlugin {
+        id: id.to_string(),
+        name: id.to_string(),
+        version: String::new(),
+        problem,
+    };
+    let text = match std::fs::read_to_string(folder.join("plugin.json")) {
+        Ok(text) => text,
+        Err(_) => return empty("缺少 plugin.json".to_string()),
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return empty("plugin.json 不是合法 JSON".to_string());
+    };
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(|item| item.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let api = value.get("api").and_then(|item| item.as_u64()).unwrap_or(0);
+    let main = match field("main") {
+        entry if entry.is_empty() => "index.js".to_string(),
+        entry => entry,
+    };
+    let name = match field("name") {
+        printed if printed.is_empty() => id.to_string(),
+        printed => printed,
+    };
+    let problem = if api != 1 {
+        format!("plugin.json 的 api 是 {api}，这个版本只支持 1")
+    } else if escapes_folder(&main) {
+        // The engine refuses this too; catching it here keeps a broken folder
+        // from being imported and only failing at the next question.
+        "plugin.json 的 main 指向了插件目录之外".to_string()
+    } else if !folder.join(&main).is_file() {
+        format!("找不到入口文件 {main}")
+    } else {
+        String::new()
+    };
+    InstalledPlugin {
+        id: id.to_string(),
+        name,
+        version: field("version"),
+        problem,
+    }
+}
+
+/// Whether a manifest's `main` leaves the plugin folder.
+fn escapes_folder(main: &str) -> bool {
+    main.starts_with('/')
+        || main.starts_with('\\')
+        || main.contains(':')
+        || main.split(['/', '\\']).any(|part| part == "..")
+}
+
+/// Copy a plugin folder in from anywhere on disk, then return its id.
+///
+/// Same rules as the scan: the folder name is the id, the manifest has to be
+/// one the engine would load, and an existing id is never overwritten.
+pub fn import_plugin(source: &Path) -> Result<String, String> {
+    let Some(dir) = AiSettings::plugin_dir() else {
+        return Err("找不到插件目录".to_string());
+    };
+    import_plugin_into(source, &dir)
+}
+
+/// The same import against an arbitrary folder (the tests use this one).
+pub fn import_plugin_into(source: &Path, dir: &Path) -> Result<String, String> {
+    if !source.is_dir() {
+        return Err("请选择一个插件文件夹（里面放 plugin.json）。".to_string());
+    }
+    let Some(id) = source
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+    else {
+        return Err(format!("读不出 {} 的文件夹名", source.display()));
+    };
+    if !is_plugin_id(&id) {
+        return Err(format!(
+            "文件夹名「{id}」不能当插件 id：只能用字母、数字、-、_、.，且不能以 . 开头或结尾"
+        ));
+    }
+    let plugin = read_plugin(&id, source);
+    if !plugin.problem.is_empty() {
+        return Err(format!("这个文件夹不是可用的插件：{}", plugin.problem));
+    }
+    if scanned_plugins(dir).len() >= MAX_PLUGINS {
+        return Err(format!("插件已经有 {MAX_PLUGINS} 个，先删掉一个再添加"));
+    }
+    let target = dir.join(&id);
+    if target.exists() {
+        return Err(format!("插件「{id}」已经存在，先删除它再添加"));
+    }
+    crate::folder::copy_dir(source, &target)?;
+    Ok(id)
 }
 
 /// Highest number of custom modes the settings page keeps.
@@ -454,7 +603,7 @@ pub struct ModeSelection {
 }
 
 /// Every connection the window knows about, plus which one is in use.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AiSettings {
     /// Configured endpoints, in the order the settings page shows them.
     pub connections: Vec<Connection>,
@@ -750,16 +899,16 @@ impl AiSettings {
         if id == MODE_FULL {
             return "全量模式".to_string();
         }
-        self.modes
-            .iter()
-            .find(|mode| mode.id == id)
-            .map_or_else(|| "全量模式".to_string(), |mode| {
+        self.modes.iter().find(|mode| mode.id == id).map_or_else(
+            || "全量模式".to_string(),
+            |mode| {
                 if mode.name.trim().is_empty() {
                     "自定义模式".to_string()
                 } else {
                     mode.name.clone()
                 }
-            })
+            },
+        )
     }
 
     /// Whether a mode id is known. Unknown ids fall back to full mode.
@@ -1033,12 +1182,28 @@ impl AiSettings {
                                     .collect()
                             })
                             .unwrap_or_default(),
-                        sampling: Sampling::from_name(&text_field(item, "sampling")),
+                        // The figure itself; a file written before the slider
+                        // names a preset instead (`sampling`), which the legacy
+                        // lookup turns back into the number it used to send.
+                        temperature: item
+                            .get("temperature")
+                            .and_then(|value| value.as_f64())
+                            .or_else(|| {
+                                item.get("sampling")
+                                    .and_then(|value| value.as_str())
+                                    .and_then(legacy_temperature)
+                            }),
+                        reasoning: Reasoning::from_name(&text_field(item, "reasoning")),
                         max_tokens: item
                             .get("maxTokens")
                             .and_then(|value| value.as_u64())
                             .unwrap_or(0)
                             .min(1_000_000) as u32,
+                        window: item
+                            .get("window")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0)
+                            .min(10_000_000),
                     })
                 })
                 .collect();
@@ -1067,8 +1232,10 @@ impl AiSettings {
             base_url: String::new(),
             verified: false,
             models: Vec::new(),
-            sampling: Sampling::Default,
+            temperature: None,
+            reasoning: Reasoning::Default,
             max_tokens: 0,
+            window: 0,
         });
         if !model.is_empty() {
             migrated.model = model;
@@ -1124,8 +1291,10 @@ impl AiSettings {
                     "baseUrl": connection.base_url,
                     "verified": connection.verified,
                     "models": connection.models,
-                    "sampling": connection.sampling.name(),
+                    "reasoning": connection.reasoning.name(),
+                    "temperature": connection.temperature,
                     "maxTokens": connection.max_tokens,
+                    "window": connection.window,
                 })
             })
             .collect();
@@ -1258,7 +1427,7 @@ mod tests {
         assert_eq!(settings.connections.len(), 1);
         let connection = settings.active().expect("active");
         assert_eq!(connection.provider, "deepseek");
-        assert_eq!(connection.model, "deepseek-chat");
+        assert_eq!(connection.model, "deepseek-flash");
         assert_eq!(connection.base_url, "https://api.deepseek.com");
         assert!(!connection.verified);
         assert!(!settings.usable());
@@ -1288,8 +1457,12 @@ mod tests {
                     base_url: "https://api.deepseek.com".to_string(),
                     verified: true,
                     models: vec!["deepseek-chat".to_string(), "deepseek-v4-pro".to_string()],
-                    sampling: Sampling::Balanced,
+                    temperature: Some(0.7),
+                    reasoning: Reasoning::High,
                     max_tokens: 4096,
+                    // A window narrower than the name table would guess, so the
+                    // round trip proves the override survives.
+                    window: 262_144,
                 },
                 Connection {
                     id: "c2".to_string(),
@@ -1299,8 +1472,10 @@ mod tests {
                     base_url: "http://127.0.0.1:1234/v1".to_string(),
                     verified: false,
                     models: Vec::new(),
-                    sampling: Sampling::Default,
+                    temperature: None,
+                    reasoning: Reasoning::Default,
                     max_tokens: 0,
+                    window: 0,
                 },
             ],
             active: 1,
@@ -1330,7 +1505,10 @@ mod tests {
         assert_eq!(loaded.skills, vec!["demo-skill".to_string()]);
         assert_eq!(loaded.modes, settings.modes);
         assert_eq!(loaded.mode_label("mode-1"), "写作");
-        assert_eq!(loaded.mode_selection("mode-1").plugins, vec!["demo-plugin".to_string()]);
+        assert_eq!(
+            loaded.mode_selection("mode-1").plugins,
+            vec!["demo-plugin".to_string()]
+        );
         // The spending guard and the proxy survive a round trip too.
         assert_eq!(loaded.budget_tokens, 250_000);
         assert_eq!(loaded.proxy, "http://127.0.0.1:7890");
@@ -1404,7 +1582,7 @@ mod tests {
     fn presets_carry_a_default_model() {
         assert_eq!(
             preset("deepseek").map(|preset| preset.model),
-            Some("deepseek-chat")
+            Some("deepseek-flash")
         );
         assert!(preset("nope").is_none());
         let custom = Connection::from_preset("custom").expect("custom preset");
@@ -1413,10 +1591,37 @@ mod tests {
     }
 
     #[test]
+    fn offered_models_keep_the_shipped_list_alongside_what_the_endpoint_reported() {
+        // A fetch that predates a model, or a gateway that hides one, must not
+        // remove it from the picker: the shipped list is the floor.
+        let fetched = vec!["deepseek-flash".to_string()];
+        assert_eq!(
+            offered_models("deepseek", "https://api.deepseek.com", &fetched),
+            vec!["deepseek-flash", "deepseek-v4-pro"]
+        );
+        // Extras the endpoint reported come after the curated order.
+        let fetched = vec!["deepseek-flash".to_string(), "my-proxy-model".to_string()];
+        assert_eq!(
+            offered_models("deepseek", "https://api.deepseek.com", &fetched),
+            vec!["deepseek-flash", "deepseek-v4-pro", "my-proxy-model"]
+        );
+        // A custom connection pointed at DeepSeek still gets the lineup.
+        assert_eq!(
+            offered_models("custom", "https://api.deepseek.com/v1", &[]),
+            vec!["deepseek-flash", "deepseek-v4-pro"]
+        );
+        // Any other custom endpoint offers exactly what it reported.
+        assert_eq!(
+            offered_models("custom", "https://example.test/v1", &["m1".to_string()]),
+            vec!["m1"]
+        );
+    }
+
+    #[test]
     fn presets_offer_their_model_versions() {
         let deepseek = model_versions("deepseek");
-        assert!(deepseek.contains(&"deepseek-chat"), "{deepseek:?}");
-        assert!(deepseek.contains(&"deepseek-reasoner"), "{deepseek:?}");
+        assert!(deepseek.contains(&"deepseek-flash"), "{deepseek:?}");
+        assert!(deepseek.contains(&"deepseek-v4-pro"), "{deepseek:?}");
         for entry in PRESETS.iter() {
             if entry.models.is_empty() {
                 continue;
@@ -1431,20 +1636,75 @@ mod tests {
     }
 
     #[test]
-    fn sampling_maps_to_temperatures_and_back() {
-        assert_eq!(Sampling::Default.temperature(), None);
-        assert_eq!(Sampling::Precise.temperature(), Some(0.2));
-        assert_eq!(Sampling::Balanced.temperature(), Some(0.7));
-        assert_eq!(Sampling::Loose.temperature(), Some(1.0));
-        for sampling in [
-            Sampling::Default,
-            Sampling::Precise,
-            Sampling::Balanced,
-            Sampling::Loose,
+    fn an_old_preset_name_still_reads_as_its_number() {
+        assert_eq!(legacy_temperature("precise"), Some(0.2));
+        assert_eq!(legacy_temperature("balanced"), Some(0.7));
+        assert_eq!(legacy_temperature("loose"), Some(1.0));
+        // "default" sent nothing, and so does an unknown name.
+        assert_eq!(legacy_temperature("default"), None);
+        assert_eq!(legacy_temperature("weird"), None);
+    }
+
+    #[test]
+    fn a_file_written_before_the_slider_keeps_its_temperature() {
+        // `sampling` was a preset name; the number it stood for is what the
+        // slider has to show now.
+        let file = TempFile::new("legacy-sampling");
+        file.write(
+            "{\"connections\":[{\"id\":\"c1\",\"provider\":\"deepseek\",\
+             \"model\":\"deepseek-flash\",\"apiKey\":\"sk-a\",\
+             \"baseUrl\":\"https://api.deepseek.com\",\"sampling\":\"balanced\"}]}",
+        );
+        let loaded = AiSettings::load_from(&file.0);
+        assert_eq!(loaded.connections[0].temperature, Some(0.7));
+    }
+
+    #[test]
+    fn reasoning_names_round_trip_and_unknown_means_the_endpoint_default() {
+        for reasoning in [
+            Reasoning::Default,
+            Reasoning::Off,
+            Reasoning::Low,
+            Reasoning::High,
+            Reasoning::Max,
         ] {
-            assert_eq!(Sampling::from_name(sampling.name()), sampling);
+            assert_eq!(Reasoning::from_name(reasoning.name()), reasoning);
         }
-        assert_eq!(Sampling::from_name("weird"), Sampling::Default);
+        assert_eq!(Reasoning::from_name("weird"), Reasoning::Default);
+        assert_eq!(Reasoning::from_name(""), Reasoning::Default);
+    }
+
+    #[test]
+    fn a_save_without_a_reasoning_key_keeps_the_endpoint_default() {
+        // Files written before the thinking switch existed have no key at all;
+        // they must keep the endpoint's own default, not read as "off".
+        let file = TempFile::new("no-reasoning");
+        file.write(
+            "{\"connections\":[{\"id\":\"c1\",\"provider\":\"deepseek\",\
+             \"model\":\"deepseek-flash\",\"apiKey\":\"sk-a\",\
+             \"baseUrl\":\"https://api.deepseek.com\",\"verified\":true}]}",
+        );
+        let loaded = AiSettings::load_from(&file.0);
+        assert_eq!(loaded.connections.len(), 1);
+        assert_eq!(loaded.connections[0].reasoning, Reasoning::Default);
+        assert_eq!(loaded.connections[0].temperature, None);
+    }
+
+    #[test]
+    fn web_search_is_offered_by_deepseek_flash_only() {
+        let mut connection = Connection::from_preset("deepseek").expect("preset");
+        assert!(connection.supports_web_search());
+        connection.model = "deepseek-v4-pro".to_string();
+        assert!(
+            !connection.supports_web_search(),
+            "only flash offers the tools"
+        );
+        // A custom entry pointing at DeepSeek still counts; anywhere else does not.
+        connection.provider = "custom".to_string();
+        connection.model = "deepseek-flash".to_string();
+        assert!(connection.supports_web_search());
+        connection.base_url = "https://api.openai.com/v1".to_string();
+        assert!(!connection.supports_web_search());
     }
 
     #[test]
@@ -1457,13 +1717,36 @@ mod tests {
             base_url: " https://api.deepseek.com/ ".to_string(),
             verified: false,
             models: Vec::new(),
-            sampling: Sampling::Default,
+            temperature: None,
+            reasoning: Reasoning::Default,
             max_tokens: 0,
+            window: 0,
         };
         let normalized = connection.normalized();
         assert_eq!(normalized.model, "deepseek-chat");
         assert_eq!(normalized.api_key, "sk-a");
         assert_eq!(normalized.base_url, "https://api.deepseek.com");
+    }
+
+    #[test]
+    fn a_connection_names_its_own_window_when_it_knows_better() {
+        let mut connection = Connection::from_preset("deepseek").expect("preset");
+        // Without an override the name table answers.
+        assert_eq!(
+            connection.window_tokens(),
+            crate::ai::context_window(&connection.model)
+        );
+        connection.model = "some-local-model".to_string();
+        assert_eq!(
+            connection.window_tokens(),
+            crate::ai::DEFAULT_CONTEXT_WINDOW,
+            "an unknown model falls back to the conservative default"
+        );
+        connection.window = 32_768;
+        assert_eq!(connection.window_tokens(), 32_768, "the setting wins");
+        // A hand-edited absurd value is clamped before it reaches the gauge.
+        connection.window = u64::MAX;
+        assert_eq!(connection.normalized().window, 10_000_000);
     }
 
     /// A connection with only the fields a store test cares about.
@@ -1476,8 +1759,10 @@ mod tests {
             base_url: "https://api.deepseek.com".to_string(),
             verified: true,
             models: Vec::new(),
-            sampling: Sampling::Default,
+            temperature: None,
+            reasoning: Reasoning::Default,
             max_tokens: 0,
+            window: 0,
         }
     }
 
@@ -1631,6 +1916,91 @@ mod tests {
     }
 
     #[test]
+    fn imports_a_plugin_folder_with_its_entry() {
+        let dir = TempDir::new("plugin-import");
+        let source = dir.0.join("source").join("echo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("plugin.json"),
+            r#"{"name":"回显","version":"1.0.0","api":1}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("index.js"), "export function activate() {}").unwrap();
+        let target = dir.0.join("plugins");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let id = import_plugin_into(&source, &target).unwrap();
+        assert_eq!(id, "echo");
+        assert!(target.join("echo").join("index.js").is_file());
+        let found = scanned_plugins(&target);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].problem.is_empty());
+        assert_eq!(found[0].name, "回显");
+        // The original stays, and the same id cannot land twice.
+        assert!(source.join("index.js").is_file());
+        assert!(import_plugin_into(&source, &target).is_err());
+    }
+
+    #[test]
+    fn refuses_a_plugin_folder_the_engine_would_not_load() {
+        let dir = TempDir::new("plugin-import-broken");
+        let target = dir.0.join("plugins");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let missing = dir.0.join("missing");
+        std::fs::create_dir_all(&missing).unwrap();
+        assert!(
+            import_plugin_into(&missing, &target)
+                .unwrap_err()
+                .contains("plugin.json")
+        );
+
+        let wrong_api = dir.0.join("wrong-api");
+        std::fs::create_dir_all(&wrong_api).unwrap();
+        std::fs::write(wrong_api.join("plugin.json"), r#"{"api":2}"#).unwrap();
+        std::fs::write(wrong_api.join("index.js"), "").unwrap();
+        assert!(
+            import_plugin_into(&wrong_api, &target)
+                .unwrap_err()
+                .contains("api")
+        );
+
+        let no_entry = dir.0.join("no-entry");
+        std::fs::create_dir_all(&no_entry).unwrap();
+        std::fs::write(no_entry.join("plugin.json"), r#"{"api":1}"#).unwrap();
+        assert!(
+            import_plugin_into(&no_entry, &target)
+                .unwrap_err()
+                .contains("入口")
+        );
+
+        let escaping = dir.0.join("escaping");
+        std::fs::create_dir_all(&escaping).unwrap();
+        std::fs::write(
+            escaping.join("plugin.json"),
+            r#"{"api":1,"main":"../outside.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.0.join("outside.js"), "").unwrap();
+        assert!(
+            import_plugin_into(&escaping, &target)
+                .unwrap_err()
+                .contains("之外")
+        );
+
+        let spaced = dir.0.join("有 空格");
+        std::fs::create_dir_all(&spaced).unwrap();
+        std::fs::write(spaced.join("plugin.json"), r#"{"api":1}"#).unwrap();
+        std::fs::write(spaced.join("index.js"), "").unwrap();
+        assert!(
+            import_plugin_into(&spaced, &target)
+                .unwrap_err()
+                .contains("插件 id")
+        );
+        assert!(scanned_plugins(&target).is_empty(), "nothing was copied");
+    }
+
+    #[test]
     fn server_ids_allow_spaces_but_not_paths() {
         assert!(is_server_id("filesystem"));
         assert!(is_server_id("my server"));
@@ -1684,18 +2054,7 @@ mod tests {
         assert!(is_plugin_id("demo"));
         assert!(is_plugin_id("demo-plugin_2"));
         for bad in [
-            "",
-            ".",
-            ".hidden",
-            "..",
-            "a/b",
-            "a\\b",
-            "a b",
-            "插件",
-            "demo.",
-            "con",
-            "NUL",
-            "com1",
+            "", ".", ".hidden", "..", "a/b", "a\\b", "a b", "插件", "demo.", "con", "NUL", "com1",
         ] {
             assert!(!is_plugin_id(bad), "{bad} should be refused");
         }
@@ -1732,7 +2091,7 @@ mod tests {
         assert!(found[2].problem.contains("入口文件"));
         assert!(found[3].problem.contains("只支持"));
     }
-#[test]
+    #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn modes_intersect_the_global_resource_switches() {
         let mut settings = AiSettings::default();

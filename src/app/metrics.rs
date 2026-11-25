@@ -42,6 +42,13 @@ impl DshFlowApp {
     /// from the engine's loop is added on top: it grows as the loop goes.
     pub(crate) fn chat_metrics(&self) -> ChatMetrics {
         let mut metrics = chat_metrics(self.chat(), &self.chat_model());
+        // The connection's own window (when it has one) is the figure the
+        // engine compacts against, so the gauge must read the same.
+        if let Some(connection) = self.ai.active()
+            && connection.window > 0
+        {
+            metrics.context_percent = chat_context_percent_in(self.chat(), connection.window);
+        }
         if let Some(pending) = self.active_pending() {
             metrics.steps = metrics.steps.saturating_add(u64::from(pending.round));
         }

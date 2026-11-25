@@ -291,11 +291,14 @@ impl DshFlowApp {
         page_size: usize,
         sort: Option<(usize, bool)>,
     ) {
-        self.tables.borrow_mut().entry(id).or_insert_with(|| TableState {
-            page_size,
-            sort,
-            ..TableState::default()
-        });
+        self.tables
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| TableState {
+                page_size,
+                sort,
+                ..TableState::default()
+            });
     }
 
     /// Draw one table.
@@ -321,9 +324,8 @@ impl DshFlowApp {
             let tables = self.tables.borrow();
             let state = tables.get(id);
             let sort = state.and_then(|state| state.sort);
-            let visible = state.map_or_else(|| (0..rows.len()).collect(), |state| {
-                state.visible(&rows)
-            });
+            let visible =
+                state.map_or_else(|| (0..rows.len()).collect(), |state| state.visible(&rows));
             // The order a Shift press runs over: every filtered row, not just the
             // page on show.
             let order: Rc<Vec<usize>> = Rc::new(state.map_or_else(Vec::new, |state| {
@@ -459,6 +461,7 @@ impl DshFlowApp {
                             .min_h(px(0.))
                             .overflow_y_scroll()
                             .track_scroll(&scroll)
+                            .contained_wheel()
                             .child(body),
                     )
                     .child(bar)
@@ -562,7 +565,12 @@ impl DshFlowApp {
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(scroll) = self.tables.borrow().get(id).map(|state| state.scroll.clone()) else {
+        let Some(scroll) = self
+            .tables
+            .borrow()
+            .get(id)
+            .map(|state| state.scroll.clone())
+        else {
             return div().into_any_element();
         };
         let Some((track, thumb, max, _)) = tool_bar_metrics(&scroll) else {
@@ -579,6 +587,7 @@ impl DshFlowApp {
             .as_ref()
             .is_some_and(|(dragging, _, _)| *dragging == id);
         let handle = scroll.clone();
+        let wheel = scroll.clone();
         div()
             .id((id, ROWS_BAR))
             .w(px(8.))
@@ -589,6 +598,14 @@ impl DshFlowApp {
             .items_center()
             .block_mouse_except_scroll()
             .cursor_pointer()
+            // A wheel over the bar scrolls the rows it represents: the bar is
+            // part of the table, so it must not pass the wheel to the page.
+            .on_scroll(cx.listener(move |_view, event: &ScrollEvent, window, cx| {
+                if wheel_scroll(&wheel, event, window) {
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |view, event: &MouseDownEvent, _, cx| {
@@ -634,7 +651,12 @@ impl DshFlowApp {
         let Some((id, start_y, start_offset)) = self.table_drag else {
             return;
         };
-        let Some(scroll) = self.tables.borrow().get(id).map(|state| state.scroll.clone()) else {
+        let Some(scroll) = self
+            .tables
+            .borrow()
+            .get(id)
+            .map(|state| state.scroll.clone())
+        else {
             return;
         };
         let Some((track, thumb, max, _)) = tool_bar_metrics(&scroll) else {

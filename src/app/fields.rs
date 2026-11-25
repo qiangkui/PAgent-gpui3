@@ -39,6 +39,142 @@ pub(crate) fn field_row_at(offset: f32, box_height: f32, lines: usize, block: bo
     row.min(count - 1)
 }
 
+/// True when a field folds a too-long line onto the next row instead of
+/// clipping it and scrolling sideways.
+///
+/// The composer and the instruction editor grow downwards; every other field is
+/// one line tall, so a long value there still scrolls.
+pub(crate) fn field_wraps(slot: Field) -> bool {
+    matches!(slot, Field::Composer | Field::ChatInstructions)
+}
+
+/// The runs every measurement in this module shapes with.
+fn field_runs(len: usize) -> Vec<TextRun> {
+    vec![TextRun {
+        len,
+        font: gpui::font(".SystemUIFont"),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }]
+}
+
+/// One row per manual line, however long: what a field shows before it knows
+/// how wide it is, and what the one-line fields always show.
+pub(crate) fn logical_rows(text: &str) -> Vec<Range<usize>> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        rows.push(start..end);
+        start = end + 1;
+    }
+    rows
+}
+
+/// The rows a field's text is drawn in, as absolute byte ranges.
+///
+/// One row per manual line, plus the rows a line too long for `width` needs.
+/// The caret, the click hit-test and the layout all read these, so the breaks
+/// the reader sees are the breaks the caret moves through. `wrap` is false for
+/// the one-line fields, which scroll sideways instead.
+pub(crate) fn field_rows(
+    text_system: &gpui::WindowTextSystem,
+    text: &str,
+    width: Pixels,
+    wrap: bool,
+) -> Vec<Range<usize>> {
+    if !wrap || width <= px(0.) {
+        return logical_rows(text);
+    }
+    let mut rows = Vec::new();
+    let mut start = 0;
+    for line in text.split('\n') {
+        let end = start + line.len();
+        if line.is_empty() {
+            rows.push(start..end);
+        } else {
+            rows.extend(wrap_line(text_system, text, start..end, width));
+        }
+        start = end + 1;
+    }
+    rows
+}
+
+/// Break one manual line where it no longer fits, preferring a space so words
+/// are not cut in half.
+fn wrap_line(
+    text_system: &gpui::WindowTextSystem,
+    text: &str,
+    line: Range<usize>,
+    width: Pixels,
+) -> Vec<Range<usize>> {
+    let slice = &text[line.clone()];
+    let shaped = text_system.shape_line(
+        slice.to_string().into(),
+        px(FIELD_FONT_SIZE),
+        &field_runs(slice.len()),
+        None,
+    );
+    let mut rows = Vec::new();
+    let mut start = 0;
+    while start < slice.len() {
+        let origin = shaped.x_for_index(start);
+        let mut end = start;
+        let mut space = None;
+        for (offset, ch) in slice[start..].char_indices() {
+            let index = start + offset;
+            if shaped.x_for_index(index) - origin > width {
+                break;
+            }
+            end = index + ch.len_utf8();
+            if ch == ' ' {
+                space = Some(end);
+            }
+        }
+        if end <= start {
+            // One glyph wider than the field still has to move the row on.
+            end = start + slice[start..].chars().next().map_or(1, char::len_utf8);
+        } else if end < slice.len() {
+            if let Some(break_at) = space {
+                end = break_at;
+            }
+        }
+        rows.push((line.start + start)..(line.start + end));
+        start = end;
+    }
+    rows
+}
+
+/// Which row of [`field_rows`] a caret sits on.
+///
+/// A caret exactly at a wrap point belongs to the row that starts there, which
+/// is where an editor puts it once the reader types past the end of a row.
+pub(crate) fn row_of_caret(rows: &[Range<usize>], caret: usize) -> usize {
+    rows.iter()
+        .rposition(|range| range.start <= caret)
+        .unwrap_or(0)
+}
+
+/// The caret's x inside one row, and that row's full width.
+pub(crate) fn row_caret_x(
+    text_system: &gpui::WindowTextSystem,
+    text: &str,
+    row: Range<usize>,
+    caret: usize,
+) -> (Pixels, Pixels) {
+    let line = &text[row.clone()];
+    let shaped = text_system.shape_line(
+        line.to_string().into(),
+        px(FIELD_FONT_SIZE),
+        &field_runs(line.len()),
+        None,
+    );
+    let index = caret.clamp(row.start, row.end) - row.start;
+    (shaped.x_for_index(index), shaped.width())
+}
+
 impl DshFlowApp {
     /// What the caret painter needs: the text as drawn, the caret offset in it, and
     /// the colour of the bar.
@@ -340,8 +476,6 @@ impl DshFlowApp {
                     self.model_menu = false;
                 } else if self.tools_menu {
                     self.tools_menu = false;
-                } else if self.budget_menu {
-                    self.budget_menu = false;
                 } else if self.mode_menu {
                     self.mode_menu = false;
                 } else if self.attach_menu {
@@ -397,6 +531,9 @@ impl DshFlowApp {
         // The instruction, allowlist and colour editors grow with their text
         // instead of staying one line.
         let multiline = field_multiline(slot);
+        // The composer and the instruction editor fold long lines; everything
+        // else stays one line tall and scrolls sideways.
+        let wraps = field_wraps(slot);
         let mut row = div()
             .id(("field", key))
             .flex()
@@ -526,10 +663,26 @@ impl DshFlowApp {
                         .child(placeholder.to_string()),
                 );
             }
-        } else if focused || selection.is_some() || multiline {
+        } else if wraps || focused || selection.is_some() || multiline {
             // The text is cut into spans only where a selection or an IME
-            // composition has to be coloured, never at the caret.
-            row = row.child(field_spans(field, selection, palette));
+            // composition has to be coloured, never at the caret. A wrapping
+            // field is laid out in the rows it actually occupies, so a long
+            // draft folds instead of sliding out of view.
+            let rows = match self.window_text.as_deref() {
+                Some(text_system) => {
+                    field_rows(text_system, &field.text, self.field_text_width(slot), wraps)
+                }
+                // Before the first layout there is nothing to fold against.
+                None => logical_rows(&field.text),
+            };
+            row = row.child(field_spans(
+                field,
+                &rows,
+                selection,
+                field.marked(),
+                if wraps { 0. } else { field.scroll() },
+                palette,
+            ));
         } else {
             row = row.child(
                 div()
@@ -611,10 +764,10 @@ impl DshFlowApp {
     /// Move the field's horizontal scroll so the caret stays inside the visible
     /// part of a long line.
     ///
-    /// Only one-line fields scroll: in a block of lines the shift would slide
-    /// every line sideways, so a long line there is clipped instead.
+    /// Only one-line fields scroll: a block of lines would slide every row
+    /// sideways, and a wrapping field folds its long line instead.
     pub(crate) fn ensure_caret_scroll(&mut self, slot: Field, window: &mut Window) {
-        if field_multiline(slot) {
+        if field_multiline(slot) || field_wraps(slot) {
             return;
         }
         let Some(bounds) = self
@@ -647,6 +800,19 @@ impl DshFlowApp {
         if let Some(field) = self.field_mut(slot) {
             field.set_scroll(scroll);
         }
+    }
+
+    /// How much room a field's text has, from the frame that was drawn last.
+    ///
+    /// Zero until the field has been laid out once; the callers read that as
+    /// "do not fold yet" rather than "fold at zero width".
+    pub(crate) fn field_text_width(&self, slot: Field) -> Pixels {
+        self.field_bounds
+            .borrow()
+            .iter()
+            .find(|(key, _)| *key == field_slot(slot))
+            .map(|(_, bounds)| (bounds.size.width - slot.pad() * 2.).max(px(0.)))
+            .unwrap_or(px(0.))
     }
 
     /// The field's right-click menu: cut, copy, paste, select all.
@@ -750,32 +916,30 @@ impl DshFlowApp {
             .map(|(_, bounds)| *bounds)?;
         let field = self.field(slot)?;
 
-        let lines: Vec<&str> = field.text.split('\n').collect();
-        let block = field_multiline(slot);
+        let wraps = field_wraps(slot);
+        let width = (bounds.size.width - slot.pad() * 2.).max(px(0.));
+        let rows = field_rows(window.text_system(), &field.text, width, wraps);
         let offset = f32::from(position.y - bounds.top());
-        let row = field_row_at(offset, f32::from(bounds.size.height), lines.len(), block);
-        let start: usize = lines.iter().take(row).map(|line| line.len() + 1).sum();
-        let line = lines.get(row).copied().unwrap_or_default();
+        let row = field_row_at(
+            offset,
+            f32::from(bounds.size.height),
+            rows.len(),
+            field_multiline(slot),
+        );
+        let range = rows.get(row).cloned().unwrap_or(0..0);
+        let line = &field.text[range.clone()];
 
-        let runs = vec![gpui::TextRun {
-            len: line.len(),
-            font: gpui::font(".SystemUIFont"),
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }];
         let shaped = window.text_system().shape_line(
             line.to_string().into(),
             px(FIELD_FONT_SIZE),
-            &runs,
+            &field_runs(line.len()),
             None,
         );
-        // The row's padding is where the text starts, and the text may be
-        // scrolled left to keep a long line's caret in view.
-        let scroll = px(field.scroll());
-        let x = (position.x - bounds.left() - slot.pad() + scroll).max(px(0.));
-        Some(start + shaped.closest_index_for_x(x))
+        // The row's padding is where the text starts; only a one-line field may
+        // be scrolled left to keep a long line's caret in view.
+        let scroll = if wraps { 0. } else { field.scroll() };
+        let x = (position.x - bounds.left() - slot.pad() + px(scroll)).max(px(0.));
+        Some(range.start + shaped.closest_index_for_x(x))
     }
 }
 
@@ -874,24 +1038,32 @@ impl Element for FieldElement {
                 && app.caret_on
                 && let Some((text, caret, colour)) = app.field_caret(self.slot)
             {
-                let line_index = text[..caret].matches('\n').count();
-                let scroll = app
-                    .field(self.slot)
-                    .map(|field| field.scroll())
-                    .unwrap_or(0.);
-                let (caret_x, _) = caret_metrics(window, &text, caret);
+                let pad = self.slot.pad();
+                let wraps = field_wraps(self.slot);
+                let text_system = window.text_system().clone();
+                let inner = (bounds.size.width - pad * 2.).max(px(0.));
+                let rows = field_rows(&text_system, &text, inner, wraps);
+                let row = row_of_caret(&rows, caret);
+                let range = rows.get(row).cloned().unwrap_or(0..0);
+                let (caret_x, _) = row_caret_x(&text_system, &text, range, caret);
+                let scroll = if wraps {
+                    0.
+                } else {
+                    app.field(self.slot)
+                        .map(|field| field.scroll())
+                        .unwrap_or(0.)
+                };
                 let x = (caret_x - px(scroll)).max(px(0.));
                 // A block of lines starts under the box's top padding; a
                 // one-line field centres its line in the row. Measuring the
                 // same way the layout does is what keeps a multi-line caret
                 // on its own line.
-                let lines = text.split('\n').count().max(1);
                 let top = f32::from(bounds.size.height);
-                let text_top = field_text_top(top, lines, field_multiline(self.slot));
+                let text_top = field_text_top(top, rows.len(), field_multiline(self.slot));
                 let origin = point(
-                    bounds.left() + self.slot.pad() + x,
+                    bounds.left() + pad + x,
                     bounds.top()
-                        + px(text_top + COMPOSER_LINE_HEIGHT * line_index as f32 + CARET_INSET_Y),
+                        + px(text_top + COMPOSER_LINE_HEIGHT * row as f32 + CARET_INSET_Y),
                 );
                 window.paint_quad(PaintQuad {
                     bounds: Bounds::new(origin, size(px(1.), px(14.))),
@@ -972,32 +1144,30 @@ pub(crate) fn caret_metrics(window: &Window, text: &str, caret: usize) -> (Pixel
 
 pub(crate) fn field_spans(
     field: &TextField,
+    rows: &[Range<usize>],
     selection: Option<Range<usize>>,
+    marked: Option<Range<usize>>,
+    scroll: f32,
     palette: Palette,
 ) -> AnyElement {
-    let marked = field.marked();
-    let mut rows: Vec<AnyElement> = Vec::new();
-    let mut start = 0;
-    for line in field.text.split('\n') {
-        let end = start + line.len();
-        rows.push(field_line(
-            &field.text,
-            start..end,
-            selection.clone(),
-            marked.clone(),
-            palette,
-        ));
-        start = end + 1;
-    }
     div()
         .flex()
         .flex_col()
         .items_start()
         .min_w(px(0.))
-        // Shifted rather than translated: the row clips it, so a long line scrolls.
+        // Shifted rather than translated: the row clips it, so a long line
+        // scrolls sideways. A wrapping field passes 0 and folds instead.
         .relative()
-        .left(px(-field.scroll()))
-        .children(rows)
+        .left(px(-scroll))
+        .children(rows.iter().map(|row| {
+            field_line(
+                &field.text,
+                row.clone(),
+                selection.clone(),
+                marked.clone(),
+                palette,
+            )
+        }))
         .into_any_element()
 }
 

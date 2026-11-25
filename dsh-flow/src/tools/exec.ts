@@ -2,6 +2,9 @@
 
 import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
+import path from 'node:path'
 import { describeRuntime, resolveProjectRuntime } from '../runtime.ts'
 import type { ToolResult } from './types.ts'
 import {
@@ -158,6 +161,27 @@ interface SpawnSpec {
 }
 
 /**
+ * Resolve a bare executable against PATH for CreateProcessAsUser.
+ *
+ * The sandbox helper passes the application name explicitly; Windows does not
+ * search PATH for that form, so `node` / `python` from a runtime resolver must
+ * become an absolute path first.
+ */
+function absoluteFile(file: string, prepend: readonly string[] = []): string {
+  if (path.isAbsolute(file)) return file
+  const search = process.env.PATH ?? process.env.Path ?? ''
+  const names = file.toLowerCase().endsWith('.exe') ? [file] : [file, `${file}.exe`]
+  for (const dir of [...prepend, ...search.split(path.delimiter)]) {
+    if (dir === '') continue
+    for (const name of names) {
+      const candidate = path.join(dir, name)
+      if (existsSync(candidate)) return candidate
+    }
+  }
+  return file
+}
+
+/**
  * Start one process and wait for it, killing the whole tree on timeout.
  * @param spec - executable, arguments and how to start them.
  * @param cwd - resolved working directory.
@@ -177,14 +201,47 @@ function spawnProcess(
   input = ''
 ): Promise<ToolResult> {
   return new Promise((resolve) => {
-    const child = spawn(spec.file, spec.args, {
-      cwd,
-      shell: spec.shell,
-      windowsHide: true,
-      // Staying in the engine's group lets the window's stop kill it too.
-      stdio: [input === '' ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-      env: commandEnv(spec.pathPrepend ?? [])
-    })
+    // The window can hand commands to the Windows sandbox helper. It lowers the
+    // child to Low integrity and keeps it in a Job Object; the command sees the
+    // same stdio pipes, so the live rows and the timeout path are unchanged.
+    const helper = process.env.DSH_SANDBOX_HELPER
+    const workspace = process.env.DSH_SANDBOX_WORKSPACE || cwd
+    const env = commandEnv(spec.pathPrepend ?? [])
+    let child
+    if (helper && process.platform === 'win32') {
+      const dir = path.join(workspace, '.dsh-flow')
+      mkdirSync(dir, { recursive: true })
+      const specPath = path.join(
+        dir,
+        `sandbox-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}.json`
+      )
+      const payload = {
+        cwd,
+        workspace,
+        readonly: process.env.DSH_SANDBOX_READONLY === '1',
+        file: spec.shell ? process.env.ComSpec || 'cmd.exe' : absoluteFile(spec.file, spec.pathPrepend ?? []),
+        args: spec.shell ? ['/d', '/s', '/c', spec.file] : spec.args
+      }
+      writeFileSync(specPath, JSON.stringify(payload), 'utf8')
+      const temp = path.join(dir, 'sandbox-tmp')
+      env.TEMP = temp
+      env.TMP = temp
+      child = spawn(helper, ['--spec', specPath], {
+        cwd,
+        windowsHide: true,
+        stdio: [input === '' ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        env
+      })
+    } else {
+      child = spawn(spec.file, spec.args, {
+        cwd,
+        shell: spec.shell,
+        windowsHide: true,
+        // Staying in the engine's group lets the window's stop kill it too.
+        stdio: [input === '' ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+        env
+      })
+    }
     if (input !== '') child.stdin?.end(input)
     let failure = ''
     let timedOut = false
@@ -192,13 +249,27 @@ function spawnProcess(
     let live = Buffer.alloc(0)
     let liveAt = Date.now()
     let liveEncoding: 'utf-8' | 'gb18030' | null = null
+    // One decoder for the stream, so a character split across two chunks is
+    // completed instead of being painted as a replacement character. A fresh
+    // decoder per chunk was why a GBK stream's last character could break.
+    let liveDecoder: InstanceType<typeof TextDecoder> | null = null
     const outChunks: Buffer[] = []
     const errChunks: Buffer[] = []
     let outSize = 0
     let errSize = 0
 
-    /** Decode the newest line; the row only ever shows that one. */
-    const decodeLive = (bytes: Buffer): string => {
+    /**
+     * Decode one chunk; the row only ever shows its newest line.
+     *
+     * The decoder is kept for the whole stream and fed every byte, so a
+     * character split across two chunks is completed instead of being painted
+     * as a replacement character. Handing each chunk to a fresh decoder (and
+     * holding back a UTF-8-shaped tail) is what used to lose the last character
+     * of a GBK line.
+     * @param bytes - what arrived since the last flush.
+     * @param force - true on the final flush, when nothing else is coming.
+     */
+    const decodeLive = (bytes: Buffer, force: boolean): string => {
       if (
         bytes.length >= 2 &&
         ((bytes[0] === 0xff && bytes[1] === 0xfe) ||
@@ -206,60 +277,29 @@ function spawnProcess(
       ) {
         return decodeText(bytes)
       }
-      const newline = bytes.lastIndexOf(0x0a)
-      const line = newline >= 0 && newline + 1 < bytes.length ? bytes.subarray(newline + 1) : bytes
-      // Learn the stream's encoding from the first non-ASCII line; pure ASCII
-      // is valid in both, so it must not decide.
-      if (!line.some((byte) => byte >= 0x80)) return line.toString('utf8')
-      if (liveEncoding === null) {
+      if (liveDecoder === null) {
+        // Pure ASCII is valid in both encodings, so it must not decide.
+        if (!bytes.some((byte) => byte >= 0x80)) return bytes.toString('utf8')
         try {
-          new TextDecoder('utf-8', { fatal: true }).decode(trimUtf8Tail(line))
+          new TextDecoder('utf-8', { fatal: true }).decode(trimUtf8Tail(bytes))
           liveEncoding = 'utf-8'
-        } catch (error) {
+        } catch {
           liveEncoding = 'gb18030'
-          if (process.env.DSH_LIVE_DEBUG) console.error('strict failed', String(error), line.toString('hex'), trimUtf8Tail(line).toString('hex'))
         }
-        if (process.env.DSH_LIVE_DEBUG) console.error('learn', liveEncoding, line.toString('hex'))
+        liveDecoder = new TextDecoder(liveEncoding)
       }
-      let start = 0
-      if (liveEncoding === 'utf-8') {
-        while (start < line.length && (line[start] & 0xc0) === 0x80) start += 1
-      }
-      return new TextDecoder(liveEncoding).decode(line.subarray(start))
-    }
-    /**
-     * Bytes at the end that start a character a later chunk completes.
-     *
-     * A live row is a preview, so holding a few bytes back is invisible; decoding
-     * them now would paint a replacement character that never belonged to the
-     * stream.
-     */
-    const pendingTail = (bytes: Buffer): number => {
-      let index = bytes.length - 1
-      let continuations = 0
-      while (index >= 0 && (bytes[index] & 0xc0) === 0x80 && continuations < 3) {
-        index -= 1
-        continuations += 1
-      }
-      if (index < 0) return 0
-      const lead = bytes[index]
-      const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1
-      const have = bytes.length - index
-      return have < need ? have : 0
+      const decoded = liveDecoder.decode(bytes, { stream: !force })
+      const newline = decoded.lastIndexOf('\n')
+      return newline >= 0 && newline + 1 < decoded.length ? decoded.slice(newline + 1) : decoded
     }
     /** Forward what arrived since the last tick, at most a few times a second. */
     const flush = (force = false): void => {
       if (!onOutput || live.length === 0) return
       if (!force && Date.now() - liveAt < LIVE_OUTPUT_INTERVAL_MS) return
-      const all = live
-      // Keep an unfinished character for the next chunk; the final flush takes
-      // everything, since nothing else is coming.
-      const keep = force ? 0 : pendingTail(all)
-      const bytes = keep === 0 ? all : all.subarray(0, all.length - keep)
-      live = keep === 0 ? Buffer.alloc(0) : Buffer.from(all.subarray(all.length - keep))
+      const bytes = live
+      live = Buffer.alloc(0)
       liveAt = Date.now()
-      if (bytes.length === 0) return
-      const text = stripAnsi(decodeLive(bytes))
+      const text = stripAnsi(decodeLive(bytes, force))
       if (text.trim() === '') return
       try {
         onOutput(text)

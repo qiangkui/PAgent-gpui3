@@ -235,8 +235,7 @@ fn started_at_ms(text: &str) -> Option<u64> {
     let hour = number(11, 13)?;
     let minute = number(14, 16)?;
     let second = number(17, 19)?;
-    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60
-    {
+    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
     let millis = text
@@ -261,8 +260,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let year_of_era = year - era * 400;
     let shifted_month = i64::from(month) + 9;
     let day_of_year = (153 * (shifted_month % 12) + 2) / 5 + i64::from(day) - 1;
-    let day_of_era =
-        year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
 }
 
@@ -301,15 +299,7 @@ fn process_started_ms(pid: u32) -> Option<u64> {
     let mut exit = FileTime::default();
     let mut kernel = FileTime::default();
     let mut user = FileTime::default();
-    let ok = unsafe {
-        GetProcessTimes(
-            handle,
-            &mut creation,
-            &mut exit,
-            &mut kernel,
-            &mut user,
-        )
-    };
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
     unsafe { CloseHandle(handle) };
     if ok == 0 {
         return None;
@@ -669,6 +659,7 @@ impl DshFlowApp {
                                 .id(SharedString::from(format!("task-log-{}", task.id)))
                                 .max_h(px(190.))
                                 .overflow_y_scroll()
+                                .contained_wheel()
                                 .track_scroll(&self.task_log_scroll)
                                 .rounded_md()
                                 .bg(rgb(palette.background))

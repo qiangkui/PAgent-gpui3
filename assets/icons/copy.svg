@@ -1,8 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- Two sheets, both outlined so the shape still reads at 13px. Alpha only;
-       the theme supplies the colour. -->
-  <g fill="none" stroke="#000" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round">
-    <path d="M8.6 5.6h8.2A1.6 1.6 0 0 1 18.4 7.2v8.4"/>
-    <rect x="5" y="9.4" width="9.6" height="9.6" rx="1.6"/>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke-width="1"><!-- Copy: two sheets, beside a message. From the dsh product icon set, regular weight. --><rect x="1.52075" y="4.07373" width="10.3932" height="10.3932" rx="2" stroke="currentColor"></rect><path d="M11.9792 1.53296C13.36 1.53296 14.4792 2.65225 14.4792 4.03296V9.42847C14.4792 10.3756 13.9521 11.1987 13.1755 11.6228V10.3298C13.3652 10.0787 13.4792 9.7674 13.4792 9.42847V4.03296C13.4792 3.20453 12.8077 2.53296 11.9792 2.53296H6.58374C6.27966 2.53301 5.99684 2.6235 5.7605 2.77905H4.42358C4.85652 2.03463 5.66056 1.53304 6.58374 1.53296H11.9792Z" fill="currentColor"></path></svg>

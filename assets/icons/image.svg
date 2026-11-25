@@ -1,7 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- A framed picture: the "图片" attachment option. -->
-  <g fill="#000">
-    <path fill-rule="evenodd" d="M6.5 2h11A2.5 2.5 0 0 1 20 4.5v15a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2zm0 2v11.1l3.3-3.3a1.5 1.5 0 0 1 2.1 0l2.3 2.3 1.6-1.6a1.5 1.5 0 0 1 2.2 0l2 2V4h-13z"/>
-    <circle cx="9" cy="8" r="1.8"/>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none" stroke-width="1"><!-- Image file: a framed landscape, the ?? option in the attach menu. Drawn here on the dsh grid (1px stroke, 16 units) because the set has no picture glyph. --><rect x="1.5" y="2.5" width="13" height="11" rx="2" stroke="currentColor"></rect><circle cx="5.4" cy="6.1" r="1.1" stroke="currentColor"></circle><path d="M2.1 12.1L5.7 8.9C6 8.65 6.4 8.65 6.7 8.9L9.1 11L11 9.3C11.3 9.05 11.7 9.05 12 9.3L13.9 10.95" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"></path></svg>

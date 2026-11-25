@@ -20,7 +20,13 @@ const STATS_TILE_WIDTH: f32 = 266.;
 /// Width of one chart card: two cards and one gap fill the area exactly.
 const STATS_CARD_WIDTH: f32 = 405.;
 /// Height of the three summary tiles on the first row.
-const STATS_TILE_HEIGHT: f32 = 128.;
+///
+/// The surface pads 16px top and bottom and puts 8px between its three lines.
+/// GPUI gives a line box the golden ratio of its font size by default, so the
+/// 16px label, the 30px figure and the 12px note need 26 + 49 + 19 pixels:
+/// 142 all told. At 128 the note — the only child that truncates, and therefore
+/// the only one allowed to shrink — collapsed to a sliver of glyph tops.
+const STATS_TILE_HEIGHT: f32 = 144.;
 /// Height of a chart card placed two per row, so the pair always matches.
 const STATS_CARD_HEIGHT: f32 = 260.;
 /// Height of the full-width Token 用量 card.
@@ -199,6 +205,20 @@ pub(crate) struct StatsPoint {
     pub(crate) context: u64,
     /// Tool calls the question made; zero when the save did not record them.
     pub(crate) tools: u64,
+    /// Prompt tokens the provider served from its cache.
+    pub(crate) cache_hits: u64,
+    /// Prompt tokens the question sent, summed over its rounds.
+    pub(crate) prompt_tokens: u64,
+    /// Wall clock spent waiting for model round trips, in milliseconds.
+    pub(crate) model_ms: u64,
+    /// Wall clock spent running tools, in milliseconds.
+    pub(crate) tool_ms: u64,
+    /// Searches the provider ran on its side for the question.
+    pub(crate) web_searches: u32,
+    /// Pages the provider opened or read for the question.
+    pub(crate) web_fetches: u32,
+    /// Thinking tokens the question produced, summed over its rounds.
+    pub(crate) reasoning_tokens: u64,
     /// True when the time is the conversation's last change, not the answer's.
     pub(crate) estimated: bool,
 }
@@ -225,6 +245,14 @@ pub(crate) struct ModelShare {
     pub(crate) requests: u64,
     /// Tokens it was billed for.
     pub(crate) tokens: u64,
+    /// Prompt tokens the provider served from its cache, for this model.
+    pub(crate) cache_hits: u64,
+    /// Prompt tokens its requests sent, summed over rounds.
+    pub(crate) prompt_tokens: u64,
+    /// Wall clock it spent on model round trips, in milliseconds.
+    pub(crate) model_ms: u64,
+    /// Wall clock its tools spent, in milliseconds.
+    pub(crate) tool_ms: u64,
 }
 
 /// Everything the cards show, built once per window.
@@ -240,6 +268,20 @@ pub(crate) struct StatsReport {
     pub(crate) tools: u64,
     /// Prompt tokens of the last rounds in the window.
     pub(crate) prompt: u64,
+    /// Prompt tokens the provider served from its cache in the window.
+    pub(crate) cache_hits: u64,
+    /// Prompt tokens the window's requests sent, summed over their rounds.
+    pub(crate) prompt_tokens: u64,
+    /// Wall clock the window spent waiting for model round trips.
+    pub(crate) model_ms: u64,
+    /// Wall clock the window spent running tools.
+    pub(crate) tool_ms: u64,
+    /// Searches the provider ran on its own side in the window.
+    pub(crate) web_searches: u64,
+    /// Pages those searches or questions opened.
+    pub(crate) web_fetches: u64,
+    /// Thinking tokens the window's questions produced.
+    pub(crate) reasoning_tokens: u64,
     /// Conversations that answered at least once in the window.
     pub(crate) chats: u64,
     /// Models, busiest first.
@@ -254,6 +296,15 @@ impl StatsReport {
     /// Tokens per request across the window; zero when nothing was asked.
     pub(crate) fn average_tokens(&self) -> u64 {
         self.tokens.checked_div(self.requests).unwrap_or(0)
+    }
+
+    /// The window's cache share, when an endpoint reported hits at all.
+    ///
+    /// `None` rather than 0%: an endpoint that never reports cache hits would
+    /// otherwise read as a cache that never worked.
+    pub(crate) fn cache_rate(&self) -> Option<f64> {
+        (self.cache_hits > 0 && self.prompt_tokens > 0)
+            .then(|| self.cache_hits.min(self.prompt_tokens) as f64 / self.prompt_tokens as f64)
     }
 }
 
@@ -387,6 +438,13 @@ pub(crate) fn stats_points_for(
                     tokens: request.tokens,
                     context: request.context,
                     tools,
+                    cache_hits: request.cache_hits,
+                    prompt_tokens: request.prompt_tokens,
+                    model_ms: request.model_ms,
+                    tool_ms: request.tool_ms,
+                    web_searches: request.web_searches,
+                    web_fetches: request.web_fetches,
+                    reasoning_tokens: u64::from(request.reasoning_tokens),
                     estimated: false,
                 });
             }
@@ -422,6 +480,8 @@ pub(crate) fn stats_points_for(
                     pending_tools = 0;
                     pending_question = turn_label(&message.text);
                 }
+                // Interaction cards are not user questions or answers.
+                Role::Question | Role::Plan => {}
                 Role::Assistant => {
                     turn = turn.saturating_add(1);
                     let recorded: u64 = message
@@ -440,6 +500,11 @@ pub(crate) fn stats_points_for(
                     } else {
                         message.model.clone()
                     };
+                    let prompt_tokens: u64 = message
+                        .round_tokens
+                        .iter()
+                        .map(|(prompt, _, _)| *prompt)
+                        .sum();
                     points.push(StatsPoint {
                         at_ms: chat.updated_ms,
                         chat: chat.dir.clone(),
@@ -450,10 +515,21 @@ pub(crate) fn stats_points_for(
                         tokens: message.tokens,
                         context: message.context,
                         tools,
+                        cache_hits: message.cache_hits,
+                        prompt_tokens,
+                        model_ms: message.model_ms,
+                        tool_ms: message.tool_ms,
+                        web_searches: 0,
+                        web_fetches: 0,
+                        reasoning_tokens: message
+                            .round_reasoning
+                            .iter()
+                            .map(|count| u64::from(*count))
+                            .sum(),
                         estimated: true,
                     });
                 }
-                Role::Note | Role::Approval => {}
+                Role::Note | Role::Approval | Role::Thinking => {}
             }
         }
     }
@@ -474,6 +550,13 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
         tokens: 0,
         tools: 0,
         prompt: 0,
+        cache_hits: 0,
+        prompt_tokens: 0,
+        model_ms: 0,
+        tool_ms: 0,
+        web_searches: 0,
+        web_fetches: 0,
+        reasoning_tokens: 0,
         chats: 0,
         models: Vec::new(),
         start_ms,
@@ -496,6 +579,19 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
         report.tokens = report.tokens.saturating_add(point.tokens);
         report.tools = report.tools.saturating_add(point.tools);
         report.prompt = report.prompt.saturating_add(point.context);
+        report.cache_hits = report.cache_hits.saturating_add(point.cache_hits);
+        report.prompt_tokens = report.prompt_tokens.saturating_add(point.prompt_tokens);
+        report.model_ms = report.model_ms.saturating_add(point.model_ms);
+        report.tool_ms = report.tool_ms.saturating_add(point.tool_ms);
+        report.web_searches = report
+            .web_searches
+            .saturating_add(u64::from(point.web_searches));
+        report.web_fetches = report
+            .web_fetches
+            .saturating_add(u64::from(point.web_fetches));
+        report.reasoning_tokens = report
+            .reasoning_tokens
+            .saturating_add(point.reasoning_tokens);
         report.estimated |= point.estimated;
         let name = point.model.trim();
         let name = if name.is_empty() {
@@ -507,9 +603,17 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
             model: name.to_string(),
             requests: 0,
             tokens: 0,
+            cache_hits: 0,
+            prompt_tokens: 0,
+            model_ms: 0,
+            tool_ms: 0,
         });
         entry.requests = entry.requests.saturating_add(1);
         entry.tokens = entry.tokens.saturating_add(point.tokens);
+        entry.cache_hits = entry.cache_hits.saturating_add(point.cache_hits);
+        entry.prompt_tokens = entry.prompt_tokens.saturating_add(point.prompt_tokens);
+        entry.model_ms = entry.model_ms.saturating_add(point.model_ms);
+        entry.tool_ms = entry.tool_ms.saturating_add(point.tool_ms);
     }
     for (index, filled) in seen.iter().enumerate() {
         buckets[index].chats = filled.len() as u64;
@@ -553,6 +657,13 @@ pub(crate) fn ledger_record(
         tokens: request.tokens,
         context: request.context,
         tools,
+        cache_hits: request.cache_hits,
+        prompt_tokens: request.prompt_tokens,
+        model_ms: request.model_ms,
+        tool_ms: request.tool_ms,
+        web_searches: request.web_searches,
+        web_fetches: request.web_fetches,
+        reasoning_tokens: u64::from(request.reasoning_tokens),
         estimated: false,
     }
 }
@@ -569,6 +680,13 @@ fn point_from_record(record: crate::stats_store::StatsRecord) -> StatsPoint {
         tokens: record.tokens,
         context: record.context,
         tools: record.tools,
+        cache_hits: record.cache_hits,
+        prompt_tokens: record.prompt_tokens,
+        model_ms: record.model_ms,
+        tool_ms: record.tool_ms,
+        web_searches: record.web_searches,
+        web_fetches: record.web_fetches,
+        reasoning_tokens: record.reasoning_tokens,
         estimated: record.estimated,
     }
 }
@@ -586,6 +704,13 @@ fn record_from_point(point: StatsPoint) -> crate::stats_store::StatsRecord {
         tokens: point.tokens,
         context: point.context,
         tools: point.tools,
+        cache_hits: point.cache_hits,
+        prompt_tokens: point.prompt_tokens,
+        model_ms: point.model_ms,
+        tool_ms: point.tool_ms,
+        web_searches: 0,
+        web_fetches: 0,
+        reasoning_tokens: point.reasoning_tokens,
         estimated: point.estimated,
     }
 }
@@ -609,6 +734,13 @@ fn report_from_daily(
         tokens: 0,
         tools: 0,
         prompt: 0,
+        cache_hits: 0,
+        prompt_tokens: 0,
+        model_ms: 0,
+        tool_ms: 0,
+        web_searches: 0,
+        web_fetches: 0,
+        reasoning_tokens: 0,
         chats: 0,
         models: Vec::new(),
         start_ms,
@@ -633,17 +765,36 @@ fn report_from_daily(
         report.tokens = report.tokens.saturating_add(day.tokens);
         report.tools = report.tools.saturating_add(day.tools);
         report.prompt = report.prompt.saturating_add(day.prompt);
+        report.cache_hits = report.cache_hits.saturating_add(day.cache_hits);
+        report.prompt_tokens = report.prompt_tokens.saturating_add(day.prompt_tokens);
+        report.model_ms = report.model_ms.saturating_add(day.model_ms);
+        report.tool_ms = report.tool_ms.saturating_add(day.tool_ms);
+        report.web_searches = report.web_searches.saturating_add(day.web_searches);
+        report.web_fetches = report.web_fetches.saturating_add(day.web_fetches);
+        report.reasoning_tokens = report.reasoning_tokens.saturating_add(day.reasoning_tokens);
         report.estimated |= day.estimated;
         for (name, counts) in &day.models {
             let name = name.trim();
-            let name = if name.is_empty() { "未知模型" } else { name };
+            let name = if name.is_empty() {
+                "未知模型"
+            } else {
+                name
+            };
             let entry = models.entry(name.to_string()).or_insert(ModelShare {
                 model: name.to_string(),
                 requests: 0,
                 tokens: 0,
+                cache_hits: 0,
+                prompt_tokens: 0,
+                model_ms: 0,
+                tool_ms: 0,
             });
             entry.requests = entry.requests.saturating_add(counts.requests);
             entry.tokens = entry.tokens.saturating_add(counts.tokens);
+            entry.cache_hits = entry.cache_hits.saturating_add(counts.cache_hits);
+            entry.prompt_tokens = entry.prompt_tokens.saturating_add(counts.prompt_tokens);
+            entry.model_ms = entry.model_ms.saturating_add(counts.model_ms);
+            entry.tool_ms = entry.tool_ms.saturating_add(counts.tool_ms);
         }
     }
     for (index, filled) in seen.iter().enumerate() {
@@ -830,6 +981,7 @@ impl DshFlowApp {
             Column::text("模型", 120.),
             Column::count("计费", 64.),
             Column::count("上下文", 64.),
+            Column::count("思考", 56.),
             Column::count("工具", 56.),
         ];
         // The scan keeps every request of the conversations that changed in the
@@ -841,7 +993,12 @@ impl DshFlowApp {
                 .saturating_mul(self.stats_range.buckets() as u64),
         );
         let mut rows: Vec<Row> = Vec::new();
-        for (index, point) in self.stats_points_cached().unwrap_or_default().iter().enumerate() {
+        for (index, point) in self
+            .stats_points_cached()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
             if point.at_ms < report.start_ms || point.at_ms >= end_ms {
                 continue;
             }
@@ -886,6 +1043,11 @@ impl DshFlowApp {
                     }),
                     Value::Count(point.tokens),
                     Value::Count(point.context),
+                    if point.reasoning_tokens == 0 {
+                        Value::Faint("—".to_string())
+                    } else {
+                        Value::Count(point.reasoning_tokens)
+                    },
                     if point.tools == 0 {
                         Value::Faint("—".to_string())
                     } else {
@@ -970,7 +1132,52 @@ impl DshFlowApp {
                 format!("每问平均 {tools_average} 次"),
                 palette.warn,
                 palette,
-            ));
+            ))
+            // A cache share needs hits to have been reported, so the tile
+            // appears on its own rather than as a permanent zero.
+            .when_some(report.cache_rate(), |this, rate| {
+                this.child(summary_tile(
+                    "缓存命中",
+                    share_text(true, rate),
+                    format!(
+                        "命中 {} / 提示 {}",
+                        short_count(report.cache_hits),
+                        short_count(report.prompt_tokens)
+                    ),
+                    palette.ok,
+                    palette,
+                ))
+            })
+            // Thinking is billed as output but never rides in a prompt, so the
+            // window keeps it as its own figure beside the token total.
+            .when(report.reasoning_tokens > 0, |this| {
+                this.child(summary_tile(
+                    "思考 token",
+                    short_count(report.reasoning_tokens),
+                    if report.tokens > 0 {
+                        format!(
+                            "占输出 {}",
+                            share_text(true, report.reasoning_tokens as f64 / report.tokens as f64)
+                        )
+                    } else {
+                        "各轮估算合计".to_string()
+                    },
+                    palette.sky,
+                    palette,
+                ))
+            })
+            // Server-side searching costs tokens like anything else, so the
+            // window keeps its own count; the tile appears only once a
+            // provider actually searched.
+            .when(report.web_searches > 0, |this| {
+                this.child(summary_tile(
+                    "联网搜索",
+                    format!("{} 次", full_count(report.web_searches)),
+                    format!("读页 {} 次", full_count(report.web_fetches)),
+                    palette.running,
+                    palette,
+                ))
+            });
         // The four chart cards go two per row, each pair sharing width and
         // height so the band reads as a grid rather than a wrapping strip.
         let chart_rows = div()
@@ -1608,6 +1815,23 @@ fn models_card(report: &StatsReport, palette: Palette) -> AnyElement {
                 .rounded_full()
                 .bg(rgb(palette.accent))
         };
+        // A model's cache share rides in the same line as its counts; a model
+        // the endpoint never reported hits for shows only the counts.
+        let cache = (model.cache_hits > 0 && model.prompt_tokens > 0)
+            .then(|| model.cache_hits.min(model.prompt_tokens) as f64 / model.prompt_tokens as f64);
+        let summary = match cache {
+            Some(rate) => format!(
+                "{} 次 · {} · 缓存 {}",
+                short_count(model.requests),
+                short_count(model.tokens),
+                share_text(true, rate)
+            ),
+            None => format!(
+                "{} 次 · {}",
+                short_count(model.requests),
+                short_count(model.tokens)
+            ),
+        };
         rows = rows.child(
             div()
                 .flex()
@@ -1637,11 +1861,7 @@ fn models_card(report: &StatsReport, palette: Palette) -> AnyElement {
                                 .flex_shrink_0()
                                 .text_xs()
                                 .text_color(rgb(palette.muted))
-                                .child(format!(
-                                    "{} 次 · {}",
-                                    short_count(model.requests),
-                                    short_count(model.tokens)
-                                )),
+                                .child(summary),
                         ),
                 )
                 .child(
@@ -1689,8 +1909,32 @@ mod tests {
             tokens,
             context,
             tools,
+            cache_hits: 0,
+            prompt_tokens: 0,
+            model_ms: 0,
+            tool_ms: 0,
+            web_searches: 0,
+            web_fetches: 0,
+            reasoning_tokens: 0,
             estimated: false,
         }
+    }
+
+    #[test]
+    fn a_summary_tile_has_room_for_its_note() {
+        // A line box defaults to the golden ratio of the font size, and the tile
+        // adds 16px of padding on both sides plus two 8px gaps. The note is the
+        // only child that truncates, so a short tile silently squeezes it away
+        // instead of pushing the card taller.
+        let lines: f32 = [16., 30., 12.]
+            .into_iter()
+            .map(|font| (font * std::f32::consts::GOLDEN_RATIO).round())
+            .sum();
+        let needed = 16. * 2. + 8. * 2. + lines;
+        assert!(
+            STATS_TILE_HEIGHT >= needed,
+            "the note needs {needed}px, the tile gives it {STATS_TILE_HEIGHT}px"
+        );
     }
 
     #[test]
@@ -1797,10 +2041,51 @@ mod tests {
         assert_eq!(empty.requests, 0);
         assert_eq!(empty.tools, 0);
         assert_eq!(empty.average_tokens(), 0);
+        // Nothing reported a cache or a clock, so neither figure is invented.
+        assert!(empty.cache_rate().is_none());
+        assert_eq!(empty.model_ms, 0);
+        assert_eq!(empty.tool_ms, 0);
         assert!(empty.models.is_empty());
         assert_eq!(empty.buckets.len(), 12);
     }
 
+    #[test]
+    fn the_report_sums_cache_and_time_with_the_tokens() {
+        let now = 20_780 * DAY_MS + 12 * HOUR_MS;
+        let range = StatsRange::Week;
+        let (start, _) = range.window(now);
+        let mut first = point(start + HOUR_MS, "chat-1", "m1", 100, 80, 1);
+        first.cache_hits = 640;
+        first.prompt_tokens = 1_000;
+        first.model_ms = 2_100;
+        first.tool_ms = 640;
+        first.reasoning_tokens = 1_200;
+        first.web_searches = 2;
+        first.web_fetches = 1;
+        let mut second = point(start + 2 * HOUR_MS, "chat-2", "m1", 50, 30, 0);
+        second.model_ms = 400;
+        // A request from before the fields existed contributes no cache and no
+        // clock, so it cannot drag the share down.
+        let older = point(start + 3 * HOUR_MS, "chat-3", "m2", 20, 10, 0);
+        let report = stats_report(&[first, second, older], range, now);
+        assert_eq!(report.cache_hits, 640);
+        assert_eq!(report.prompt_tokens, 1_000);
+        assert_eq!(report.model_ms, 2_500);
+        assert_eq!(report.tool_ms, 640);
+        assert_eq!(report.reasoning_tokens, 1_200);
+        assert_eq!(report.web_searches, 2);
+        assert_eq!(report.web_fetches, 1);
+        let rate = report.cache_rate().expect("hits were reported");
+        assert!((rate - 0.64).abs() < 1e-6, "rate {rate}");
+        // The same figures land on the model that produced them.
+        let m1 = report
+            .models
+            .iter()
+            .find(|model| model.model == "m1")
+            .expect("m1 answered");
+        assert_eq!(m1.cache_hits, 640);
+        assert_eq!(m1.model_ms, 2_500);
+    }
     #[test]
     fn a_conversation_without_requests_is_placed_at_its_last_change() {
         let now = 20_780 * DAY_MS + 12 * HOUR_MS;
@@ -1856,6 +2141,14 @@ mod tests {
             tokens: 42,
             context: 30,
             calls: 4,
+            cache_hits: 0,
+            prompt_tokens: 0,
+            model_ms: 0,
+            tool_ms: 0,
+            web_searches: 0,
+            web_fetches: 0,
+            reasoning: String::new(),
+            reasoning_tokens: 0,
             items: vec![
                 StoredRequestItem {
                     kind: ContextKind::User.key().to_string(),
@@ -1923,7 +2216,7 @@ mod tests {
         assert_eq!(points[1].turn, 2);
         assert_eq!(points[1].question, "第二个问题");
     }
-#[test]
+    #[test]
     fn daily_rollups_supply_quarter_cards() {
         let now = 20_780 * DAY_MS + 12 * HOUR_MS;
         let range = StatsRange::Quarter;
@@ -1942,6 +2235,10 @@ mod tests {
             crate::stats_store::ModelCount {
                 requests: 2,
                 tokens: 100,
+                cache_hits: 0,
+                prompt_tokens: 0,
+                model_ms: 0,
+                tool_ms: 0,
             },
         );
         let mut second = crate::stats_store::DayRollup {
@@ -1958,6 +2255,10 @@ mod tests {
             crate::stats_store::ModelCount {
                 requests: 1,
                 tokens: 50,
+                cache_hits: 0,
+                prompt_tokens: 0,
+                model_ms: 0,
+                tool_ms: 0,
             },
         );
         let report = report_from_daily(&[first, second], range, now);

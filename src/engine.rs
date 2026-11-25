@@ -361,12 +361,19 @@ pub fn engine_ready(engine_dir: &Path) -> bool {
 /// binary, so "is it there, and which version" is the first question a broken
 /// install raises.
 pub fn node_version() -> Option<String> {
-    let output = Command::new("node")
+    let mut command = Command::new("node");
+    command
         .arg("--version")
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        .stderr(Stdio::null());
+    // The UI is a window app: node is a console program, so without this the
+    // check would open a console window of its own.
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command.output().ok()?;
     if !output.status.success() {
         return None;
     }

@@ -4,9 +4,10 @@ import {
   askModel,
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
+  historyMessages,
   listModels,
   MAX_HISTORY,
-  MAX_HISTORY_CHARS
+  MAX_HISTORY_TOKENS
 } from '../src/ai.ts'
 
 /** One captured request. */
@@ -32,6 +33,32 @@ function stubFetch(body: unknown, status = 200): { fetchImpl: typeof fetch; call
   }) as unknown as typeof fetch
   return { fetchImpl, calls }
 }
+
+test('sends the thinking choice with a one-shot question', async () => {
+  const stub = stubFetch({ choices: [{ message: { content: 'ok' } }] })
+  await askModel(
+    { prompt: 'hi', apiKey: 'sk-test', reasoning: 'off' },
+    { fetchImpl: stub.fetchImpl, env: {} }
+  )
+  const body = JSON.parse(String(stub.calls[0].init.body)) as {
+    thinking?: { type: string }
+    reasoning_effort?: string
+  }
+  assert.deepEqual(body.thinking, { type: 'disabled' })
+  assert.equal(body.reasoning_effort, undefined)
+})
+
+test('history keeps the server calls an assistant turn carried', () => {
+  // Passing them back is what lets the provider restore the pages it read.
+  const call = { id: 's1', kind: 'search', action: { queries: ['x'] } }
+  const messages = historyMessages([
+    { role: 'user', content: '问' },
+    { role: 'assistant', content: '答', serverToolCalls: [call] }
+  ])
+  assert.equal(messages.length, 2)
+  assert.equal(messages[0].server_tool_calls, undefined, 'a user turn carries none')
+  assert.deepEqual(messages[1].server_tool_calls, [call])
+})
 
 test('sends the prompt to the chat completions endpoint', async () => {
   const stub = stubFetch({ choices: [{ message: { content: ' 你好 ' } }], usage: { total_tokens: 5 } })
@@ -96,7 +123,9 @@ test('surfaces the provider error message', async () => {
   const stub = stubFetch({ error: { message: 'Authentication Fails' } }, 401)
   await assert.rejects(
     askModel({ prompt: 'hi', apiKey: 'bad' }, { fetchImpl: stub.fetchImpl, env: {} }),
-    /deepseek-chat 调用失败：Authentication Fails/
+    // The label names the model that was actually called, so it follows the
+    // default rather than a hard-coded id.
+    new RegExp(`${DEFAULT_MODEL} 调用失败：Authentication Fails`)
   )
 })
 
@@ -146,9 +175,11 @@ test('keeps only the most recent turns', async () => {
   assert.equal(body.messages[body.messages.length - 1].content, 'now')
 })
 
-test('drops the oldest turns past the character budget', async () => {
+test('drops the oldest turns past the token budget', async () => {
   const stub = stubFetch({ choices: [{ message: { content: 'ok' } }] })
-  const big = '字'.repeat(MAX_HISTORY_CHARS / 2 + 1)
+  // Chinese text is about one token per character, so this is the unit the
+  // budget is expressed in.
+  const big = '字'.repeat(MAX_HISTORY_TOKENS / 2 + 1)
   await askModel(
     {
       prompt: 'now',
@@ -173,7 +204,7 @@ test('drops the oldest turns past the character budget', async () => {
 
 test('keeps one oversized turn instead of sending no history at all', async () => {
   const stub = stubFetch({ choices: [{ message: { content: 'ok' } }] })
-  const big = '字'.repeat(MAX_HISTORY_CHARS + 1)
+  const big = '字'.repeat(MAX_HISTORY_TOKENS + 1)
   await askModel(
     { prompt: 'now', apiKey: 'sk-test', history: [{ role: 'user', content: big }] },
     { fetchImpl: stub.fetchImpl, env: {} }

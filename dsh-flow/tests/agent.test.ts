@@ -8,6 +8,7 @@ import {
   MAX_CALLS,
   MAX_TOOL_CONTEXT,
   MAX_TOOL_MESSAGE,
+  MAX_WIRE_ARGUMENTS,
   runAgent,
   summarise
 } from '../src/agent.ts'
@@ -34,6 +35,191 @@ test('answers without calling a tool', async () => {
   assert.equal(stub.calls[0].body.tools !== undefined, true, 'tools are declared')
 })
 
+test('sends the thinking effort the window chose', async () => {
+  const stub = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', reasoning: 'max' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.equal(stub.calls[0].body.reasoning_effort, 'max')
+  assert.equal(stub.calls[0].body.thinking, undefined, 'thinking stays on')
+})
+
+test('turns thinking off when the window asks', async () => {
+  const stub = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', reasoning: 'off' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.deepEqual(stub.calls[0].body.thinking, { type: 'disabled' })
+  assert.equal(stub.calls[0].body.reasoning_effort, undefined, 'no effort without thinking')
+  // Nothing was thought, so the figure the window shows stays at zero.
+  assert.deepEqual(result.roundReasoning, [0])
+})
+
+test('leaves thinking to the endpoint when the window sends no choice', async () => {
+  const stub = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.equal(stub.calls[0].body.thinking, undefined)
+  assert.equal(stub.calls[0].body.reasoning_effort, undefined)
+})
+
+test('a search that has started is reported before the answer lands', async () => {
+  const sse = [
+    'data: {"choices":[{"delta":{},"server_tool_event":{"type":"call_started","step":1,"call":{"id":"s1","kind":"search","action":{"queries":["x"]}}}}]}\n\n',
+    'data: {"choices":[{"delta":{"content":"OK","server_tool_calls":[{"id":"s1","kind":"search","action":{"queries":["x"]},"status":"completed","sources":[{"title":"X","url":"https://example.com/x"}]}]},"finish_reason":"stop"}]}\n\n',
+    'data: [DONE]\n\n'
+  ].join('')
+  const fetchImpl = (async () =>
+    new Response(sse, { headers: { 'content-type': 'text/event-stream' } })) as unknown as typeof fetch
+  const started: Array<[string, string, string]> = []
+  const steps: AgentStep[] = []
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', webSearch: true },
+    {
+      fetchImpl,
+      env: {},
+      root: await workspace(),
+      onToolStart: (call, tool, target) => started.push([call, tool, target]),
+      onStep: (step) => steps.push(step)
+    }
+  )
+  assert.deepEqual(started, [['round-1-1', 'web_search', 'x']], 'a running row is opened as the search starts')
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].call, 'round-1-1', 'the finished row reuses the live id')
+  assert.equal(result.text, 'OK')
+})
+
+test('declares the server tools and shows what they found', async () => {
+  const search = {
+    choices: [
+      {
+        message: {
+          content: '今天发布了 V4。',
+          server_tool_calls: [
+            {
+              id: 'search_1',
+              type: 'deepseek_web_search',
+              kind: 'search',
+              action: { type: 'search', queries: ['DeepSeek V4 发布'] },
+              status: 'completed',
+              sources: [{ title: 'DeepSeek', url: 'https://example.com/v4' }]
+            }
+          ],
+          annotations: [{ type: 'url_citation', url: 'https://example.com/v4', title: 'DeepSeek' }]
+        },
+        finish_reason: 'stop'
+      }
+    ]
+  }
+  const stub = stubFetch([search])
+  const steps: AgentStep[] = []
+  const result = await runAgent(
+    { prompt: '今天有什么新消息？', apiKey: 'sk-test', webSearch: true },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace(), onStep: (step) => steps.push(step) }
+  )
+  const tools = stub.calls[0].body.tools as Array<{ type: string }>
+  assert.deepEqual(
+    tools.slice(0, 2).map((tool) => tool.type),
+    ['deepseek_web_search', 'deepseek_read_url'],
+    'the server tools ride in front of the function tools'
+  )
+  assert.equal(steps.length, 1)
+  assert.equal(steps[0].tool, 'web_search')
+  assert.equal(steps[0].target, 'DeepSeek V4 发布')
+  assert.equal(steps[0].detail, '1 个来源')
+  assert.equal(result.text, '今天发布了 V4。')
+  assert.equal(result.webSearch.searches, 1)
+  assert.deepEqual(result.webSearch.sources, [{ title: 'DeepSeek', url: 'https://example.com/v4' }])
+})
+
+test('no server tools are declared unless the window asks', async () => {
+  const stub = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  const tools = stub.calls[0].body.tools as Array<{ type: string }>
+  assert.equal(tools.length > 0, true, 'the local tools are still declared')
+  assert.equal(
+    tools.every((tool) => tool.type === 'function'),
+    true,
+    'no server tool is sent by default'
+  )
+})
+
+test('a gateway that refuses the server tools still answers', async () => {
+  const seen: Array<Array<{ type?: string }>> = []
+  const bodies = [
+    { error: { message: 'unknown tool type deepseek_web_search' } },
+    { choices: [{ message: { content: '好的' } }], finish_reason: 'stop' }
+  ]
+  const fetchImpl = (async (_url: string, init: RequestInit) => {
+    const body = JSON.parse(String(init.body)) as { tools?: Array<{ type?: string }> }
+    seen.push(body.tools ?? [])
+    const answer = bodies[Math.min(seen.length - 1, bodies.length - 1)]
+    const status = seen.length === 1 ? 400 : 200
+    return new Response(JSON.stringify(answer), {
+      status,
+      headers: { 'content-type': 'application/json' }
+    })
+  }) as unknown as typeof fetch
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', webSearch: true },
+    { fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.equal(result.text, '好的')
+  assert.equal(seen.length, 2, 'the round is sent again without the server tools')
+  assert.equal(
+    seen[1].every((tool) => tool.type !== 'deepseek_web_search' && tool.type !== 'deepseek_read_url'),
+    true,
+    'the retry keeps the local tools only'
+  )
+})
+
+test('an answer refused by review says so instead of "no content"', async () => {
+  const stub = stubFetch([
+    { choices: [{ message: { content: '' }, finish_reason: 'content_filter' }] }
+  ])
+  await assert.rejects(
+    runAgent(
+      { prompt: 'hi', apiKey: 'sk-test' },
+      { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+    ),
+    (error: Error) => error.message.includes('content_filter')
+  )
+})
+
+test('the thinking choice reaches the summary round too', async () => {
+  const call = {
+    choices: [
+      {
+        message: {
+          content: null,
+          tool_calls: [
+            {
+              id: 'call-1',
+              type: 'function',
+              function: { name: 'glob', arguments: JSON.stringify({ pattern: '*' }) }
+            }
+          ]
+        }
+      }
+    ]
+  }
+  const stub = stubFetch([call])
+  await runAgent(
+    { prompt: 'x', apiKey: 'sk-test', maxRounds: 1, reasoning: 'low' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.equal(stub.calls.length, 2, 'one tool round plus the summary round')
+  assert.equal(stub.calls[0].body.reasoning_effort, 'low')
+  assert.equal(stub.calls[1].body.reasoning_effort, 'low', 'the summary keeps the choice')
+})
+
 test('reports the tool schemas it sends, so the window can size them', async () => {
   const stub = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
   const sent: Array<{ name: string; schema: string }> = []
@@ -46,11 +232,125 @@ test('reports the tool schemas it sends, so the window can size them', async () 
       onTools: (report) => sent.push(...report.items)
     }
   )
-  assert.deepEqual(sent.map((item) => item.name), ['read', 'list'])
+  assert.deepEqual(sent.map((item) => item.name), [
+    'read',
+    'list',
+    'ask_user_question',
+    'todo_write'
+  ])
   // The schema is the definition itself, not a summary of it.
   const read = JSON.parse(sent[0].schema) as { function: { name: string; description?: string } }
   assert.equal(read.function.name, 'read')
   assert.equal(typeof read.function.description, 'string')
+})
+
+test('says which plugin or server a tool came from', async () => {
+  // The window counts a plugin's contribution on its card, so the report names
+  // the origin; the definition sent to the model stays untouched.
+  const stub = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  const sent: Array<{ name: string; schema: string; plugin?: string; server?: string }> = []
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', allowedTools: ['read'] },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root: await workspace(),
+      plugins: [
+        {
+          name: 'demo_tool',
+          description: '演示用工具',
+          parameters: { type: 'object', properties: {} },
+          plugin: 'demo',
+          run: () => ''
+        }
+      ],
+      mcpTools: [
+        {
+          name: 'mcp_files_read',
+          description: '读文件',
+          parameters: { type: 'object', properties: {} },
+          server: 'files',
+          original: 'read',
+          run: async () => ({ ok: true, text: '' })
+        },
+        {
+          name: 'mcp',
+          description: 'MCP 网关',
+          parameters: { type: 'object', properties: {} },
+          server: 'mcp',
+          original: 'mcp',
+          run: async () => ({ ok: true, text: '' })
+        }
+      ],
+      onTools: (report) => sent.push(...report.items)
+    }
+  )
+  const byName = new Map(sent.map((item) => [item.name, item]))
+  assert.equal(byName.get('read')?.plugin, undefined)
+  assert.equal(byName.get('demo_tool')?.plugin, 'demo')
+  assert.equal(byName.get('mcp_files_read')?.server, 'files')
+  assert.equal(byName.get('mcp')?.server, undefined, 'the gateway belongs to no server')
+  // The origin rides beside the schema, never inside it.
+  assert.ok(!byName.get('demo_tool')!.schema.includes('"plugin"'))
+})
+
+test('asks before an MCP server is disconnected', async () => {
+  const root = await workspace()
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'mcp',
+                  arguments: JSON.stringify({ action: 'disconnect', server: 'files' })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'ok' } }] }
+  ])
+  let ran = 0
+  const asked: ApprovalRequest[] = []
+  const steps: AgentStep[] = []
+  await runAgent(
+    { prompt: 'go', apiKey: 'sk-test' },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root,
+      mcpTools: [
+        {
+          name: 'mcp',
+          description: 'MCP 网关',
+          parameters: { type: 'object', properties: {} },
+          server: 'mcp',
+          original: 'mcp',
+          run: async () => {
+            ran += 1
+            return { ok: true, text: '已断开' }
+          }
+        }
+      ],
+      confirmActions: async (request) => {
+        asked.push(request)
+        return false
+      },
+      onStep: (step) => steps.push(step)
+    }
+  )
+  assert.equal(asked.length, 1)
+  assert.match(asked[0].target, /disconnect files/)
+  assert.equal(ran, 0, 'a refused disconnect never reaches the gateway')
+  assert.match(steps[0].output, /拒绝/)
 })
 
 test('builds plugin panels from the request it is about to send', async () => {
@@ -265,6 +565,142 @@ test('asks before a write and leaves the file alone when refused', async () => {
   assert.match(steps[0].output, /拒绝/)
 })
 
+test('shrinks a tool argument once its result is in', async () => {
+  const root = await workspace()
+  const content = 'x'.repeat(20_000)
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'write',
+                  arguments: JSON.stringify({ path: 'big.txt', content })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'done' } }] }
+  ])
+  await runAgent(
+    { prompt: 'write', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root, approve: async () => true }
+  )
+  // The second round is the first one that replays the assistant turn.
+  const replayed = stub.calls[1].body.messages.find(
+    (message) => message.role === 'assistant' && Array.isArray(message.tool_calls)
+  )
+  const call = (replayed?.tool_calls?.[0] ?? {}) as {
+    id?: string
+    function?: { name?: string; arguments?: string }
+  }
+  // The id and name stay, so the turn still pairs with its tool result.
+  assert.equal(call.id, 'call-1')
+  assert.equal(call.function?.name, 'write')
+  const wire = call.function?.arguments ?? ''
+  assert.ok(wire.length <= MAX_WIRE_ARGUMENTS + 1_000, `arguments kept ${wire.length} chars`)
+  assert.match(wire, /big\.txt/)
+  assert.match(wire, /已省略/)
+  // Only the replayed body is shortened; the file got the whole content.
+  assert.equal(await readFile(path.join(root, 'big.txt'), 'utf8'), content)
+})
+
+test('refuses a write when confirmation cannot be asked for', async () => {
+  const root = await workspace()
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'write',
+                  arguments: JSON.stringify({ path: 'x.txt', content: 'no' })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'ok' } }] }
+  ])
+  const steps: AgentStep[] = []
+  await runAgent(
+    { prompt: 'write', apiKey: 'sk-test' },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root,
+      requireWriteApproval: true,
+      onStep: (step) => steps.push(step)
+    }
+  )
+  await assert.rejects(readFile(path.join(root, 'x.txt')), 'nothing was written')
+  assert.equal(steps[0].ok, false)
+  assert.match(steps[0].output, /没有确认界面/)
+})
+
+test('an answer cut by the output cap says so', async () => {
+  const stub = stubFetch([
+    { choices: [{ message: { content: '写到一半' }, finish_reason: 'length' }] }
+  ])
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.match(result.text, /写到一半/)
+  assert.match(result.text, /长度上限/)
+})
+
+test('a repeated tool-call id is made unique before it is replayed', async () => {
+  const round = {
+    choices: [
+      {
+        message: {
+          content: null,
+          tool_calls: [
+            {
+              id: 'call_0',
+              type: 'function',
+              function: { name: 'list', arguments: JSON.stringify({ path: '.' }) }
+            }
+          ]
+        }
+      }
+    ]
+  }
+  const stub = stubFetch([round, round, { choices: [{ message: { content: 'done' } }] }])
+  await runAgent(
+    { prompt: 'go', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  const replayed = stub.calls[2].body.messages
+  const callIds = replayed
+    .filter((message) => Array.isArray(message.tool_calls))
+    .map((message) => (message.tool_calls as Array<{ id: string }>)[0]!.id)
+  assert.equal(callIds.length, 2)
+  assert.equal(callIds[0], 'call_0', 'the first use keeps the provider id')
+  assert.equal(new Set(callIds).size, 2, 'the second use was renamed')
+  // Every result still answers the call id that asked for it.
+  const resultIds = replayed
+    .filter((message) => message.role === 'tool')
+    .map((message) => message.tool_call_id)
+  assert.deepEqual(resultIds, callIds)
+})
+
 test('writes after the change is allowed', async () => {
   const root = await workspace()
   const stub = stubFetch([
@@ -381,7 +817,9 @@ test('offers only the tools the request allows', async () => {
   const tools = stub.calls[0].body.tools as Array<{ function: { name: string } }>
   assert.deepEqual(
     tools.map((tool) => tool.function.name),
-    ['read', 'glob']
+    // Asking and todo-writing stay available even under an allow-list: they are
+    // part of the agent loop, not optional tools.
+    ['read', 'glob', 'ask_user_question', 'todo_write']
   )
 })
 
@@ -1459,4 +1897,231 @@ test('replays the conversation inside the tool loop', async () => {
     ['user', 'assistant', 'user']
   )
   assert.equal(stub.calls[0].body.messages[0].content, '这里有什么文件？')
+})
+test('counts thinking tokens apart from the answer', async () => {
+  // A reasoner bills its thinking as output; the panel shows it as its own
+  // category, so the round has to say how much it was.
+  const stub = stubFetch([
+    { choices: [{ message: { content: '答案', reasoning_content: '先想一下再回答' } }] }
+  ])
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', model: 'deepseek-reasoner' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.equal(result.text, '答案')
+  // One round, so one figure; the CJK rule counts one token per character.
+  assert.equal(result.roundReasoning.length, 1)
+  assert.equal(result.roundReasoning[0], '先想一下再回答'.length)
+  // The text itself is kept, so the window can show it above the answer.
+  assert.equal(result.reasoning, '先想一下再回答')
+  // A provider that sends no thinking reads as zero rather than as absent.
+  const plain = stubFetch([{ choices: [{ message: { content: '答案' } }] }])
+  const silent = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: plain.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.deepEqual(silent.roundReasoning, [0])
+  assert.equal(silent.reasoning, '')
+})
+
+test('reports where the question time went', async () => {
+  // The panel splits a request into model calls, tool runs and the rest, so the
+  // loop has to measure the two phases it drives. The stub sleeps, so the
+  // figures cannot pass as zero by accident.
+  const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  const bodies = [
+    {
+      choices: [
+        {
+          message: {
+            content: null,
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: { name: 'demo_slow', arguments: JSON.stringify({}) }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'done' } }] }
+  ]
+  let index = 0
+  const fetchImpl = (async () => {
+    const body = bodies[Math.min(index, bodies.length - 1)]
+    index += 1
+    await pause(12)
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    })
+  }) as unknown as typeof fetch
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    {
+      fetchImpl,
+      env: {},
+      root: await workspace(),
+      confirmActions: async () => true,
+      plugins: [
+        {
+          name: 'demo_slow',
+          description: 'slow demo tool',
+          parameters: { type: 'object', properties: {} },
+          plugin: 'demo',
+          run: async () => {
+            await pause(12)
+            return 'ok'
+          }
+        }
+      ]
+    }
+  )
+  assert.equal(result.text, 'done')
+  // Two round trips, each held for about 12ms.
+  assert.ok(result.timing.modelMs >= 20, `model time ${result.timing.modelMs}`)
+  // One plugin tool call, held for about 12ms; it runs on the serial path
+  // because a plugin tool is not read-only.
+  assert.ok(result.timing.toolMs >= 10, `tool time ${result.timing.toolMs}`)
+})
+
+test('plan mode adds its guidance and exit tool only when asked', async () => {
+  const plain = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: plain.fetchImpl, env: {}, root: await workspace() }
+  )
+  const plainTools = (plain.calls[0].body.tools ?? []) as Array<{ function: { name: string } }>
+  assert.ok(plainTools.some((tool) => tool.function.name === 'todo_write'))
+  assert.ok(plainTools.some((tool) => tool.function.name === 'ask_user_question'))
+  assert.ok(!plainTools.some((tool) => tool.function.name === 'exit_plan_mode'))
+  assert.ok(!String(plain.calls[0].body.messages[0].content).includes('计划模式'))
+
+  const planned = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', plan: true },
+    { fetchImpl: planned.fetchImpl, env: {}, root: await workspace() }
+  )
+  const plannedTools = (planned.calls[0].body.tools ?? []) as Array<{ function: { name: string } }>
+  assert.ok(plannedTools.some((tool) => tool.function.name === 'exit_plan_mode'))
+  assert.ok(String(planned.calls[0].body.messages[0].content).includes('计划模式'))
+})
+
+test('the todo tool replaces the list and reports it to the window', async () => {
+  const items = [
+    { text: '读代码', status: 'completed' },
+    { text: '改实现', status: 'in_progress' }
+  ]
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: { name: 'todo_write', arguments: JSON.stringify({ items }) }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'done' } }] }
+  ])
+  let seen: Array<{ text: string; status: string }> = []
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace(), onTodo: (items) => (seen = items) }
+  )
+  assert.deepEqual(seen, items)
+  assert.equal(result.text, 'done')
+  const toolResult = stub.calls[1].body.messages.find((message) => message.role === 'tool')
+  assert.ok(String(toolResult?.content).includes('已更新待办'))
+})
+
+test('a structured question waits for the chosen option', async () => {
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'ask_user_question',
+                  arguments: JSON.stringify({ question: '选哪个方案？', options: ['甲', '乙'] })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'done' } }] }
+  ])
+  let asked: { question: string; options: string[] } | undefined
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root: await workspace(),
+      askUser: async (request) => {
+        asked = { question: request.question, options: request.options }
+        return '乙'
+      }
+    }
+  )
+  assert.deepEqual(asked, { question: '选哪个方案？', options: ['甲', '乙'] })
+  assert.equal(result.text, 'done')
+  const toolResult = stub.calls[1].body.messages.find((message) => message.role === 'tool')
+  assert.ok(String(toolResult?.content).includes('用户选择：乙'))
+})
+
+test('a plan is reviewed before the model may execute it', async () => {
+  const plan = '# 计划\n\n1. 读代码\n2. 改实现'
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: { name: 'exit_plan_mode', arguments: JSON.stringify({ plan }) }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'done' } }] }
+  ])
+  let reviewed = ''
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', plan: true },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root: await workspace(),
+      reviewPlan: async (request) => {
+        reviewed = request.plan
+        return true
+      }
+    }
+  )
+  assert.equal(reviewed, plan)
+  assert.equal(result.text, 'done')
+  const toolResult = stub.calls[1].body.messages.find((message) => message.role === 'tool')
+  assert.ok(String(toolResult?.content).includes('已批准'))
 })

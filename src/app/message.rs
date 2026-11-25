@@ -109,6 +109,84 @@ impl DshFlowApp {
             .into_any_element()
     }
 
+    /// The thinking block above an answer: a toggle line, and the reasoning itself
+    /// once it is open.
+    ///
+    /// Thinking is output the endpoint billed for, but it is not what the model
+    /// said; showing it in the answer's own text would make the transcript read
+    /// as if the model replied with its inner monologue.
+    fn render_reasoning(
+        &self,
+        index: usize,
+        message: &ChatMessage,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = message.open;
+        let mut block = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w_full()
+            .min_w(px(0.))
+            .child(
+                div()
+                    .id(("reasoning-toggle", index))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w(px(0.))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.toggle_reasoning(index, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(rgb(palette.faint))
+                            .child(if open { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(rgb(palette.muted))
+                            .child("思考过程"),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_xs()
+                            .text_color(rgb(palette.faint))
+                            .child(format!("{} 字", message.reasoning.chars().count())),
+                    )
+                    .child(div().flex_1().min_w(px(0.))),
+            );
+        if open {
+            block = block.child(
+                div()
+                    .id(("reasoning-text", index))
+                    .w_full()
+                    .min_w(px(0.))
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .contained_wheel()
+                    .rounded_md()
+                    .bg(rgb(palette.panel_soft))
+                    .p_2()
+                    .text_xs()
+                    .text_color(rgb(palette.muted))
+                    .whitespace_normal()
+                    .child(message.reasoning.clone()),
+            );
+        }
+        block.into_any_element()
+    }
+
     /// One transcript entry; `find` is the lower-cased query when this entry is
     /// the search hit being shown, so its matches can be painted.
     pub(crate) fn render_message(
@@ -320,6 +398,12 @@ impl DshFlowApp {
                 .text_sm()
                 .text_color(rgb(palette.text))
                 .whitespace_normal()
+                // A reasoner's thinking sits above its answer, closed by
+                // default: the reply is what the reader came for, and the
+                // reasoning is one click away when they want it.
+                .when(!message.reasoning.trim().is_empty(), |this| {
+                    this.child(self.render_reasoning(index, message, palette, cx))
+                })
                 .children(markdown_blocks(
                     &self.parsed_blocks(index, &message.text),
                     &message.text,
@@ -464,9 +548,7 @@ impl DshFlowApp {
                                             .text_xs()
                                             .text_color(rgb(palette.accent))
                                             .cursor_pointer()
-                                            .hover(move |style| {
-                                                style.bg(rgb(palette.panel_soft))
-                                            })
+                                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
                                             .on_click(cx.listener(move |view, _, _, cx| {
                                                 view.open_changed_file(&path_for_open, cx);
                                             }))
@@ -478,6 +560,89 @@ impl DshFlowApp {
                     block
                 })
                 .into_any_element(),
+            Role::Thinking => {
+                // One row per stretch of thinking: a sky-blue prefix, the first
+                // line while closed, the whole text once opened — the same
+                // shape as a tool row, because it is the same kind of record.
+                let expanded = message.open;
+                let first = message
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let width = tool_row_text_width(self.answer_width);
+                div()
+                    .id(("message", index))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .w_full()
+                    .min_w(px(0.))
+                    .child(
+                        div()
+                            .id(("thinking-row", index))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .w_full()
+                            .min_w(px(0.))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_reasoning(index, cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .bg(rgb(palette.panel_soft))
+                                    .text_xs()
+                                    .text_color(rgb(palette.sky))
+                                    .child("思考"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.))
+                                    .w(px(width))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
+                                    .child(first),
+                            )
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_xs()
+                                    .text_color(rgb(palette.faint))
+                                    .child(if expanded { "▾ 收起" } else { "▸ 展开" }),
+                            ),
+                    )
+                    .when(expanded, |this| {
+                        this.child(
+                            div()
+                                .id(("thinking-detail", index))
+                                .ml(px(DETAIL_INDENT))
+                                .w(px(width))
+                                .max_h(px(DETAIL_MAX_HEIGHT))
+                                .overflow_y_scroll()
+                                .rounded_md()
+                                .bg(rgb(palette.background))
+                                .border_1()
+                                .border_color(rgb(palette.border))
+                                .p(px(DETAIL_PAD))
+                                .text_xs()
+                                .text_color(rgb(palette.muted))
+                                .whitespace_normal()
+                                .contained_wheel()
+                                .child(message.text.clone()),
+                        )
+                    })
+                    .into_any_element()
+            }
             Role::Tool => {
                 // The engine keeps a capped copy of the arguments and result;
                 // the row shows the summary until the reader asks for them.
@@ -592,7 +757,7 @@ impl DshFlowApp {
                                 // Bubble order is innermost first, so the detail
                                 // has already scrolled by the time this runs;
                                 // what is left to stop is the transcript's wheel.
-                                .on_scroll(cx.listener(|_, _, _, cx| cx.stop_propagation()))
+                                .contained_wheel()
                                 .child(
                                     div()
                                         .id(("tool-scroll", index))
@@ -614,14 +779,27 @@ impl DshFlowApp {
                                                 text_width,
                                             ))
                                         })
-                                        .when(!message.output.is_empty(), |this| {
-                                            this.child(tool_detail_section(
-                                                "返回",
-                                                &message.output,
-                                                palette,
-                                                text_width,
-                                            ))
-                                        }),
+                                        .when(
+                                            !message.output.is_empty() || is_web_row(&message.text),
+                                            |this| {
+                                                if is_web_row(&message.text) {
+                                                    this.child(web_sources_section(
+                                                        &message.text,
+                                                        &message.output,
+                                                        index,
+                                                        palette,
+                                                        text_width,
+                                                    ))
+                                                } else {
+                                                    this.child(tool_detail_section(
+                                                        "返回",
+                                                        &message.output,
+                                                        palette,
+                                                        text_width,
+                                                    ))
+                                                }
+                                            },
+                                        ),
                                 )
                                 .child(self.render_tool_bar(index, palette, &vertical, cx)),
                         )
@@ -733,9 +911,7 @@ impl DshFlowApp {
                                         .border_color(rgb(palette.border))
                                         .text_xs()
                                         .text_color(rgb(palette.muted))
-                                        .on_scroll(
-                                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
-                                        )
+                                        .contained_wheel()
                                         .child(
                                             div()
                                                 .id(("approval-scroll", index))
@@ -976,6 +1152,7 @@ impl DshFlowApp {
                                         .id(("attachment-body", index))
                                         .max_h(px(260.))
                                         .overflow_y_scroll()
+                                        .contained_wheel()
                                         .rounded_md()
                                         .bg(rgb(palette.background))
                                         .border_1()
@@ -994,6 +1171,206 @@ impl DshFlowApp {
                                         } else {
                                             preview
                                         }),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }
+            Role::Question => {
+                // A structured question is answered by picking one of its
+                // options; the card folds once a choice has been sent.
+                let live = message.output.trim().is_empty()
+                    && self.active_pending().is_some_and(|pending| {
+                        pending.question.as_deref() == Some(message.call.as_str())
+                    });
+                let state = message.output.trim();
+                let payload: serde_json::Value =
+                    serde_json::from_str(&message.input).unwrap_or_default();
+                let options: Vec<String> = payload
+                    .get("options")
+                    .and_then(|options| options.as_array())
+                    .map(|options| {
+                        options
+                            .iter()
+                            .filter_map(|option| option.as_str())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut buttons = div().flex().flex_row().flex_wrap().gap_1();
+                for (choice_index, option) in options.iter().enumerate() {
+                    let choice = option.clone();
+                    buttons = buttons.child(
+                        div()
+                            .id(("question-option", index * 16 + choice_index))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .bg(rgb(palette.accent))
+                            .text_xs()
+                            .text_color(rgb(palette.accent_text))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.answer_question(index, choice.clone(), cx);
+                            }))
+                            .child(option.clone()),
+                    );
+                }
+                div()
+                    .id(("message", index))
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(palette.panel))
+                            .border_1()
+                            .border_color(rgb(if live { palette.warn } else { palette.border }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .bg(rgb(palette.panel_soft))
+                                            .text_xs()
+                                            .text_color(rgb(palette.warn))
+                                            .child("提问"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .text_sm()
+                                            .text_color(rgb(palette.text))
+                                            .whitespace_normal()
+                                            .child(message.text.clone()),
+                                    ),
+                            )
+                            .when(live, |this| this.child(buttons))
+                            .when(!live, |this| {
+                                this.child(div().text_xs().text_color(rgb(palette.faint)).child(
+                                    if state.is_empty() {
+                                        "已失效".to_string()
+                                    } else {
+                                        state.to_string()
+                                    },
+                                ))
+                            }),
+                    )
+                    .into_any_element()
+            }
+            Role::Plan => {
+                // A plan is shown whole: it is the thing being approved.
+                let live = message.output.trim().is_empty()
+                    && self.active_pending().is_some_and(|pending| {
+                        pending.plan.as_deref() == Some(message.call.as_str())
+                    });
+                let state = message.output.trim();
+                div()
+                    .id(("message", index))
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(palette.panel))
+                            .border_1()
+                            .border_color(rgb(if live { palette.warn } else { palette.border }))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .px_1()
+                                            .rounded_sm()
+                                            .bg(rgb(palette.panel_soft))
+                                            .text_xs()
+                                            .text_color(rgb(palette.warn))
+                                            .child("计划"),
+                                    )
+                                    .child(div().text_xs().text_color(rgb(palette.faint)).child(
+                                        if live {
+                                            "等待批准".to_string()
+                                        } else if state.is_empty() {
+                                            "已失效".to_string()
+                                        } else {
+                                            state.to_string()
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id(("plan-body", index))
+                                    .w_full()
+                                    .max_h(px(300.))
+                                    .overflow_y_scroll()
+                                    .contained_wheel()
+                                    .text_xs()
+                                    .text_color(rgb(palette.muted))
+                                    .whitespace_normal()
+                                    .child(message.text.clone()),
+                            )
+                            .when(live, |this| {
+                                this.child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id(("plan-approve", index))
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(palette.accent))
+                                                .text_xs()
+                                                .text_color(rgb(palette.accent_text))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |view, _, _, cx| {
+                                                    view.answer_plan(index, true, cx);
+                                                }))
+                                                .child("批准并执行"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(("plan-revise", index))
+                                                .px_3()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(rgb(palette.border))
+                                                .bg(rgb(palette.panel_soft))
+                                                .text_xs()
+                                                .text_color(rgb(palette.muted))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |view, _, _, cx| {
+                                                    view.answer_plan(index, false, cx);
+                                                }))
+                                                .child("继续修改"),
+                                        ),
                                 )
                             }),
                     )
@@ -1080,6 +1457,145 @@ impl DshFlowApp {
 }
 
 /// One labelled half of an expanded tool row.
+/// Whether a tool row came from the provider's own web tools.
+///
+/// The row's title starts with the tool name (`web_search · …`), the same way
+/// the actions card reads it.
+fn is_web_row(text: &str) -> bool {
+    let tool = text.split('·').next().unwrap_or_default().trim();
+    tool == "web_search" || tool == "read_url"
+}
+
+/// One line of a web row's output, as `标题 — URL`.
+fn web_source(line: &str) -> Option<(String, String)> {
+    let (title, url) = line.split_once(" — ")?;
+    let url = url.trim();
+    if !crate::markdown::is_openable_link(url) {
+        return None;
+    }
+    Some((title.trim().to_string(), url.to_string()))
+}
+
+/// The page a `read_url` row opened, read out of its title.
+fn web_page_of(text: &str) -> Option<String> {
+    let mut parts = text.splitn(2, '·');
+    parts.next()?;
+    let rest = parts.next()?.trim();
+    let url = rest.split(" — ").next()?.trim();
+    crate::markdown::is_openable_link(url).then(|| url.to_string())
+}
+
+/// One clickable source row: the title on the left, an "打开" hint on the right.
+fn web_source_row(
+    id: (&'static str, usize),
+    label: String,
+    url: String,
+    palette: Palette,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .w_full()
+        .min_w(px(0.))
+        .px_1()
+        .py_0p5()
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(move |style| style.bg(rgb(palette.panel_soft)))
+        .on_click(move |_, _, cx| {
+            // Answers are untrusted text: `open_url` refuses anything that is
+            // not an http(s) or mailto address, and never goes through a shell.
+            let _ = crate::app::util::open_url(&url);
+            cx.stop_propagation();
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .truncate()
+                .text_xs()
+                .text_color(rgb(palette.text))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(rgb(palette.accent))
+                .child("打开"),
+        )
+        .into_any_element()
+}
+
+/// The body of a web tool row: one clickable row per source, or the page it read.
+///
+/// The provider's citations arrive as plain text in the row's output, so the
+/// transcript turns them back into links here instead of leaving a URL the
+/// reader has to copy out by hand.
+fn web_sources_section(
+    text: &str,
+    output: &str,
+    index: usize,
+    palette: Palette,
+    width: f32,
+) -> AnyElement {
+    let mut rows: Vec<AnyElement> = Vec::new();
+    for (at, line) in output.lines().enumerate() {
+        let Some((title, url)) = web_source(line) else {
+            continue;
+        };
+        rows.push(web_source_row(
+            ("web-source", index * 1024 + at),
+            title,
+            url,
+            palette,
+        ));
+    }
+    let mut header = format!("来源 {}", rows.len());
+    if let Some(page) = web_page_of(text) {
+        if rows.is_empty() {
+            header = "页面".to_string();
+        }
+        rows.push(web_source_row(
+            ("web-source", index * 1024 + rows.len()),
+            page.clone(),
+            page,
+            palette,
+        ));
+    }
+    if rows.is_empty() {
+        // A failed call keeps its error text; a search the endpoint reported
+        // without any result list says so instead of showing nothing at all.
+        if !output.trim().is_empty() {
+            return tool_detail_section("返回", output, palette, width);
+        }
+        return div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .w(px(width))
+            .child(div().text_xs().text_color(rgb(palette.faint)).child("来源"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(palette.muted))
+                    .child("端点没有返回来源列表，只报告了这次调用。"),
+            )
+            .into_any_element();
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .w(px(width))
+        .child(div().text_xs().text_color(rgb(palette.faint)).child(header))
+        .children(rows)
+        .into_any_element()
+}
+
 fn tool_detail_section(title: &str, body: &str, palette: Palette, width: f32) -> AnyElement {
     // Shaped at a fixed width, like the markdown blocks: a plain text child
     // measures at its longest line and would overflow the detail instead of
@@ -2048,6 +2564,20 @@ fn percent_decoded(text: &str) -> String {
 ///
 /// The caller keeps the parse (see `DshFlowApp::parsed_blocks`): this runs on
 /// every frame, while a parse only has to happen when the text changes.
+/// The gutter of a code block: how many lines it draws, and the numbers.
+///
+/// A trailing newline does not add a drawn line, which is also how the code
+/// lays itself out; an empty block still shows `1` so the gutter keeps the same
+/// height as the (blank) code beside it.
+pub(crate) fn line_numbers(body: &str) -> (usize, String) {
+    let lines = body.lines().count().max(1);
+    let text = (1..=lines)
+        .map(|line| line.to_string())
+        .collect::<Vec<String>>()
+        .join("\n");
+    (lines, text)
+}
+
 pub(crate) fn markdown_blocks(
     blocks: &[markdown::Rich],
     text: &str,
@@ -2205,165 +2735,359 @@ fn block_rows(
             flush_list(&mut list, &mut rows);
             list_kind = kind;
         }
-        let element = match &rich.block {
-            markdown::Block::Paragraph(_) => div()
-                .w_full()
-                .text_size(px(PARAGRAPH_SIZE * scale))
-                .text_color(rgb(tone))
-                .whitespace_normal()
-                .child(selectable(number, body, width, emphasis, links))
-                .into_any_element(),
-            // A definition list has no marker column, so the term is drawn bold
-            // on its own line with the description under it — which is also how
-            // the block's text reads.
-            markdown::Block::Definition(_) => div()
-                .w_full()
-                .text_size(px(PARAGRAPH_SIZE * scale))
-                .text_color(rgb(tone))
-                .whitespace_normal()
-                .pl(px(4.))
-                .child(selectable(number, body, width - 4., emphasis, links))
-                .into_any_element(),
-            markdown::Block::Heading(level, _) => {
-                // A level one heading has to look like the top of the answer,
-                // not the same as the level two under it; the deep levels step
-                // down so an outline still shows its shape.
-                let size = match *level {
-                    1 => 20.,
-                    2 => 16.,
-                    3 => 14.,
-                    4 => 13.,
-                    _ => 12.,
-                } * scale;
-                div()
+        let element =
+            match &rich.block {
+                markdown::Block::Paragraph(_) => div()
                     .w_full()
-                    .pt_1()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_size(px(size))
+                    .text_size(px(PARAGRAPH_SIZE * scale))
                     .text_color(rgb(tone))
                     .whitespace_normal()
                     .child(selectable(number, body, width, emphasis, links))
-                    .into_any_element()
-            }
-            // The marker is drawn in its own column, so the words start at the
-            // same x on every line and a wrapped item hangs under them instead
-            // of running back to the marker. A nested item is inset by its level.
-            markdown::Block::Bullet(level, _)
-            | markdown::Block::Numbered(level, _, _)
-            | markdown::Block::Task(level, _, _) => {
-                let indent = *level as f32 * LIST_INDENT;
-                let marker_width = if matches!(rich.block, markdown::Block::Numbered(..)) {
-                    NUMBER_MARKER
-                } else {
-                    BULLET_MARKER
-                };
-                // A task draws a box where a bullet draws its dot. The box is a
-                // control: a click flips it, and the flip belongs to the
-                // conversation, so it survives a restart.
-                let marker: AnyElement = match &rich.block {
-                    markdown::Block::Task(_, checked, _) => {
-                        let checked = *checked != ticked.contains(&(message, number));
-                        let on_check = on_check.clone();
-                        let id = ("task", code_copy_id(message, number));
-                        div()
-                            .id(id)
-                            .cursor_pointer()
-                            .on_click(move |_, window, cx| on_check(number, window, cx))
-                            .child(task_marker(checked, palette))
-                            .into_any_element()
-                    }
-                    _ => div().child(list_marker(&rich.block)).into_any_element(),
-                };
-                div()
+                    .into_any_element(),
+                // A definition list has no marker column, so the term is drawn bold
+                // on its own line with the description under it — which is also how
+                // the block's text reads.
+                markdown::Block::Definition(_) => div()
                     .w_full()
-                    .pl(px(indent))
-                    .flex()
-                    .flex_row()
-                    .items_start()
                     .text_size(px(PARAGRAPH_SIZE * scale))
                     .text_color(rgb(tone))
-                    .child(div().flex_shrink_0().w(px(marker_width)).child(marker))
-                    .child(selectable(
-                        number,
-                        body,
-                        width - indent - marker_width,
-                        emphasis,
-                        links,
-                    ))
-                    .into_any_element()
-            }
-            // A thin line between sections, the same weight as the table's own
-            // dividers.
-            markdown::Block::Rule => div()
-                .w_full()
-                .py_1()
-                .child(div().w_full().h(px(1.)).bg(rgb(palette.border)))
-                .into_any_element(),
-            // The quote is the other block that pads itself, so its text wraps
-            // inside that padding instead of reaching the block's edge. What is
-            // inside it is drawn as blocks of its own, one box around them all.
-            // A quote inside a quote flips to the panel colour, so the nesting
-            // is visible instead of two boxes of the same grey.
-            markdown::Block::Quote(inner) => div()
-                .w_full()
-                .px(px(QUOTE_PAD))
-                .py_1()
-                .rounded_md()
-                .bg(rgb(if quote_depth.is_multiple_of(2) {
-                    palette.panel_soft
-                } else {
-                    palette.canvas
-                }))
-                .flex()
-                .flex_col()
-                .gap(px(LIST_GAP))
-                .children(block_rows(
-                    inner.as_slice(),
-                    counter,
-                    "",
-                    palette.muted,
-                    palette,
-                    message,
-                    width - 2. * QUOTE_PAD,
-                    selection,
-                    on_drag,
-                    copied_block,
-                    on_copy,
-                    toggled_details,
-                    on_toggle,
-                    ticked,
-                    on_check,
-                    dir,
-                    block_scroll,
-                    quote_depth + 1,
-                    scale,
-                    find,
-                ))
-                .into_any_element(),
-            // A block written under a list item: drawn one level in, under the
-            // item's text column, so a fence or a quote reads as part of it.
-            markdown::Block::Indented(level, marker, inner) => {
-                // The child starts where the item's text starts: past its marker
-                // column, which is wider for a number than for a bullet.
-                let marker_width = match marker {
-                    markdown::Marker::Bullet => BULLET_MARKER,
-                    markdown::Marker::Number => NUMBER_MARKER,
-                };
-                let inset = *level as f32 * LIST_INDENT + marker_width;
-                div()
+                    .whitespace_normal()
+                    .pl(px(4.))
+                    .child(selectable(number, body, width - 4., emphasis, links))
+                    .into_any_element(),
+                markdown::Block::Heading(level, _) => {
+                    // A level one heading has to look like the top of the answer,
+                    // not the same as the level two under it; the deep levels step
+                    // down so an outline still shows its shape.
+                    let size = match *level {
+                        1 => 20.,
+                        2 => 16.,
+                        3 => 14.,
+                        4 => 13.,
+                        _ => 12.,
+                    } * scale;
+                    div()
+                        .w_full()
+                        .pt_1()
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_size(px(size))
+                        .text_color(rgb(tone))
+                        .whitespace_normal()
+                        .child(selectable(number, body, width, emphasis, links))
+                        .into_any_element()
+                }
+                // The marker is drawn in its own column, so the words start at the
+                // same x on every line and a wrapped item hangs under them instead
+                // of running back to the marker. A nested item is inset by its level.
+                markdown::Block::Bullet(level, _)
+                | markdown::Block::Numbered(level, _, _)
+                | markdown::Block::Task(level, _, _) => {
+                    let indent = *level as f32 * LIST_INDENT;
+                    let marker_width = if matches!(rich.block, markdown::Block::Numbered(..)) {
+                        NUMBER_MARKER
+                    } else {
+                        BULLET_MARKER
+                    };
+                    // A task draws a box where a bullet draws its dot. The box is a
+                    // control: a click flips it, and the flip belongs to the
+                    // conversation, so it survives a restart.
+                    let marker: AnyElement = match &rich.block {
+                        markdown::Block::Task(_, checked, _) => {
+                            let checked = *checked != ticked.contains(&(message, number));
+                            let on_check = on_check.clone();
+                            let id = ("task", code_copy_id(message, number));
+                            div()
+                                .id(id)
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| on_check(number, window, cx))
+                                .child(task_marker(checked, palette))
+                                .into_any_element()
+                        }
+                        _ => div().child(list_marker(&rich.block)).into_any_element(),
+                    };
+                    div()
+                        .w_full()
+                        .pl(px(indent))
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .text_size(px(PARAGRAPH_SIZE * scale))
+                        .text_color(rgb(tone))
+                        .child(div().flex_shrink_0().w(px(marker_width)).child(marker))
+                        .child(selectable(
+                            number,
+                            body,
+                            width - indent - marker_width,
+                            emphasis,
+                            links,
+                        ))
+                        .into_any_element()
+                }
+                // A thin line between sections, the same weight as the table's own
+                // dividers.
+                markdown::Block::Rule => div()
                     .w_full()
-                    .pl(px(inset))
+                    .py_1()
+                    .child(div().w_full().h(px(1.)).bg(rgb(palette.border)))
+                    .into_any_element(),
+                // The quote is the other block that pads itself, so its text wraps
+                // inside that padding instead of reaching the block's edge. What is
+                // inside it is drawn as blocks of its own, one box around them all.
+                // A quote inside a quote flips to the panel colour, so the nesting
+                // is visible instead of two boxes of the same grey.
+                markdown::Block::Quote(inner) => div()
+                    .w_full()
+                    .px(px(QUOTE_PAD))
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(if quote_depth.is_multiple_of(2) {
+                        palette.panel_soft
+                    } else {
+                        palette.canvas
+                    }))
                     .flex()
                     .flex_col()
                     .gap(px(LIST_GAP))
                     .children(block_rows(
-                        std::slice::from_ref(inner.as_ref()),
+                        inner.as_slice(),
                         counter,
-                        empty_text,
+                        "",
+                        palette.muted,
+                        palette,
+                        message,
+                        width - 2. * QUOTE_PAD,
+                        selection,
+                        on_drag,
+                        copied_block,
+                        on_copy,
+                        toggled_details,
+                        on_toggle,
+                        ticked,
+                        on_check,
+                        dir,
+                        block_scroll,
+                        quote_depth + 1,
+                        scale,
+                        find,
+                    ))
+                    .into_any_element(),
+                // A block written under a list item: drawn one level in, under the
+                // item's text column, so a fence or a quote reads as part of it.
+                markdown::Block::Indented(level, marker, inner) => {
+                    // The child starts where the item's text starts: past its marker
+                    // column, which is wider for a number than for a bullet.
+                    let marker_width = match marker {
+                        markdown::Marker::Bullet => BULLET_MARKER,
+                        markdown::Marker::Number => NUMBER_MARKER,
+                    };
+                    let inset = *level as f32 * LIST_INDENT + marker_width;
+                    div()
+                        .w_full()
+                        .pl(px(inset))
+                        .flex()
+                        .flex_col()
+                        .gap(px(LIST_GAP))
+                        .children(block_rows(
+                            std::slice::from_ref(inner.as_ref()),
+                            counter,
+                            empty_text,
+                            tone,
+                            palette,
+                            message,
+                            width - inset,
+                            selection,
+                            on_drag,
+                            copied_block,
+                            on_copy,
+                            toggled_details,
+                            on_toggle,
+                            ticked,
+                            on_check,
+                            dir,
+                            block_scroll,
+                            quote_depth,
+                            scale,
+                            find,
+                        ))
+                        .into_any_element()
+                }
+                // A picture on a line of its own. A local file — an absolute path, a
+                // `file://` address, or a path relative to the conversation folder —
+                // is drawn. A remote URL stays a card that names the image, because
+                // nothing here fetches the network.
+                markdown::Block::Image(alt, url) => match local_image(url, dir) {
+                    Some(path) => {
+                        let caption = alt.clone();
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                gpui::img(path)
+                                    .max_w(px(width))
+                                    .max_h(px(IMAGE_MAX_HEIGHT))
+                                    .rounded_md()
+                                    .border_1()
+                                    .border_color(rgb(palette.border)),
+                            )
+                            .when(!caption.trim().is_empty(), |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette.faint))
+                                        .child(caption),
+                                )
+                            })
+                            .into_any_element()
+                    }
+                    None => div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(palette.border))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(palette.panel_soft))
+                                .text_xs()
+                                .text_color(rgb(palette.faint))
+                                .child("图片"),
+                        )
+                        .child(selectable(
+                            number,
+                            body,
+                            width - 2. * IMAGE_CARD_PAD - IMAGE_BADGE,
+                            emphasis,
+                            links,
+                        ))
+                        .into_any_element(),
+                },
+                // One note under the answer: its number in the marker column, so a
+                // wrapped note lines up under the text like a list item does. The
+                // note's own blocks are drawn under the same column, in the faint
+                // tone notes use.
+                markdown::Block::Footnote(note, inner) => {
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .text_xs()
+                        .text_color(rgb(palette.faint))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(FOOTNOTE_MARKER))
+                                .child(format!("[{note}]")),
+                        )
+                        .child(div().w_full().flex().flex_col().gap(px(LIST_GAP)).children(
+                            block_rows(
+                                inner,
+                                counter,
+                                "",
+                                palette.faint,
+                                palette,
+                                message,
+                                width - FOOTNOTE_MARKER,
+                                selection,
+                                on_drag,
+                                copied_block,
+                                on_copy,
+                                toggled_details,
+                                on_toggle,
+                                ticked,
+                                on_check,
+                                dir,
+                                block_scroll,
+                                quote_depth,
+                                scale * FOOTNOTE_SCALE,
+                                find,
+                            ),
+                        ))
+                        .into_any_element()
+                }
+                // A formula on its own line. What can be stacked is drawn as
+                // numerator over denominator, the rest stays one line of text that a
+                // selection can still copy.
+                markdown::Block::Math(formula) => {
+                    let stacked = formula.stacked();
+                    let copied = copied_block == Some(number);
+                    let on_copy = on_copy.clone();
+                    let source: SharedString = formula.source.clone().into();
+                    let inner: AnyElement = if stacked {
+                        math_sequence(&formula.nodes, palette, tone, MATH_SIZE)
+                    } else {
+                        selectable(number, body, width - 2. * CODE_PAD, emphasis, links)
+                            .into_any_element()
+                    };
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .w_full()
+                        .px(px(CODE_PAD))
+                        .py_3()
+                        .rounded_md()
+                        .bg(rgb(palette.panel_soft))
+                        // A drawn formula is not selectable, so it gets the copy
+                        // button a code block has: the LaTeX, ready to paste on.
+                        .when(stacked, |this| {
+                            this.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_end()
+                                    .w_full()
+                                    .child(
+                                        div()
+                                            .id(("math-copy", code_copy_id(message, number)))
+                                            .px_1()
+                                            .rounded_sm()
+                                            .text_xs()
+                                            .text_color(rgb(if copied {
+                                                palette.ok
+                                            } else {
+                                                palette.faint
+                                            }))
+                                            .cursor_pointer()
+                                            .hover(move |style| style.bg(rgb(palette.border)))
+                                            .on_click(move |_, window, cx| {
+                                                on_copy(number, source.clone(), window, cx);
+                                            })
+                                            .child(if copied { "已复制" } else { "复制" }),
+                                    ),
+                            )
+                        })
+                        .child(inner)
+                        .into_any_element()
+                }
+                // `<details>`: the summary line opens and closes the blocks it holds.
+                markdown::Block::Details(summary, open_default, inner) => {
+                    // The reader's toggles are kept as flips of what the element
+                    // asked for, so `<details open>` starts expanded and a click
+                    // closes it.
+                    let expanded = *open_default != toggled_details.contains(&(message, number));
+                    let toggle = on_toggle.clone();
+                    // The contents are built either way, so the block numbers handed
+                    // out do not depend on whether the reader has opened the section.
+                    let contents = block_rows(
+                        inner,
+                        counter,
+                        "",
                         tone,
                         palette,
                         message,
-                        width - inset,
+                        width - 2. * QUOTE_PAD,
                         selection,
                         on_drag,
                         copied_block,
@@ -2377,143 +3101,73 @@ fn block_rows(
                         quote_depth,
                         scale,
                         find,
-                    ))
-                    .into_any_element()
-            }
-            // A picture on a line of its own. A local file — an absolute path, a
-            // `file://` address, or a path relative to the conversation folder —
-            // is drawn. A remote URL stays a card that names the image, because
-            // nothing here fetches the network.
-            markdown::Block::Image(alt, url) => match local_image(url, dir) {
-                Some(path) => {
-                    let caption = alt.clone();
+                    );
                     div()
                         .w_full()
                         .flex()
                         .flex_col()
-                        .gap_1()
+                        .gap_2()
+                        .px(px(QUOTE_PAD))
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(palette.border))
                         .child(
-                            gpui::img(path)
-                                .max_w(px(width))
-                                .max_h(px(IMAGE_MAX_HEIGHT))
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(palette.border)),
+                            div()
+                                .id(("details", code_copy_id(message, number)))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .w_full()
+                                .cursor_pointer()
+                                .on_click(move |_, window, cx| toggle(number, window, cx))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .text_xs()
+                                        .text_color(rgb(palette.muted))
+                                        .child(if expanded { "▾" } else { "▸" }),
+                                )
+                                .child(summary_text(summary, tone)),
                         )
-                        .when(!caption.trim().is_empty(), |this| {
+                        .when(expanded, move |this| {
                             this.child(
                                 div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.faint))
-                                    .child(caption),
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .w_full()
+                                    .min_w(px(0.))
+                                    .children(contents),
                             )
                         })
                         .into_any_element()
                 }
-                None => div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px_1()
-                            .rounded_sm()
-                            .bg(rgb(palette.panel_soft))
-                            .text_xs()
-                            .text_color(rgb(palette.faint))
-                            .child("图片"),
-                    )
-                    .child(selectable(
-                        number,
-                        body,
-                        width - 2. * IMAGE_CARD_PAD - IMAGE_BADGE,
-                        emphasis,
-                        links,
-                    ))
-                    .into_any_element(),
-            },
-            // One note under the answer: its number in the marker column, so a
-            // wrapped note lines up under the text like a list item does. The
-            // note's own blocks are drawn under the same column, in the faint
-            // tone notes use.
-            markdown::Block::Footnote(note, inner) => div()
-                .w_full()
-                .flex()
-                .flex_row()
-                .items_start()
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(
+                markdown::Block::Table(table) => {
+                    let markdown: SharedString = table.markdown().into();
+                    let range =
+                        selection.and_then(|chosen| chosen.part_of(message, number, body.len()));
+                    let mut cells: Vec<Vec<markdown::Cell>> =
+                        Vec::with_capacity(table.rows.len() + 1);
+                    cells.push(table.header.clone());
+                    cells.extend(table.rows.clone());
+                    let on_drag = on_drag.clone();
+                    let handler: OnDrag =
+                        Rc::new(move |event, window, cx| on_drag(number, event, window, cx));
+                    let copied = copied_block == Some(number);
+                    let on_copy = on_copy.clone();
+                    // The table paints its own frame: the wrapper fills the answer so
+                    // the copy button sits at its right edge, while the table itself
+                    // stays only as wide as its columns.
                     div()
-                        .flex_shrink_0()
-                        .w(px(FOOTNOTE_MARKER))
-                        .child(format!("[{note}]")),
-                )
-                .child(
-                    div()
-                        .w_full()
                         .flex()
                         .flex_col()
-                        .gap(px(LIST_GAP))
-                        .children(block_rows(
-                            inner,
-                            counter,
-                            "",
-                            palette.faint,
-                            palette,
-                            message,
-                            width - FOOTNOTE_MARKER,
-                            selection,
-                            on_drag,
-                            copied_block,
-                            on_copy,
-                            toggled_details,
-                            on_toggle,
-                            ticked,
-                            on_check,
-                            dir,
-                            block_scroll,
-                            quote_depth,
-                            scale * FOOTNOTE_SCALE,
-                            find,
-                        )),
-                )
-                .into_any_element(),
-            // A formula on its own line. What can be stacked is drawn as
-            // numerator over denominator, the rest stays one line of text that a
-            // selection can still copy.
-            markdown::Block::Math(formula) => {
-                let stacked = formula.stacked();
-                let copied = copied_block == Some(number);
-                let on_copy = on_copy.clone();
-                let source: SharedString = formula.source.clone().into();
-                let inner: AnyElement = if stacked {
-                    math_sequence(&formula.nodes, palette, tone, MATH_SIZE)
-                } else {
-                    selectable(number, body, width - 2. * CODE_PAD, emphasis, links)
-                        .into_any_element()
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w_full()
-                    .px(px(CODE_PAD))
-                    .py_3()
-                    .rounded_md()
-                    .bg(rgb(palette.panel_soft))
-                    // A drawn formula is not selectable, so it gets the copy
-                    // button a code block has: the LaTeX, ready to paste on.
-                    .when(stacked, |this| {
-                        this.child(
+                        .gap_1()
+                        .w_full()
+                        // Copies the table alone, as Markdown the model's own answer
+                        // can be pasted into a document.
+                        .child(
                             div()
                                 .flex()
                                 .flex_row()
@@ -2522,7 +3176,7 @@ fn block_rows(
                                 .w_full()
                                 .child(
                                     div()
-                                        .id(("math-copy", code_copy_id(message, number)))
+                                        .id(("table-copy", code_copy_id(message, number)))
                                         .px_1()
                                         .rounded_sm()
                                         .text_xs()
@@ -2534,251 +3188,149 @@ fn block_rows(
                                         .cursor_pointer()
                                         .hover(move |style| style.bg(rgb(palette.border)))
                                         .on_click(move |_, window, cx| {
-                                            on_copy(number, source.clone(), window, cx);
+                                            on_copy(number, markdown.clone(), window, cx);
                                         })
                                         .child(if copied { "已复制" } else { "复制" }),
                                 ),
                         )
-                    })
-                    .child(inner)
-                    .into_any_element()
-            }
-            // `<details>`: the summary line opens and closes the blocks it holds.
-            markdown::Block::Details(summary, open_default, inner) => {
-                // The reader's toggles are kept as flips of what the element
-                // asked for, so `<details open>` starts expanded and a click
-                // closes it.
-                let expanded = *open_default != toggled_details.contains(&(message, number));
-                let toggle = on_toggle.clone();
-                // The contents are built either way, so the block numbers handed
-                // out do not depend on whether the reader has opened the section.
-                let contents = block_rows(
-                    inner,
-                    counter,
-                    "",
-                    tone,
-                    palette,
-                    message,
-                    width - 2. * QUOTE_PAD,
-                    selection,
-                    on_drag,
-                    copied_block,
-                    on_copy,
-                    toggled_details,
-                    on_toggle,
-                    ticked,
-                    on_check,
-                    dir,
-                    block_scroll,
-                    quote_depth,
-                    scale,
-                    find,
-                );
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .px(px(QUOTE_PAD))
-                    .py_1()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .child(
-                        div()
-                            .id(("details", code_copy_id(message, number)))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_2()
-                            .w_full()
-                            .cursor_pointer()
-                            .on_click(move |_, window, cx| toggle(number, window, cx))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(rgb(palette.muted))
-                                    .child(if expanded { "▾" } else { "▸" }),
-                            )
-                            .child(summary_text(summary, tone)),
-                    )
-                    .when(expanded, move |this| {
-                        this.child(
+                        .child(
                             div()
+                                .id(("table-scroll", code_copy_id(message, number)))
                                 .flex()
                                 .flex_col()
-                                .gap_2()
+                                .items_start()
                                 .w_full()
                                 .min_w(px(0.))
-                                .children(contents),
+                                .overflow_x_scroll()
+                                .track_scroll(&block_scroll((message, number)))
+                                .child(SelectableTable::new(
+                                    cells,
+                                    body,
+                                    px(width),
+                                    range,
+                                    table.aligns.clone(),
+                                    TableLook {
+                                        header: rgb(palette.panel_soft).into(),
+                                        divider: rgb(palette.border).into(),
+                                        selection: highlight,
+                                        link: rgb(palette.accent).into(),
+                                        mark: rgb(palette.selection).into(),
+                                    },
+                                    handler,
+                                )),
                         )
-                    })
-                    .into_any_element()
-            }
-            markdown::Block::Table(table) => {
-                let markdown: SharedString = table.markdown().into();
-                let range =
-                    selection.and_then(|chosen| chosen.part_of(message, number, body.len()));
-                let mut cells: Vec<Vec<markdown::Cell>> = Vec::with_capacity(table.rows.len() + 1);
-                cells.push(table.header.clone());
-                cells.extend(table.rows.clone());
-                let on_drag = on_drag.clone();
-                let handler: OnDrag =
-                    Rc::new(move |event, window, cx| on_drag(number, event, window, cx));
-                let copied = copied_block == Some(number);
-                let on_copy = on_copy.clone();
-                // The table paints its own frame: the wrapper fills the answer so
-                // the copy button sits at its right edge, while the table itself
-                // stays only as wide as its columns.
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w_full()
-                    // Copies the table alone, as Markdown the model's own answer
-                    // can be pasted into a document.
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_end()
-                            .w_full()
-                            .child(
-                                div()
-                                    .id(("table-copy", code_copy_id(message, number)))
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .text_color(rgb(if copied {
-                                        palette.ok
-                                    } else {
-                                        palette.faint
-                                    }))
-                                    .cursor_pointer()
-                                    .hover(move |style| style.bg(rgb(palette.border)))
-                                    .on_click(move |_, window, cx| {
-                                        on_copy(number, markdown.clone(), window, cx);
-                                    })
-                                    .child(if copied { "已复制" } else { "复制" }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id(("table-scroll", code_copy_id(message, number)))
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .w_full()
-                            .min_w(px(0.))
-                            .overflow_x_scroll()
-                            .track_scroll(&block_scroll((message, number)))
-                            .child(SelectableTable::new(
-                                cells,
-                                body,
-                                px(width),
-                                range,
-                                table.aligns.clone(),
-                                TableLook {
-                                    header: rgb(palette.panel_soft).into(),
-                                    divider: rgb(palette.border).into(),
-                                    selection: highlight,
-                                    link: rgb(palette.accent).into(),
-                                    mark: rgb(palette.selection).into(),
-                                },
-                                handler,
-                            )),
-                    )
-                    .into_any_element()
-            }
-            markdown::Block::Code(language, body) => {
-                let language = language_label(language);
-                let copied = copied_block == Some(number);
-                let body: SharedString = body.clone().into();
-                let clickable = body.clone();
-                let on_copy = on_copy.clone();
-                // Keywords, strings, numbers and comments each get a colour; the
-                // palette has no code-specific fields, so the ones it has stand in.
-                let tokens = TokenColors {
-                    comment: rgb(palette.faint).into(),
-                    string: rgb(palette.ok).into(),
-                    number: rgb(palette.warn).into(),
-                    keyword: rgb(palette.accent).into(),
-                    function: rgb(palette.code_function).into(),
-                    type_name: rgb(palette.code_type).into(),
-                    // A diff reads as "this line goes" and "this line comes",
-                    // so it borrows the two colours those states already use.
-                    added: rgb(palette.ok).into(),
-                    removed: rgb(palette.failed).into(),
-                };
-                let block = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .w_full()
-                    .px(px(CODE_PAD))
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(palette.panel_soft))
-                    // Language on the left, a copy button on the right; a block
-                    // without a language still gets the button.
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_between()
-                            .w_full()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(palette.faint))
-                                    .child(language),
-                            )
-                            .child(
-                                div()
-                                    .id(("code-copy", code_copy_id(message, number)))
-                                    .flex_shrink_0()
-                                    .px_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .text_color(rgb(if copied {
-                                        palette.ok
-                                    } else {
-                                        palette.faint
-                                    }))
-                                    .cursor_pointer()
-                                    .hover(move |style| style.bg(rgb(palette.border)))
-                                    .on_click(move |_, window, cx| {
-                                        on_copy(number, clickable.clone(), window, cx);
-                                    })
-                                    .child(if copied { "已复制" } else { "复制" }),
-                            ),
-                    );
-                block
-                    .child(
-                        div()
-                            .id(("code-scroll", code_copy_id(message, number)))
-                            .flex()
-                            .flex_col()
-                            .items_start()
-                            .w_full()
-                            .min_w(px(0.))
-                            .overflow_x_scroll()
-                            .track_scroll(&block_scroll((message, number)))
-                            .font_family(MONO_FONT)
-                            .text_xs()
-                            .text_color(rgb(tone))
-                            .whitespace_normal()
-                            .child(
-                                code_selectable(number, body, emphasis, &[]).with_tokens(tokens),
-                            ),
-                    )
-                    .into_any_element()
-            }
-        };
+                        .into_any_element()
+                }
+                markdown::Block::Code(language, body) => {
+                    let language = language_label(language);
+                    let copied = copied_block == Some(number);
+                    let body: SharedString = body.clone().into();
+                    let clickable = body.clone();
+                    let on_copy = on_copy.clone();
+                    // Keywords, strings, numbers and comments each get a colour; the
+                    // palette has no code-specific fields, so the ones it has stand in.
+                    let tokens = TokenColors {
+                        comment: rgb(palette.faint).into(),
+                        string: rgb(palette.ok).into(),
+                        number: rgb(palette.warn).into(),
+                        keyword: rgb(palette.accent).into(),
+                        function: rgb(palette.code_function).into(),
+                        type_name: rgb(palette.code_type).into(),
+                        // A diff reads as "this line goes" and "this line comes",
+                        // so it borrows the two colours those states already use.
+                        added: rgb(palette.ok).into(),
+                        removed: rgb(palette.failed).into(),
+                    };
+                    let block = div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .w_full()
+                        .px(px(CODE_PAD))
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(palette.panel_soft))
+                        // Language on the left, a copy button on the right; a block
+                        // without a language still gets the button.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_between()
+                                .w_full()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(palette.faint))
+                                        .child(language),
+                                )
+                                .child(
+                                    div()
+                                        .id(("code-copy", code_copy_id(message, number)))
+                                        .flex_shrink_0()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .text_color(rgb(if copied {
+                                            palette.ok
+                                        } else {
+                                            palette.faint
+                                        }))
+                                        .cursor_pointer()
+                                        .hover(move |style| style.bg(rgb(palette.border)))
+                                        .on_click(move |_, window, cx| {
+                                            on_copy(number, clickable.clone(), window, cx);
+                                        })
+                                        .child(if copied { "已复制" } else { "复制" }),
+                                ),
+                        );
+                    // One number per source line: the code lays out unwrapped, so the
+                    // gutter's line height matches the code's exactly. The numbers sit
+                    // outside the sideways scroller, so a long line never drags them
+                    // off; the copy button still copies the code alone.
+                    let (_lines, gutter) = line_numbers(&body);
+                    block
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_start()
+                                .w_full()
+                                .min_w(px(0.))
+                                .child(
+                                    div()
+                                        .flex_shrink_0()
+                                        .pr_2()
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .text_color(rgb(palette.faint))
+                                        .child(gutter),
+                                )
+                                .child(
+                                    div()
+                                        .id(("code-scroll", code_copy_id(message, number)))
+                                        .flex()
+                                        .flex_col()
+                                        .items_start()
+                                        .flex_1()
+                                        .min_w(px(0.))
+                                        .overflow_x_scroll()
+                                        .track_scroll(&block_scroll((message, number)))
+                                        .font_family(MONO_FONT)
+                                        .text_xs()
+                                        .text_color(rgb(tone))
+                                        .whitespace_normal()
+                                        .child(
+                                            code_selectable(number, body, emphasis, &[])
+                                                .with_tokens(tokens),
+                                        ),
+                                ),
+                        )
+                        .into_any_element()
+                }
+            };
         match kind {
             Some(_) => list.push(element),
             None => rows.push(element),

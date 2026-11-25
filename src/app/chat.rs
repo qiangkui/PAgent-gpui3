@@ -53,6 +53,20 @@ impl DshFlowApp {
                         pending.approval.as_deref() == Some(message.call.as_str())
                     })
             });
+            let waiting_question = last.is_some_and(|message| {
+                matches!(message.role, Role::Question)
+                    && message.output.trim().is_empty()
+                    && self.active_pending().is_some_and(|pending| {
+                        pending.question.as_deref() == Some(message.call.as_str())
+                    })
+            });
+            let waiting_plan = last.is_some_and(|message| {
+                matches!(message.role, Role::Plan)
+                    && message.output.trim().is_empty()
+                    && self.active_pending().is_some_and(|pending| {
+                        pending.plan.as_deref() == Some(message.call.as_str())
+                    })
+            });
             if !pending.draft.trim().is_empty() {
                 let on_drag: Rc<dyn Fn(usize, DragEvent, &mut Window, &mut App)> = {
                     let view = cx.entity();
@@ -148,6 +162,10 @@ impl DshFlowApp {
             }
             let label = if waiting_approval {
                 "等待确认".to_string()
+            } else if waiting_question {
+                "等待回答".to_string()
+            } else if waiting_plan {
+                "等待批准计划".to_string()
             } else if calling {
                 "正在调用工具".to_string()
             } else if pending.draft.trim().is_empty() {
@@ -222,6 +240,10 @@ impl DshFlowApp {
                                 "「{title}」{} · {}",
                                 if pending.approval.is_some() {
                                     "等待确认"
+                                } else if pending.question.is_some() {
+                                    "等待回答"
+                                } else if pending.plan.is_some() {
+                                    "等待批准计划"
                                 } else {
                                     "正在回答"
                                 },
@@ -253,6 +275,13 @@ impl DshFlowApp {
                     )
                     .into_any_element(),
             );
+        }
+
+        // Follow the answer while it streams in, but only while the reader is
+        // at the end: scrolling up must win over the next delta, and the ↓
+        // control is the way back. Nothing to follow in an empty conversation.
+        if !chat.messages.is_empty() && !self.scrolled_away_from_bottom() {
+            self.chat_scroll.scroll_to_bottom();
         }
 
         div()
@@ -314,10 +343,32 @@ impl DshFlowApp {
                         })
                     })
                     .when(self.shown_chat_tab() == ChatTab::Context, |this| {
-                        this.child(self.render_context_view(palette, cx))
+                        this.child(appear(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .w_full()
+                                .min_h(px(0.))
+                                .min_w(px(0.))
+                                .child(self.render_context_view(palette, cx)),
+                            "chat-tab-context",
+                            0.,
+                        ))
                     })
                     .when(self.shown_chat_tab() == ChatTab::Tasks, |this| {
-                        this.child(self.render_tasks_view(palette, cx))
+                        this.child(appear(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .w_full()
+                                .min_h(px(0.))
+                                .min_w(px(0.))
+                                .child(self.render_tasks_view(palette, cx)),
+                            "chat-tab-tasks",
+                            0.,
+                        ))
                     }),
             )
             .when(self.shown_chat_tab() == ChatTab::Chat, |this| {
@@ -577,6 +628,7 @@ impl DshFlowApp {
             .child(row)
             // The two views of the conversation, directly under its name.
             .child(self.render_chat_tabs(palette, cx))
+            .child(self.render_todos(palette, cx))
             // One device pixel: `1. / scale` logical px, the thinnest line the
             // display can draw.
             .child(
@@ -585,6 +637,124 @@ impl DshFlowApp {
                     .h(px(1. / self.scale_factor.max(1.)))
                     .bg(rgb(palette.chrome)),
             )
+    }
+
+    /// The conversation's todo list, under the tab strip.
+    ///
+    /// It stays out of the transcript so it does not scroll away, and folds to
+    /// one line when nobody is reading it. The model writes the whole list on
+    /// every `todo_write`, so the last write always replaces the card.
+    pub(crate) fn render_todos(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
+        let chat = self.chat();
+        if chat.todos.is_empty() {
+            return div();
+        }
+        let total = chat.todos.len();
+        let done = chat
+            .todos
+            .iter()
+            .filter(|todo| todo.status == TodoStatus::Done)
+            .count();
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .w_full()
+            .min_w(px(0.))
+            .px_5()
+            .pb_1();
+        card =
+            card.child(
+                div()
+                    .id("todos-head")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.todos_open = !view.todos_open;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(palette.muted))
+                            .child(format!("待办 {done}/{total}")),
+                    )
+                    .child(div().text_xs().text_color(rgb(palette.faint)).child(
+                        if self.todos_open {
+                            "▾ 收起"
+                        } else {
+                            "▸ 展开"
+                        },
+                    )),
+            );
+        if self.todos_open {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .w_full()
+                .min_w(px(0.))
+                .pt_1();
+            for (index, todo) in chat.todos.iter().enumerate().take(8) {
+                let color = match todo.status {
+                    TodoStatus::Done => palette.ok,
+                    TodoStatus::Active => palette.accent,
+                    TodoStatus::Pending => palette.faint,
+                };
+                list = list.child(
+                    div()
+                        .id(("todo", index))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .w_full()
+                        .min_w(px(0.))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .size(px(6.))
+                                .rounded_full()
+                                .bg(rgb(color)),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .w(px(52.))
+                                .text_xs()
+                                .text_color(rgb(palette.faint))
+                                .child(todo.status.label()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.))
+                                .truncate()
+                                .text_xs()
+                                .text_color(rgb(if todo.status == TodoStatus::Done {
+                                    palette.faint
+                                } else {
+                                    palette.text
+                                }))
+                                .child(todo.text.clone()),
+                        ),
+                );
+            }
+            if total > 8 {
+                list = list.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(palette.faint))
+                        .child(format!("…另有 {} 项", total - 8)),
+                );
+            }
+            card = card.child(list);
+        }
+        card
     }
 
     /// The model a conversation is using: the last answer's, else the active
@@ -1014,16 +1184,12 @@ impl DshFlowApp {
 
     /// How much room the transcript must leave for the composer.
     ///
-    /// The card grows with the draft, so a fixed clearance would let the last
-    /// message hide behind it; each extra line adds its height, up to the number
-    /// of lines drawn. An attachment row adds its own height the same way.
+    /// The card grows with the draft — one row per manual line, and one more for
+    /// every line too long to fit — so a fixed clearance would let the last
+    /// message hide behind it. An attachment row adds its own height the same
+    /// way.
     pub(crate) fn composer_clearance(&self) -> Pixels {
-        let lines = self
-            .composer
-            .text
-            .split('\n')
-            .count()
-            .clamp(1, MAX_COMPOSER_LINES);
+        let lines = self.composer_rows().clamp(1, MAX_COMPOSER_LINES);
         let extra = (lines - 1) as f32 * COMPOSER_LINE_HEIGHT;
         let attachments = if self.attachments.is_empty() {
             0.
@@ -1031,6 +1197,24 @@ impl DshFlowApp {
             ATTACHMENT_ROW_HEIGHT
         };
         px(COMPOSER_CLEARANCE + extra + attachments)
+    }
+
+    /// How many rows the draft occupies once folded into the card's width.
+    ///
+    /// Falls back to the manual line count until the first frame has been laid
+    /// out and a text system is at hand.
+    pub(crate) fn composer_rows(&self) -> usize {
+        let Some(text_system) = self.window_text.as_deref() else {
+            return self.composer.text.split('\n').count().max(1);
+        };
+        crate::app::fields::field_rows(
+            text_system,
+            &self.composer.text,
+            self.field_text_width(Field::Composer),
+            true,
+        )
+        .len()
+        .max(1)
     }
 
     /// Copy one message to the clipboard.
@@ -1134,11 +1318,24 @@ impl DshFlowApp {
         cx.notify();
     }
 
-    /// Tick or untick a task box of an answer.
+    /// Open or close the thinking block above one answer.
     ///
-    /// The box draws the reverse of what the answer wrote, like a `<details>`
-    /// section: the click is the reader's, and it is saved with the
-    /// conversation so it survives a restart.
+    /// Saved with the conversation, like a `<details>` section, so the reader's
+    /// choice survives a restart.
+    pub(crate) fn toggle_reasoning(&mut self, message: usize, cx: &mut Context<Self>) {
+        if let Some(entry) = self
+            .chats
+            .get_mut(self.active_chat)
+            .and_then(|chat| chat.messages.get_mut(message))
+        {
+            entry.open = !entry.open;
+        }
+        if message != DRAFT_MESSAGE {
+            self.save_chats();
+        }
+        cx.notify();
+    }
+
     /// Expand or fold one tool row; the choice is saved with the conversation.
     pub(crate) fn toggle_tool_row(
         &mut self,

@@ -12,10 +12,24 @@ serde_json = { version = "1.0.154", features = ["preserve_order"] }
 # through gpui, so this adds no new transitive crates.
 image = { version = "0.25", default-features = false, features = ["bmp", "png"] }
 
+[[bin]]
+name = "dsh-sandbox"
+path = "src/bin/dsh-sandbox.rs"
+
 # Only for grabbing the native handle of the settings window, so Windows can
-# round its corners and drop the 1px frame border.
+# round its corners and drop the 1px frame border; the sandbox helper needs the
+# process/token APIs from the same tree.
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 # A debug build is what `cargo build` produces, and GPUI apps are unusable
 # without optimised dependencies: text shaping, layout and painting live in

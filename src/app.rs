@@ -19,16 +19,16 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Background, BorderStyle, Bounds, ClipboardItem, Context, Corners, CursorStyle,
-    Div, Edges, Element, ElementId, ElementInputHandler, Entity, EntityInputHandler, ExternalPaths,
-    FocusHandle, GlobalElementId, Hsla, InspectorElementId, IntoElement, KeyDownEvent, LayoutId,
-    MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad, Pixels, Point, Render, ScrollHandle,
-    SharedString, TextRun, UTF16Selection, Window, WindowControlArea, WindowHandle, div, point, px,
-    relative, rgb, size, svg,
+    Animation, AnimationExt, AnyElement, App, Background, BorderStyle, Bounds, ClipboardItem,
+    Context, Corners, CursorStyle, Div, Edges, Element, ElementId, ElementInputHandler, Entity,
+    EntityInputHandler, ExternalPaths, FocusHandle, GlobalElementId, Hsla, InspectorElementId,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, PaintQuad,
+    Pixels, Point, Render, ScrollEvent, ScrollHandle, SharedString, TextRun, UTF16Selection,
+    Window, WindowControlArea, WindowHandle, div, point, px, relative, rgb, size, svg,
 };
 
 use crate::ai::{AiEvent, AiRequest, Speaker, Turn};
-use crate::config::{AiSettings, Connection, PRESETS, Sampling, model_versions};
+use crate::config::{AiSettings, Connection, PRESETS, Reasoning, model_versions, offered_models};
 use crate::engine::{
     self, RunCredentials, RunMessage, RunOutcome, RunSession, StepView, WorkflowEntry,
 };
@@ -200,8 +200,24 @@ pub(crate) fn picker_stale(elapsed: Duration) -> bool {
 pub(crate) enum PickResult {
     /// Files chosen for the composer.
     Files(Vec<std::path::PathBuf>),
+    /// One folder chosen to be installed as a skill or an external plugin.
+    Folder(std::path::PathBuf),
     /// The dialog closed without a choice.
     Cancelled,
+}
+
+/// What a native dialog was opened for.
+///
+/// The answer has to be routed when it arrives: a dialog cannot change what it
+/// was asking for while it is up.
+#[derive(Clone, Debug)]
+pub(crate) enum PickPurpose {
+    /// Attach the chosen files to the conversation in this folder.
+    Attach(String),
+    /// Copy the chosen folder in as a skill.
+    Skill,
+    /// Copy the chosen folder in as an external plugin.
+    Plugin,
 }
 
 /// What the main pane shows.
@@ -292,6 +308,9 @@ impl ToolMode {
         chat.read_only = self == Self::ReadOnly;
         chat.full_access = self == Self::Full;
         chat.auto_actions = self == Self::Full;
+        if self == Self::ReadOnly {
+            chat.auto_review = false;
+        }
     }
 }
 
@@ -374,10 +393,17 @@ pub(crate) enum Role {
     Assistant,
     /// A tool call's row.
     Tool,
+    /// The model's thinking, one row per round trip: the transcript keeps it in
+    /// the order it arrived, between the tool rows it came before.
+    Thinking,
     /// Something the window itself has to say.
     Note,
     /// A write or command waiting for a decision.
     Approval,
+    /// A structured question from the model, waiting for an option.
+    Question,
+    /// A plan the model submitted for approval before executing it.
+    Plan,
     /// A file sent with a question.
     Attachment,
 }
@@ -422,6 +448,55 @@ impl AttachmentKind {
     }
 }
 
+/// One item of the conversation's todo list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TodoItem {
+    /// What has to be done.
+    pub(crate) text: String,
+    /// Where it stands.
+    pub(crate) status: TodoStatus,
+}
+
+/// Where one todo item stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TodoStatus {
+    /// Not started.
+    Pending,
+    /// Being worked on.
+    Active,
+    /// Finished.
+    Done,
+}
+
+impl TodoStatus {
+    /// How the status is stored in `chat.json` and sent by the engine.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "in_progress",
+            Self::Done => "completed",
+        }
+    }
+
+    /// Read a stored status; anything unknown is still pending.
+    pub(crate) fn from_key(key: &str) -> Self {
+        match key.trim().to_ascii_lowercase().as_str() {
+            "in_progress" | "active" | "doing" => Self::Active,
+            "completed" | "done" => Self::Done,
+            _ => Self::Pending,
+        }
+    }
+
+    /// Name shown beside the item.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "待办",
+            Self::Active => "进行中",
+            Self::Done => "完成",
+        }
+    }
+}
+
 /// A file sent with a question.
 #[derive(Clone, Debug)]
 pub(crate) struct Attachment {
@@ -454,6 +529,13 @@ pub(crate) struct ChatMessage {
     pub(crate) model: String,
     /// How long the answer took, in milliseconds.
     pub(crate) elapsed_ms: u64,
+    /// Wall clock the engine spent waiting for model round trips during that
+    /// answer, in milliseconds; zero when it did not report timing (older
+    /// engines and saves).
+    pub(crate) model_ms: u64,
+    /// Wall clock the engine spent running tools during that answer, in
+    /// milliseconds; zero when it did not report timing.
+    pub(crate) tool_ms: u64,
     /// Tokens the answer cost, as the endpoint reported them.
     pub(crate) tokens: u64,
     /// Tokens the request carried, for the context gauge.
@@ -468,6 +550,10 @@ pub(crate) struct ChatMessage {
     /// What each round cost, oldest first, as `(prompt, completion)`; empty for
     /// answers stored before it was kept.
     pub(crate) round_tokens: Vec<(u64, u64, u32)>,
+    /// Estimated thinking tokens of each round, oldest first: output the bill
+    /// includes that no prompt holds. Empty for providers that do not stream
+    /// reasoning.
+    pub(crate) round_reasoning: Vec<u32>,
     /// What that request was made of, as the category estimates in
     /// [`ContextKind::ALL`] order, with every round's copy added up; empty when
     /// it was not recorded.
@@ -476,8 +562,24 @@ pub(crate) struct ChatMessage {
     /// arguments and results added up. Zero for answers stored before it was
     /// recorded and for questions that used no tools.
     pub(crate) tools_tokens: u32,
+    /// Which compaction layer ran on the transcript just before that answer
+    /// (`prune`, `summary`, `drop`); empty when nothing was compressed. Kept as
+    /// a field so the panel reads a fact instead of matching the note's prose.
+    pub(crate) compaction_layer: String,
+    /// Tokens that compaction saved, when one ran; zero otherwise.
+    pub(crate) compaction_saved: u64,
+    /// Thinking the model streamed for this answer, in order; empty for providers
+    /// that send none. The transcript shows it in a collapsible block above the
+    /// answer, so it is never mistaken for what the model replied.
+    pub(crate) reasoning: String,
+    /// Raw server-tool calls of this answer, kept so the next question can hand
+    /// them back: the provider restores the pages it read from them.
+    pub(crate) server_tool_calls: Vec<serde_json::Value>,
     /// True when the answer was stopped part-way.
     pub(crate) interrupted: bool,
+    /// For a thinking row: the round trip it belongs to, counting from one. Zero
+    /// for every other row.
+    pub(crate) round: u32,
     /// Kind of file an attachment carries.
     pub(crate) kind: AttachmentKind,
     /// Tool arguments, or the diff of an approval card.
@@ -510,14 +612,22 @@ impl ChatMessage {
             tool: String::new(),
             model: String::new(),
             elapsed_ms: 0,
+            model_ms: 0,
+            tool_ms: 0,
             tokens: 0,
             context: 0,
             cache_hits: 0,
             rounds: 0,
             round_tokens: Vec::new(),
+            round_reasoning: Vec::new(),
             composition: Vec::new(),
             tools_tokens: 0,
+            compaction_layer: String::new(),
+            compaction_saved: 0,
+            reasoning: String::new(),
+            server_tool_calls: Vec::new(),
             interrupted: false,
+            round: 0,
             kind: AttachmentKind::Text,
             input: String::new(),
             output: String::new(),
@@ -545,6 +655,14 @@ impl ChatMessage {
     pub(crate) fn tool(text: impl Into<String>, failed: bool) -> Self {
         let mut message = Self::blank(Role::Tool, text);
         message.failed = failed;
+        message
+    }
+
+    /// One round's thinking, kept as its own row so the transcript shows it in
+    /// place, between the tool rows of the question it belongs to.
+    pub(crate) fn thinking(text: impl Into<String>, round: u32) -> Self {
+        let mut message = Self::blank(Role::Thinking, text);
+        message.round = round;
         message
     }
 
@@ -593,6 +711,23 @@ impl ChatMessage {
         message
     }
 
+    /// A structured question waiting for one of its options.
+    pub(crate) fn question(call: String, text: String, options: String) -> Self {
+        let mut message = Self::blank(Role::Question, text);
+        message.call = call;
+        message.input = options;
+        message.tool = "ask_user_question".to_string();
+        message
+    }
+
+    /// A plan submitted for approval before the model executes it.
+    pub(crate) fn plan_review(call: String, text: String) -> Self {
+        let mut message = Self::blank(Role::Plan, text);
+        message.call = call;
+        message.tool = "exit_plan_mode".to_string();
+        message
+    }
+
     /// A message read back from `chat.json`.
     pub(crate) fn restored(role: Role, text: String, failed: bool) -> Self {
         let mut message = Self::blank(role, text);
@@ -624,12 +759,23 @@ pub(crate) struct Chat {
     pub(crate) full_access: bool,
     /// True when commands and deletions run without asking.
     pub(crate) auto_actions: bool,
+    /// True when low-risk writes and read-only commands are approved by rule
+    /// instead of showing a card (workspace mode only).
+    pub(crate) auto_review: bool,
     /// Model round-trips one question may take.
     pub(crate) max_rounds: u32,
     /// Tool calls one question may make.
     pub(crate) max_calls: u32,
     /// Mode selecting external plugins, skills and MCP servers for this chat.
     pub(crate) mode: String,
+    /// This chat's web-search override: `None` follows the connection's own
+    /// switch, `Some` forces searching on or off for this conversation alone.
+    pub(crate) web_search: Option<bool>,
+    /// True while the conversation runs in plan mode: the model investigates
+    /// and submits a plan for approval before it executes.
+    pub(crate) plan: bool,
+    /// The conversation's standing todo list, newest write wins.
+    pub(crate) todos: Vec<TodoItem>,
     /// Commands allowed for the rest of the session, as `tool\u{0}command`.
     pub(crate) allow_session: std::collections::HashSet<String>,
     /// Collapsible blocks the reader opened, as `(message, block)`.
@@ -657,9 +803,13 @@ impl Chat {
             read_only: false,
             full_access: true,
             auto_actions: false,
+            auto_review: false,
             max_rounds: defaults.max_rounds,
             max_calls: defaults.max_calls,
             mode: crate::config::MODE_FULL.to_string(),
+            web_search: None,
+            plan: false,
+            todos: Vec::new(),
             allow_session: std::collections::HashSet::new(),
             details: std::collections::HashSet::new(),
             checks: std::collections::HashSet::new(),
@@ -795,6 +945,15 @@ pub(crate) struct PendingAnswer {
     pub(crate) request: Arc<AiRequest>,
     /// Text written so far, shown in place of the answer.
     pub(crate) draft: String,
+    /// Thinking streamed for this question, in arrival order: the request line
+    /// keeps the whole text, and a provider that sends no live rows still gets
+    /// one.
+    pub(crate) reasoning: String,
+    /// The row the current thinking stretch is writing to, if one is open.
+    pub(crate) thinking_row: Option<usize>,
+    /// How many thinking rows this question has created, so a provider that
+    /// only sends the finished text still gets one row.
+    pub(crate) thinking_rows: u32,
     /// True while the transcript follows the answer as it grows.
     pub(crate) follow: bool,
     /// Scroll offset when following started.
@@ -803,6 +962,10 @@ pub(crate) struct PendingAnswer {
     pub(crate) viewing: bool,
     /// Provider id of an approval card being waited on.
     pub(crate) approval: Option<String>,
+    /// Provider id of a structured question being waited on.
+    pub(crate) question: Option<String>,
+    /// Provider id of a plan review being waited on.
+    pub(crate) plan: Option<String>,
     /// Writes approved before the decision arrived, waiting for their row.
     pub(crate) writes: Vec<ApprovedWrite>,
     /// Model answering, for the label.
@@ -867,6 +1030,10 @@ pub(crate) struct RetryAsk {
     pub(crate) max_calls: u32,
     /// Mode id used by the original request.
     pub(crate) mode: String,
+    /// Whether that request ran in plan mode.
+    pub(crate) plan: bool,
+    /// Whether that request carried the provider's search tools.
+    pub(crate) web_search: bool,
     /// Files that went with the question, as the request carried them.
     pub(crate) attachments: Vec<crate::ai::AskAttachment>,
     /// Connections already tried, so a retry moves on.
@@ -1232,6 +1399,8 @@ pub struct DshFlowApp {
     chat_find: TextField,
     /// True while the find bar is open.
     chat_find_open: bool,
+    /// True while the keyboard-shortcut sheet is open.
+    shortcuts_open: bool,
     /// Background tasks of the conversation on screen, oldest record first.
     tasks: Vec<BackgroundTask>,
     /// Folder the list was read from, so switching conversations refreshes it.
@@ -1260,6 +1429,10 @@ pub struct DshFlowApp {
     totals_scroll: ScrollHandle,
     /// Scroll position of that table's scrollbar.
     totals_drag: Option<(Pixels, Pixels)>,
+    /// Scroll position of the expanded category item's text.
+    context_item_scroll: ScrollHandle,
+    /// Scroll position of that item's scrollbar.
+    context_item_drag: Option<(Pixels, Pixels)>,
     /// State of every table drawn in the window, by its id.
     tables: RefCell<std::collections::HashMap<&'static str, TableState>>,
     /// The table whose own bar is held, with where the drag started.
@@ -1267,19 +1440,33 @@ pub struct DshFlowApp {
     /// Tool schemas the engine last reported, keyed by conversation folder; only
     /// that conversation's panel shows them.
     tool_schemas: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Plugin panels built for the last request in each conversation, keyed by
+    /// the conversation folder. They describe one request and are rebuilt on the
+    /// next, so only that request can show them.
+    plugin_panels: std::collections::HashMap<String, Vec<crate::ai::PanelReport>>,
     /// Prompt fragments the enabled plugins inject, as `(plugin id, text)`.
     plugin_prompts: Vec<(String, String)>,
+    /// Tools the enabled plugins registered for the last request, as
+    /// `(plugin id, tool name)`; the plugin cards count their own.
+    plugin_tools: Vec<(String, String)>,
     /// Which past request the context tab shows, by its question number; `None`
     /// follows the newest answer.
     context_request: Option<u64>,
     /// Which round of the shown request to break down; `None` is the whole
     /// request, with every round's figures added up.
     context_round: Option<u32>,
-    /// The open round picker, at the point it was opened.
-    context_round_menu: Option<Point<Pixels>>,
+    /// True when the request list and the timeline show every request instead of
+    /// the newest `REQUEST_ROWS`.
+    context_all_requests: bool,
+    /// True when the conversation's todo card is expanded.
+    todos_open: bool,
     /// The pieces of the request on show, read once from `requests.jsonl`; the
     /// key is its folder, turn and reported size, so a continued answer reloads.
     context_detail: RefCell<Option<(String, u64, u64, u64, Vec<ContextPart>)>>,
+    /// The tool calls of the request on show, read once from its tool rows and
+    /// kept until the transcript grows; parsing every call's arguments on each
+    /// paint made scrolling a long request re-read megabytes.
+    context_actions: RefCell<Option<(String, u64, usize, Vec<RequestAction>)>>,
 
     /// Plugin folders found on disk, refreshed when the page is opened.
     installed_plugins: Vec<crate::config::InstalledPlugin>,
@@ -1295,6 +1482,9 @@ pub struct DshFlowApp {
     installed_mcp: Vec<crate::mcp::McpServer>,
     /// Servers the engine reported as broken, as `(id, message)`.
     mcp_errors: Vec<(String, String)>,
+    /// Tools the enabled MCP servers offered for the last request, as
+    /// `(server id, tool name)`; the server cards count their own.
+    mcp_tools: Vec<(String, String)>,
     /// The folder the MCP page reads.
     mcp_dir: PathBuf,
     /// What the last MCP action did, shown under the buttons.
@@ -1330,9 +1520,15 @@ pub struct DshFlowApp {
     /// The skill whose delete item is armed.
     skill_delete_confirm: Option<String>,
     /// The last breakdown built for the 上下文 tab, with the conversation state
-    /// it was built from. The schemas enter as a fingerprint, so a different tool
-    /// set with the same number of tools still rebuilds it.
-    context_cache: RefCell<Option<((usize, u64, usize, usize, u64, usize), ContextReport)>>,
+    /// it was built from. The schemas and the model enter as fingerprints, so a
+    /// different tool set or model still rebuilds it, and the answer reserve the
+    /// active connection contributes is part of the key as well.
+    context_cache: RefCell<
+        Option<(
+            (usize, u64, usize, usize, u64, usize, u64, u64),
+            ContextReport,
+        )>,
+    >,
     /// The window the statistics page covers.
     stats_range: StatsRange,
     /// Bumped when a request reaches the permanent ledger, so the cached report
@@ -1354,16 +1550,20 @@ pub struct DshFlowApp {
     ai: AiSettings,
     /// Editable boxes of the model connections, one set per connection.
     conn_fields: Vec<ConnFields>,
-    /// The open file dialog, the thread answering it, and the conversation it was
-    /// opened for: switching chats while a dialog is up must not attach the chosen
-    /// files to the wrong one.
-    picker: Option<(std::sync::mpsc::Receiver<PickResult>, Instant, String)>,
+    /// The caption button the pointer is over, painted by the window itself.
+    ///
+    /// Those cells are non-client areas for the platform, so gpui's own hover
+    /// hit-test does not always see the move that enters them.
+    title_hover: Option<WindowControlArea>,
+    /// The open native dialog, the thread answering it, and what the answer is
+    /// for: switching chats while an attach dialog is up must not attach the
+    /// chosen files to the wrong conversation.
+    picker: Option<(std::sync::mpsc::Receiver<PickResult>, Instant, PickPurpose)>,
     /// True while the model menu is open.
     model_menu: bool,
     /// True while the tool menu is open.
     tools_menu: bool,
     /// True while the budget menu is open.
-    budget_menu: bool,
     /// True while the attach menu (files / commands) is open.
     attach_menu: bool,
     /// Which model tab the AI block shows.
@@ -1434,6 +1634,9 @@ pub struct DshFlowApp {
     steps_scroll: ScrollHandle,
     /// Scroll position of the transcript.
     chat_scroll: ScrollHandle,
+    /// Text system of the frame being built, so the composer's wrapped height
+    /// can be measured before the composer itself is drawn.
+    window_text: Option<Rc<gpui::WindowTextSystem>>,
     /// Scroll position of each collapsible block, by `(message, block)`.
     block_scroll: RefCell<std::collections::HashMap<(usize, usize), ScrollHandle>>,
     /// Parsed markdown of each message, kept between frames.
@@ -1602,6 +1805,7 @@ impl DshFlowApp {
             chat_filter: TextField::new(cx),
             chat_find: TextField::new(cx),
             chat_find_open: false,
+            shortcuts_open: false,
             tasks: Vec::new(),
             tasks_dir,
             task_selected: None,
@@ -1616,14 +1820,20 @@ impl DshFlowApp {
             context_scroll: ScrollHandle::new(),
             totals_scroll: ScrollHandle::new(),
             totals_drag: None,
+            context_item_scroll: ScrollHandle::new(),
+            context_item_drag: None,
             tables: RefCell::new(std::collections::HashMap::new()),
             table_drag: None,
             tool_schemas: std::collections::HashMap::new(),
+            plugin_panels: std::collections::HashMap::new(),
             plugin_prompts: Vec::new(),
+            plugin_tools: Vec::new(),
             context_request: None,
             context_round: None,
-            context_round_menu: None,
+            context_all_requests: false,
+            todos_open: false,
             context_detail: RefCell::new(None),
+            context_actions: RefCell::new(None),
             installed_plugins: crate::config::installed_plugins(),
             plugin_errors: Vec::new(),
             plugin_note: String::new(),
@@ -1631,6 +1841,7 @@ impl DshFlowApp {
             plugin_delete_confirm: None,
             installed_mcp: crate::mcp::scanned(&mcp_dir),
             mcp_errors: Vec::new(),
+            mcp_tools: Vec::new(),
             mcp_dir,
             mcp_note: String::new(),
             open_mcp_cards: Vec::new(),
@@ -1655,10 +1866,10 @@ impl DshFlowApp {
             renaming: None,
             ai,
             conn_fields,
+            title_hover: None,
             picker: None,
             model_menu: false,
             tools_menu: false,
-            budget_menu: false,
             attach_menu: false,
             model_tab: 0,
             ai_status: None,
@@ -1703,6 +1914,7 @@ impl DshFlowApp {
             log_scroll: ScrollHandle::new(),
             steps_scroll: ScrollHandle::new(),
             chat_scroll: ScrollHandle::new(),
+        window_text: None,
             block_scroll: RefCell::new(std::collections::HashMap::new()),
             parsed: RefCell::new(std::collections::HashMap::new()),
             sidebar_width: sidebar_width(saved.width),
@@ -1841,6 +2053,7 @@ mod render;
 mod run_actions;
 mod settings;
 mod settings_window;
+mod shortcuts;
 mod sidebar;
 mod skills;
 mod stats;
@@ -1854,10 +2067,9 @@ mod widgets;
 #[allow(unused_imports)]
 pub(crate) use {
     ai_actions::*, ai_settings::*, chat::*, chat_actions::*, compact::*, composer::*,
-    context_view::*, conversations::*, datatable::*, fields::*, flow::*, input::*,
-    instructions::*, mcp::*, message::*, metrics::*, modes::*, plugins::*, render::*, run_actions::*,
-    settings::*, settings_window::*, sidebar::*, skills::*, stats::*, steps::*, tasks::*, util::*,
-    widgets::*,
+    context_view::*, conversations::*, datatable::*, fields::*, flow::*, input::*, instructions::*,
+    mcp::*, message::*, metrics::*, modes::*, plugins::*, render::*, run_actions::*, settings::*,
+    settings_window::*, sidebar::*, skills::*, stats::*, steps::*, tasks::*, util::*, widgets::*,
 };
 
 #[cfg(test)]

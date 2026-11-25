@@ -299,10 +299,7 @@ impl DshFlowApp {
             }
         };
         if !candidate.is_file() {
-            self.banner = Some(Banner::error(format!(
-                "找不到报告 {}",
-                candidate.display()
-            )));
+            self.banner = Some(Banner::error(format!("找不到报告 {}", candidate.display())));
             cx.notify();
             return;
         }

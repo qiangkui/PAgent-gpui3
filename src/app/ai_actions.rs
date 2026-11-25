@@ -17,18 +17,37 @@ pub(crate) fn active_after_removal(active: usize, removed: usize, remaining: usi
 impl DshFlowApp {
     /// Copy the editable connection fields back into the settings.
     ///
-    /// Pick the temperature preset for one connection.
+    /// Pick the temperature for one connection; `None` leaves it to the endpoint.
     ///
     /// It rides along with every request instead of being proven by a test, so
-    /// switching it does not invalidate the endpoint.
-    pub(crate) fn set_sampling(
+    /// moving the slider does not invalidate the endpoint.
+    pub(crate) fn set_temperature(
         &mut self,
         index: usize,
-        sampling: Sampling,
+        temperature: Option<f64>,
         cx: &mut Context<Self>,
     ) {
         if let Some(connection) = self.ai.connections.get_mut(index) {
-            connection.sampling = sampling;
+            connection.temperature = temperature;
+        }
+        if let Err(error) = self.ai.save() {
+            self.banner = Some(Banner::error(error));
+        }
+        cx.notify();
+    }
+
+    /// Pick whether the model thinks first, and how hard.
+    ///
+    /// Like the temperature it rides along with every request instead of being
+    /// proven by a test, so switching it keeps the endpoint selectable.
+    pub(crate) fn set_reasoning(
+        &mut self,
+        index: usize,
+        reasoning: Reasoning,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(connection) = self.ai.connections.get_mut(index) {
+            connection.reasoning = reasoning;
         }
         if let Err(error) = self.ai.save() {
             self.banner = Some(Banner::error(error));
@@ -40,6 +59,21 @@ impl DshFlowApp {
     pub(crate) fn set_max_tokens(&mut self, index: usize, value: u32, cx: &mut Context<Self>) {
         if let Some(connection) = self.ai.connections.get_mut(index) {
             connection.max_tokens = value;
+        }
+        if let Err(error) = self.ai.save() {
+            self.banner = Some(Banner::error(error));
+        }
+        cx.notify();
+    }
+
+    /// Say how large this endpoint's context window is; zero asks the table.
+    ///
+    /// The engine compacts at 80% of this figure and the gauge reads it, so a
+    /// local model smaller than the 128k default no longer overflows before
+    /// anything is compressed.
+    pub(crate) fn set_window(&mut self, index: usize, value: u64, cx: &mut Context<Self>) {
+        if let Some(connection) = self.ai.connections.get_mut(index) {
+            connection.window = value;
         }
         if let Err(error) = self.ai.save() {
             self.banner = Some(Banner::error(error));
@@ -65,8 +99,10 @@ impl DshFlowApp {
                 base_url: fields.base_url.text.clone(),
                 verified: connection.verified,
                 models: connection.models.clone(),
-                sampling: connection.sampling,
+                temperature: connection.temperature,
+                reasoning: connection.reasoning,
                 max_tokens: connection.max_tokens,
+                window: connection.window,
             }
             .normalized();
             if edited.model != connection.model
@@ -381,6 +417,8 @@ impl DshFlowApp {
             &[],
             crate::config::DEFAULT_MAX_ROUNDS,
             crate::config::DEFAULT_MAX_CALLS,
+            false,
+            true,
             &[],
             // A connectivity test never carries plugins: it is about the key.
             None,
@@ -460,10 +498,15 @@ impl DshFlowApp {
                 | AiEvent::ToolStart { .. }
                 | AiEvent::ToolOutput { .. }
                 | AiEvent::Progress { .. }
-                | AiEvent::Approval { .. } => continue,
+                | AiEvent::Approval { .. }
+                | AiEvent::Question { .. }
+                | AiEvent::Plan { .. }
+                | AiEvent::Todo { .. } => continue,
                 // Fragments only matter while an answer is being written; a
                 // test keeps the finished text from `Done`.
                 AiEvent::Delta(_) => continue,
+                // Thinking is not the answer either; a test reads `Done`.
+                AiEvent::Reasoning(_) => continue,
                 // Tool schemas belong to the context panel, not to a test.
                 AiEvent::Tools { .. } => continue,
             });

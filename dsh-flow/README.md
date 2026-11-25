@@ -249,10 +249,29 @@ node src/cli.ts models                   # 该接入点可用的模型：stdin {
   最后再输出完整的 `{"text":…}`；对面不支持流式（回 JSON）时自动退回整段解析。
 - `models` 走 OpenAI 兼容的 `GET {baseUrl}/models`，返回该 Key 能用的模型 id（排序去重，也兼容
   `{models:[…]}` 这种简写），供界面列出可选版本；失败时返回 `{"error":"…"}`。
+- `ai` 可带 `"reasoning": "off" | "low" | "high" | "max"` 选择思考方式（省略或 `default` = 端点默认）：
+  `off` 写成 `{"thinking":{"type":"disabled"}}`，其余写成 `reasoning_effort`；多轮循环、轮次用尽的总结轮
+  与单次问答用的是同一个选择。开思考时端点把思考作为 `reasoning_content` 流回来，引擎逐行输出
+  `{"type":"reasoning","text":"…"}`（不混进 `delta`），并回报逐轮估算 `roundReasoning` 与整问 `reasoning`；
+  思考不计入回答，也不进提示词。
+- 压缩用的摘要调用（`src/compact.ts`）对 DeepSeek 端点固定关闭思考：摘要必须落在自己的
+  `max_tokens` 里，思考会把它吃掉。
+- `ai` 可带 `"webSearch": true`：在 `tools` 最前面加上服务端工具 `deepseek_web_search` /
+  `deepseek_read_url`。搜什么、打开哪一页由模型决定，搜索在 DeepSeek 服务器上执行，**客户端不执行工具**；
+  回包的 `server_tool_calls` / `annotations` 会被翻译成与本地工具同形的 `step`（`web_search` / `read_url`，
+  含「标题 — URL」来源），最终答案另带 `webSearch: { searches, fetches, sources }` 与原始 `serverToolCalls`。
+  搜索开始时先按 `server_tool_event` 的 `call_started` 发一条 `tool_start`（进行中行），完成时用同一 `call` id
+  的 `step` 替换；网关不认识这两个工具类型时自动去掉它们重发一次。
+- `history` 里的助手段落可带 `"serverToolCalls"`（就是上一次回答的 `serverToolCalls`）：引擎原样放进该条
+  assistant 消息的 `server_tool_calls`，提供方据此恢复之前读过的页面；同一问内的工具轮也会把本轮的服务端
+  调用带上。丢了它请求仍会成功，只是早先读的页面不在上下文里。
 - `ai` 带上 `"tools": true` 时，引擎会先跑工具循环（`src/agent.ts` + `src/tools.ts`）：
   每个工具调用**一执行完就**输出一行 `{"type":"step","tool":"read","target":"a.txt","ok":true,"detail":"已读取 12 行"}`
   （`detail` 是摘要：`read` / `glob` / `grep` 折成行数、文件数、匹配数），最后再输出 `{"text":…}`。
   工具被限制在当前工作目录内。注意工具轮里的 `delta` 属于那一轮的过程文本，界面收到 `step` 会清掉它。
+- 工具轮的上下文有上限：单个结果按 `MAX_TOOL_MESSAGE` 截取，整问的结果总量按 `MAX_TOOL_CONTEXT` 逐步省略；
+  一次调用的参数超过 `MAX_WIRE_ARGUMENTS` 时，执行完就换成一句说明（id 与工具名保留，`tool_call_id` 配对不变），
+  免得一次大文件写入在后续每一轮里重发。模型因输出上限被截断时，回答末尾会带一句「输出达到长度上限」。
 
 ---
 
@@ -340,6 +359,7 @@ node src/cli.ts derive session.jsonl --out out/derived --name triage-session
 - `explain` 输出 AI 依赖度（`ai` 步骤数 / 总步骤数）与每个判断点的 `why`
 - `derive`：从 dsh 会话 JSONL 生成骨架（命令 → `run` 步骤；判断点与其它调用 → `# TODO`）
 - `run` 的两处通道：`--credentials-stdin`（界面把接入点交给 `ai` 步骤）与字符串命令走 shell
+- 思考开关与力度：`ai` 桥的 `reasoning`（`off` / `low` / `high` / `max`），逐轮思考随 `reasoning` 事件与 `roundReasoning` 回报
 
 **未实现（按计划推进）**
 

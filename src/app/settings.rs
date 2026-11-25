@@ -2,32 +2,6 @@
 
 use super::*;
 
-/// Folder name of the example plugin the settings page can write.
-pub(crate) const EXAMPLE_PLUGIN_ID: &str = "hello-example";
-
-/// Its `plugin.json`: the smallest manifest the engine accepts.
-pub(crate) const EXAMPLE_PLUGIN_MANIFEST: &str =
-    "{\n  \"name\": \"示例：回显\",\n  \"version\": \"1.0.0\",\n  \"api\": 1\n}\n";
-
-/// Its entry module: one tool and one prompt fragment, both wired for real.
-pub(crate) const EXAMPLE_PLUGIN_SOURCE: &str = "// 一个最小可用的插件：注册一个工具，并在系统提示里加一句话。\n\
-// 改完保存，下一轮提问就会用新版本（引擎每次都重新读这个文件夹）。\n\
-export function activate(api) {\n\
-  api.registerTool(\n\
-    {\n\
-      name: 'plugin_echo',\n\
-      description: '把参数 text 原样返回，用来确认插件链路通了',\n\
-      parameters: {\n\
-        type: 'object',\n\
-        properties: { text: { type: 'string', description: '要回显的文字' } },\n\
-        required: ['text']\n\
-      }\n\
-    },\n\
-    (args) => `echo: ${String(args.text ?? '')}`\n\
-  )\n\
-  api.injectPrompt('示例插件：需要确认工具链路时可以用 plugin_echo 回显一段文字。')\n\
-}\n";
-
 impl DshFlowApp {
     /// Settings: a left index of the blocks, and the chosen block on the right.
     ///
@@ -60,6 +34,9 @@ impl DshFlowApp {
                     .min_w(px(0.))
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    // A sheet laid over the panel: its own wheel must not reach
+                    // the conversation behind it once the page is at its ends.
+                    .contained_wheel()
                     // The page is a sheet laid over the panel: its top-left corner is rounded
                     // so the navigation colour shows through the notch, and the
                     // bottom-right corner keeps the window's own 12px radius.
@@ -348,12 +325,11 @@ impl DshFlowApp {
             .clone()
             .map(|(text, error)| settings_notice(&text, error, palette));
 
-        let editor = settings_card("指令内容", palette)
-            .child(settings_note(
-                "每轮提问开始时读取；留空保存会删除文件。工作区根目录的 AGENTS.md 仍是兜底，\
-                 超过 2 万字符的部分不会进入模型。",
-                palette,
-            ))
+        let editor = settings_card_help(
+            "指令内容",
+            "每轮提问开始时读取；留空保存会删除文件。工作区根目录的 AGENTS.md 仍是兜底，超过 2 万字符的部分不会进入模型。",
+            palette,
+        )
             .child(self.render_field(
                 Field::ChatInstructions,
                 "例如：回答用中文；改完代码先跑 cargo test",
@@ -408,9 +384,6 @@ impl DshFlowApp {
     /// The dialog blocks its thread, and the chosen files are attached when it
     /// answers. The menu closes first so the dialog is not drawn under a popup.
     pub(crate) fn open_attach_picker(&mut self, kind: AttachmentKind, cx: &mut Context<Self>) {
-        if self.picker_busy(cx) {
-            return;
-        }
         // The dialog belongs to the conversation that was open when it started;
         // a switch while it is up must not move the files into another question.
         let dir = self
@@ -418,18 +391,47 @@ impl DshFlowApp {
             .get(self.active_chat)
             .map(|chat| chat.dir.clone())
             .unwrap_or_default();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let answer = match crate::folder::pick_files(attach_filter(kind)) {
+        let filter = attach_filter(kind);
+        let opened = self.open_picker(
+            PickPurpose::Attach(dir),
+            move || match crate::folder::pick_files(filter) {
                 Some(paths) => PickResult::Files(paths),
                 None => PickResult::Cancelled,
-            };
-            let _ = sender.send(answer);
-        });
-        self.picker = Some((receiver, Instant::now(), dir));
-        self.spawn_picker_pump(cx);
+            },
+            cx,
+        );
+        if !opened {
+            return;
+        }
         self.attach_menu = false;
         cx.notify();
+    }
+
+    /// Open one native dialog on a worker thread and route its answer.
+    ///
+    /// Only one dialog is ever up: a stale or already answered picker is
+    /// collected first, and a second request made meanwhile is dropped rather
+    /// than queued behind a window the reader may never close. `open` runs on
+    /// the worker thread and blocks there until the reader answers.
+    ///
+    /// @returns whether the dialog was started.
+    pub(crate) fn open_picker(
+        &mut self,
+        purpose: PickPurpose,
+        open: impl FnOnce() -> PickResult + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.picker_busy(cx) {
+            return false;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(open());
+        });
+        self.picker = Some((receiver, Instant::now(), purpose));
+        self.spawn_picker_pump(cx);
+        cx.notify();
+        true
     }
 
     /// Forget a dialog that can no longer answer, then say whether one is open.
@@ -474,19 +476,19 @@ impl DshFlowApp {
 
     /// Apply what the dialog answered, if it has closed.
     pub(crate) fn pump_picker(&mut self, cx: &mut Context<Self>) {
-        let Some((receiver, _, dir)) = self.picker.as_ref() else {
+        let Some((receiver, _, purpose)) = self.picker.as_ref() else {
             return;
         };
-        let dir = dir.clone();
+        let purpose = purpose.clone();
         let answer = match receiver.try_recv() {
             Ok(answer) => answer,
             Err(std::sync::mpsc::TryRecvError::Empty) => return,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => PickResult::Cancelled,
         };
         self.picker = None;
-        match answer {
-            PickResult::Cancelled => {}
-            PickResult::Files(paths) => {
+        match (purpose, answer) {
+            (_, PickResult::Cancelled) => {}
+            (PickPurpose::Attach(dir), PickResult::Files(paths)) => {
                 let active = self
                     .chats
                     .get(self.active_chat)
@@ -500,6 +502,15 @@ impl DshFlowApp {
                     self.show_toast("对话已切换，已忽略刚选的文件", true, cx);
                 }
             }
+            (PickPurpose::Skill, PickResult::Folder(folder)) => {
+                self.install_skill_folder(&folder, cx)
+            }
+            (PickPurpose::Plugin, PickResult::Folder(folder)) => {
+                self.install_plugin_folder(&folder, cx)
+            }
+            // A dialog only answers the question it was opened for; anything
+            // else is a mix-up, and dropping it beats installing the wrong thing.
+            _ => {}
         }
     }
 
@@ -571,11 +582,7 @@ impl DshFlowApp {
     }
 
     /// 数据: where the records live, and the backup / restore / export actions.
-    pub(crate) fn render_data_settings(
-        &self,
-        palette: Palette,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    pub(crate) fn render_data_settings(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
         let home = AiSettings::home();
         let data = self.ai.data_dir();
         let workspace = self.ai.workspace_dir();
@@ -676,13 +683,11 @@ impl DshFlowApp {
         let home = AiSettings::home();
         let latest_restore = crate::backup::latest_backup(&home);
         let restore_pending = crate::backup::pending_restore(&home);
-        let mut card = settings_card("备份与导出", palette)
-            .child(settings_note(
-                "备份复制可执行文件同目录的 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；\
-                 恢复会在下次启动时替换 data 与附加组件，并先自动备份当前状态；\
-                 导出把当前对话写成 Markdown 到 exports/。",
-                palette,
-            ))
+        let mut card = settings_card_help(
+            "备份与导出",
+            "备份复制可执行文件同目录的 data 目录、技能、插件、MCP 与 config.json 到 backups/（不含 workspace）；恢复会在下次启动时替换 data 与附加组件，并先自动备份当前状态；导出把当前对话写成 Markdown 到 exports/。",
+            palette,
+        )
             .child(
                 div()
                     .flex()
@@ -851,7 +856,8 @@ impl DshFlowApp {
                 } else {
                     format!("{} tok", token_amount(self.ai.budget_tokens))
                 },
-                if self.ai.budget_tokens > 0 && self.chat_metrics().billed >= self.ai.budget_tokens {
+                if self.ai.budget_tokens > 0 && self.chat_metrics().billed >= self.ai.budget_tokens
+                {
                     SettingsTone::Warn
                 } else {
                     SettingsTone::Normal
@@ -882,40 +888,40 @@ impl DshFlowApp {
         // Snippets: one chip per file, inserted into the composer on click.
         let snippets_dir = crate::snippet::dir();
         let for_example = snippets_dir.clone();
-        let mut snippet_card = settings_card("常用片段", palette)
-            .child(settings_note(
-                "把常用指令写成 snippets/ 里的 .md，点一下插入输入框。",
-                palette,
-            ))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        settings_button(
-                            "open-snippets",
-                            "打开片段目录",
-                            SettingsButton::Secondary,
-                            palette,
-                        )
-                        .on_click(cx.listener(move |_, _, _, _| {
-                            let _ = open_path(&snippets_dir);
-                        })),
+        let mut snippet_card = settings_card_help(
+            "常用片段",
+            "把常用指令写成 snippets/ 里的 .md，点一下插入输入框；插入的是文件全文，不会自动发送。",
+            palette,
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    settings_button(
+                        "open-snippets",
+                        "打开片段目录",
+                        SettingsButton::Secondary,
+                        palette,
                     )
-                    .child(
-                        settings_button(
-                            "example-snippet",
-                            "生成示例",
-                            SettingsButton::Secondary,
-                            palette,
-                        )
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.create_example_snippet(&for_example, cx);
-                        })),
-                    ),
-            );
+                    .on_click(cx.listener(move |_, _, _, _| {
+                        let _ = open_path(&snippets_dir);
+                    })),
+                )
+                .child(
+                    settings_button(
+                        "example-snippet",
+                        "生成示例",
+                        SettingsButton::Secondary,
+                        palette,
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.create_example_snippet(&for_example, cx);
+                    })),
+                ),
+        );
         let installed = crate::snippet::installed();
         if installed.is_empty() {
             snippet_card = snippet_card.child(settings_note("还没有片段。", palette));
@@ -923,11 +929,16 @@ impl DshFlowApp {
             let mut chips: Vec<AnyElement> = Vec::new();
             for (position, (name, file)) in installed.into_iter().enumerate() {
                 chips.push(
-                    settings_button(("snippet", position), &name, SettingsButton::Secondary, palette)
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.insert_snippet(&file, cx);
-                        }))
-                        .into_any_element(),
+                    settings_button(
+                        ("snippet", position),
+                        &name,
+                        SettingsButton::Secondary,
+                        palette,
+                    )
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.insert_snippet(&file, cx);
+                    }))
+                    .into_any_element(),
                 );
             }
             snippet_card =
@@ -974,16 +985,18 @@ impl DshFlowApp {
                     .flex_row()
                     .items_start()
                     .gap_3()
-                    .child(
-                        div().flex_1().min_w(px(0.)).child(settings_page_header(
-                            "诊断",
-                            "检查运行环境、文件位置，以及备份与导出。",
-                            palette,
-                        )),
-                    )
+                    .child(div().flex_1().min_w(px(0.)).child(settings_page_header(
+                        "诊断",
+                        "检查运行环境、文件位置，以及备份与导出。",
+                        palette,
+                    )))
                     .child(settings_status_pill(
                         healthy,
-                        if healthy { "环境正常" } else { "需要处理" },
+                        if healthy {
+                            "环境正常"
+                        } else {
+                            "需要处理"
+                        },
                         palette,
                     )),
             )
@@ -1082,7 +1095,11 @@ impl DshFlowApp {
         text.push_str(&format!(
             "engine: {}（{}）\n",
             self.engine_dir.display(),
-            if self.engine_ready { "可用" } else { "缺少 src/cli.ts" }
+            if self.engine_ready {
+                "可用"
+            } else {
+                "缺少 src/cli.ts"
+            }
         ));
         text.push_str(&format!("config: {}\n", home.join("config.json").display()));
         text.push_str(&format!("data: {}\n", self.ai.data_dir().display()));
@@ -1090,12 +1107,19 @@ impl DshFlowApp {
             "stats: {}\n",
             crate::stats_store::ledger_dir().display()
         ));
-        text.push_str(&format!("workspace: {}\n", self.ai.workspace_dir().display()));
+        text.push_str(&format!(
+            "workspace: {}\n",
+            self.ai.workspace_dir().display()
+        ));
         text.push_str(&format!("skills: {}\n", self.skills_dir.display()));
         text.push_str(&format!("mcp: {}\n", self.mcp_dir.display()));
         text.push_str(&format!(
             "proxy: {}\n",
-            if self.ai.proxy.is_empty() { "无" } else { &self.ai.proxy }
+            if self.ai.proxy.is_empty() {
+                "无"
+            } else {
+                &self.ai.proxy
+            }
         ));
         text.push_str(&format!("budget: {} tok\n", self.ai.budget_tokens));
         if let Some(banner) = &self.banner {

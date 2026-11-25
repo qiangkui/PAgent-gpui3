@@ -124,6 +124,11 @@ impl DshFlowApp {
                 "未启用"
             };
             let skills = server.skills.len();
+            let tools = self
+                .mcp_tools
+                .iter()
+                .filter(|(id, _)| *id == server.id)
+                .count();
             let mut summary = format!("{status} · {}", server.detail());
             if !server.description.is_empty() {
                 summary.push_str(" · ");
@@ -149,6 +154,7 @@ impl DshFlowApp {
                 },
                 border,
                 skills,
+                tools,
                 server,
             ));
         }
@@ -196,9 +202,6 @@ impl DshFlowApp {
                         cx,
                         |view, cx| view.refresh_mcp(cx),
                     ),
-                    icon_button("mcp-example", "icons/plus.svg", palette, cx, |view, cx| {
-                        view.create_example_mcp(cx)
-                    }),
                 ],
                 palette,
             ))
@@ -210,6 +213,7 @@ impl DshFlowApp {
                     .flex_1()
                     .min_h(px(0.))
                     .overflow_y_scroll()
+                    .contained_wheel()
                     .child(body),
             )
     }
@@ -230,6 +234,7 @@ impl DshFlowApp {
         description_colour: u32,
         border: u32,
         skills: usize,
+        tools: usize,
         server: &crate::mcp::McpServer,
     ) -> AnyElement {
         let open = self.open_mcp_cards.iter().any(|entry| entry == key);
@@ -322,7 +327,7 @@ impl DshFlowApp {
                     .min_w(px(0.))
                     .text_xs()
                     .text_color(rgb(palette.faint))
-                    .child(format!("{skills} 个技能")),
+                    .child(format!("{skills} 个技能 · {tools} 个工具")),
             );
         if open {
             let mut detail = format!("配置文件：{}", server.source.display());
@@ -375,29 +380,6 @@ impl DshFlowApp {
         if self.mcp_fetch.is_none() {
             self.mcp_note.clear();
         }
-        cx.notify();
-    }
-
-    /// Write a self-contained example server into the MCP folder.
-    pub(crate) fn create_example_mcp(&mut self, cx: &mut Context<Self>) {
-        self.mcp_dir = crate::mcp::locate_dir();
-        match crate::mcp::create_example(&self.mcp_dir) {
-            Ok((folder, true)) => {
-                self.mcp_note = format!(
-                    "已生成 {}：打开右边的开关，下一次提问就能用 mcp_example_server_echo。",
-                    folder.display()
-                );
-            }
-            Ok((folder, false)) => {
-                let _ = open_path(&folder);
-                self.mcp_note = format!(
-                    "{} 已存在，已打开它的文件夹（不会覆盖你改过的内容）。",
-                    folder.display()
-                );
-            }
-            Err(error) => self.mcp_note = error,
-        }
-        self.installed_mcp = crate::mcp::scanned(&self.mcp_dir);
         cx.notify();
     }
 
@@ -837,6 +819,7 @@ impl DshFlowApp {
                             .min_h(px(0.))
                             .max_h(px(MCP_SKILLS_BODY))
                             .overflow_y_scroll()
+                            .contained_wheel()
                             .track_scroll(&self.mcp_skills_scroll)
                             .children(rows),
                     )

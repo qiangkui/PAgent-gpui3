@@ -212,6 +212,32 @@ pub(crate) fn transcript_markdown(chat: &Chat) -> String {
             Role::Note => {
                 out.push_str(&format!("> {}\n\n", message.text.trim()));
             }
+            Role::Question => {
+                let state = if message.output.trim().is_empty() {
+                    "未决"
+                } else {
+                    message.output.trim()
+                };
+                out.push_str(&format!(
+                    "> 提问 · {}（{}）\n\n",
+                    one_line(&message.text),
+                    state
+                ));
+            }
+            Role::Plan => {
+                let state = if message.output.trim().is_empty() {
+                    "未决"
+                } else {
+                    message.output.trim()
+                };
+                out.push_str(&format!(
+                    "# 计划（{}）\n\n{}\n\n",
+                    state,
+                    message.text.trim()
+                ));
+            }
+            // Thinking is not part of the conversation the model reads back.
+            Role::Thinking => {}
         }
     }
     out
@@ -637,13 +663,23 @@ fn split_history(messages: &[ChatMessage]) -> (Vec<Turn>, Vec<Turn>) {
                 Role::User => Speaker::User,
                 Role::Assistant => Speaker::Assistant,
                 Role::Attachment => Speaker::User,
-                Role::Tool | Role::Note | Role::Approval => return None,
+                Role::Tool | Role::Note | Role::Approval | Role::Thinking => return None,
+                Role::Question | Role::Plan => return None,
             };
             let text = match message.role {
                 Role::Attachment => attachment_turn(&message.path, &message.text),
                 _ => message.text.clone(),
             };
-            (!text.trim().is_empty()).then_some(Turn { speaker, text })
+            let server_tool_calls = if message.role == Role::Assistant {
+                message.server_tool_calls.clone()
+            } else {
+                Vec::new()
+            };
+            (!text.trim().is_empty()).then_some(Turn {
+                speaker,
+                text,
+                server_tool_calls,
+            })
         })
         .collect();
     let mut start = turns.len().saturating_sub(MAX_TURNS);
@@ -663,6 +699,7 @@ fn split_history(messages: &[ChatMessage]) -> (Vec<Turn>, Vec<Turn>) {
         .map(|turn| Turn {
             speaker: turn.speaker,
             text: clip_turn(&turn.text, MAX_HISTORY_TURN_TOKENS),
+            server_tool_calls: turn.server_tool_calls,
         })
         .collect();
     (turns, kept)
@@ -1101,7 +1138,8 @@ pub(crate) fn tool_recap(messages: &[ChatMessage]) -> String {
             }
             // The question that started the turn is where the recap stops.
             Role::User | Role::Attachment => break,
-            Role::Assistant | Role::Note | Role::Approval => {}
+            Role::Assistant | Role::Note | Role::Approval | Role::Thinking => {}
+            Role::Question | Role::Plan => {}
         }
     }
     // Newest first while filling the budget, then back to reading order: the
@@ -1213,7 +1251,45 @@ pub(crate) fn restore_file(
     }
 }
 
+/// Width of one caption button, matching Windows' own 46px caption cells.
+pub(crate) const WINDOW_BUTTON_WIDTH: f32 = 46.;
+
+/// Which caption button sits under a pointer position, if any.
+///
+/// The three buttons are flush with the window's right edge and the title bar
+/// is the window's first row, so the pointer alone names the button. The
+/// window paints their hover state from this: the platform treats those cells
+/// as non-client, so `WM_NCMOUSEMOVE` is what arrives there and gpui's own
+/// hover hit-test does not always follow it.
+pub(crate) fn window_button_at(
+    x: f32,
+    y: f32,
+    window_width: f32,
+    bar_height: f32,
+) -> Option<WindowControlArea> {
+    if !(0.0..bar_height).contains(&y) {
+        return None;
+    }
+    let from_right = window_width - x;
+    if !(0.0..=3.0 * WINDOW_BUTTON_WIDTH).contains(&from_right) {
+        return None;
+    }
+    if from_right <= WINDOW_BUTTON_WIDTH {
+        Some(WindowControlArea::Close)
+    } else if from_right <= 2.0 * WINDOW_BUTTON_WIDTH {
+        Some(WindowControlArea::Max)
+    } else {
+        Some(WindowControlArea::Min)
+    }
+}
+
 /// The badge on an approval card.
+///
+/// Besides the engine's own tools there are two families the window never sees
+/// by name: MCP tools (`mcp` and the `mcp_<server>_<tool>` names it assigns)
+/// and whatever an external plugin registered. Anything that is neither a known
+/// built-in nor an MCP tool is a plugin tool, because those are the only two
+/// sources the engine lets add tools.
 pub(crate) fn approval_label(tool: &str) -> &'static str {
     match tool {
         "shell" => "命令确认",
@@ -1223,7 +1299,10 @@ pub(crate) fn approval_label(tool: &str) -> &'static str {
         "move" => "移动确认",
         "delete" => "删除确认",
         "replace" => "批量替换确认",
-        _ => "写入确认",
+        "write" | "edit" => "写入确认",
+        "mcp" => "MCP 确认",
+        name if name.starts_with("mcp_") => "MCP 确认",
+        _ => "插件确认",
     }
 }
 
@@ -1237,7 +1316,12 @@ pub(crate) fn approval_hint(tool: &str) -> &'static str {
         "move" => "允许后才会移动；拒绝则文件保持原样",
         "delete" => "允许后才会删除；删除后不能撤销",
         "replace" => "允许后才会改写列出的文件；拒绝则文件保持原样",
-        _ => "允许后才会写入；拒绝则文件保持原样",
+        "write" | "edit" => "允许后才会写入；拒绝则文件保持原样",
+        "mcp" => "允许后才会调用 MCP 工具；每次调用都会再问一次",
+        name if name.starts_with("mcp_") => "允许后才会调用 MCP 工具；每次调用都会再问一次",
+        // Plugin code runs inside the engine, so it asks every single time and
+        // there is nothing the window could remember for the session.
+        _ => "允许后才会运行插件代码；每次调用都会再问一次，拒绝则什么也不会执行",
     }
 }
 
@@ -1256,29 +1340,148 @@ pub(crate) fn approval_state(tool: &str, ok: bool) -> &'static str {
         ("delete", false) => "删除失败",
         ("replace", true) => "已替换",
         ("replace", false) => "替换失败",
+        ("write" | "edit", true) => "已写入",
+        ("write" | "edit", false) => "写入失败",
         ("mcp", true) => "已执行",
         ("mcp", false) => "执行失败",
         // MCP tools are prefixed by the engine; they run as an RPC call rather
         // than a file write.
         (name, true) if name.starts_with("mcp_") => "已执行",
         (name, false) if name.starts_with("mcp_") => "执行失败",
-        (_, true) => "已写入",
-        (_, false) => "写入失败",
+        // Whatever is left is a plugin tool: it ran code, it did not write a
+        // file, so it must not borrow the write wording (or a write's undo).
+        (_, true) => "已执行",
+        (_, false) => "执行失败",
     }
 }
 
-/// Mark every undecided write or command approval in a conversation.
+/// What one plugin added to the last request, as a card's suffix.
+///
+/// Empty when the plugin contributed nothing (or is switched off), so a plain
+/// card keeps its short line.
+pub(crate) fn plugin_contribution(
+    id: &str,
+    tools: &[(String, String)],
+    prompts: &[(String, String)],
+) -> String {
+    let tools = tools.iter().filter(|(plugin, _)| plugin == id).count();
+    let prompts = prompts.iter().filter(|(plugin, _)| plugin == id).count();
+    let mut text = String::new();
+    if tools > 0 {
+        text.push_str(&format!(" · {tools} 个工具"));
+    }
+    if prompts > 0 {
+        text.push_str(&format!(" · {prompts} 段提示"));
+    }
+    text
+}
+
+/// Mark every undecided approval, question or plan in a conversation.
 ///
 /// A stopped, failed or finished request can no longer take a decision, so the
 /// card must not keep offering buttons that would go nowhere.
-pub(crate) fn settle_approvals(chat: &mut Chat, state: &str) {
+pub(crate) fn settle_interactions(chat: &mut Chat, state: &str) {
     for message in &mut chat.messages {
-        if matches!(message.role, Role::Approval) && message.output.trim().is_empty() {
+        if matches!(message.role, Role::Approval | Role::Question | Role::Plan)
+            && message.output.trim().is_empty()
+        {
             message.output = state.to_string();
-            // Settled cards fold; their diff stays one click away.
+            // Settled cards fold; their diff stays one click away. Questions and
+            // plans have no folded body, so this only affects approvals.
             message.open = false;
         }
     }
+}
+
+/// Whether a low-risk approval can be granted by rule instead of a card.
+///
+/// Deliberately conservative: only writes inside the conversation's workspace
+/// with an ordinary path, and a short list of read-only commands. Anything a
+/// shell can chain (`&&`, `|`, `>`, `$(…)`), anything that deletes or publishes,
+/// and every plugin/MCP call still asks. Note that `cargo` commands on the list
+/// do run the workspace's own build scripts and tests, so auto review is only
+/// meant for a workspace the person trusts.
+pub(crate) fn auto_review_allows(tool: &str, command: &str, path: &str, diff: &str) -> bool {
+    if matches!(tool, "write" | "edit") {
+        let path = path.trim().to_ascii_lowercase();
+        if path.is_empty() {
+            return false;
+        }
+        // A relative path only: an absolute path can leave the workspace, and
+        // `..` can climb out of it.
+        if path.starts_with('/')
+            || path.starts_with('\\')
+            || path.contains("..")
+            || path.contains(':')
+        {
+            return false;
+        }
+        if path.contains(".git/") || path.contains(".git\\") {
+            return false;
+        }
+        if path.contains(".env")
+            || path.ends_with(".pem")
+            || path.ends_with(".key")
+            || path.contains("credential")
+            || path.contains("secret")
+            || path.contains(".ssh/")
+        {
+            return false;
+        }
+        // A huge rewrite is worth a card even inside the workspace.
+        return diff.len() <= 200_000;
+    }
+    if tool != "shell" {
+        return false;
+    }
+    let command = command.trim();
+    if command.is_empty() || command.len() > 2_000 {
+        return false;
+    }
+    // Shell metacharacters can chain a safe-looking command with an unsafe one.
+    // `$` and the parentheses cover command substitution — `cat $(rm -rf .)`
+    // stays inside the allow-list otherwise — and are refused rather than
+    // guessed at, so a command using them asks for a card instead.
+    if command.chars().any(|ch| {
+        matches!(
+            ch,
+            '&' | '|' | ';' | '>' | '<' | '`' | '\n' | '\r' | '$' | '(' | ')'
+        )
+    }) {
+        return false;
+    }
+    // Options that turn a "read" into a write or an exec.
+    if command.contains("--fix")
+        || command.contains("--output")
+        || command.contains("--exec")
+        || command.contains("--ext-diff")
+    {
+        return false;
+    }
+    let words: Vec<&str> = command.split_whitespace().collect();
+    matches!(
+        words.as_slice(),
+        ["git", "status", ..]
+            | ["git", "diff", ..]
+            | ["git", "log", ..]
+            | ["git", "show", ..]
+            | ["git", "rev-parse", ..]
+            | ["git", "ls-files", ..]
+            | ["git", "branch"]
+            | ["git", "branch", "--show-current"]
+            | ["cargo", "check", ..]
+            | ["cargo", "test", ..]
+            | ["cargo", "clippy", ..]
+            | ["cargo", "build", ..]
+            | ["dir", ..]
+            | ["ls", ..]
+            | ["type", ..]
+            | ["cat", ..]
+            | ["node", "--version"]
+            | ["node", "-v"]
+            | ["python", "--version"]
+            | ["python", "-V"]
+    )
 }
 
 /// Short conversation title from the first question.
@@ -1369,6 +1572,33 @@ pub(crate) fn transcript_text(title: &str, messages: &[ChatMessage]) -> String {
                 ));
             }
             Role::Note => out.push_str(&format!("> {}\n\n", message.text.trim())),
+            Role::Question => {
+                let state = if message.output.trim().is_empty() {
+                    "未决"
+                } else {
+                    message.output.trim()
+                };
+                out.push_str(&format!(
+                    "## 提问（{}）\n\n{}\n\n",
+                    state,
+                    message.text.trim()
+                ));
+            }
+            Role::Plan => {
+                let state = if message.output.trim().is_empty() {
+                    "未决"
+                } else {
+                    message.output.trim()
+                };
+                out.push_str(&format!(
+                    "## 计划（{}）\n\n{}\n\n",
+                    state,
+                    message.text.trim()
+                ));
+            }
+            // Thinking is the model's, not the conversation's: the plain-text
+            // export keeps what a reader could have said or been told.
+            Role::Thinking => {}
         }
     }
     out.trim_end().to_string() + "\n"
@@ -1406,13 +1636,21 @@ pub(crate) fn chat_meta(count: usize, busy: bool, updated_ms: u64, draft: bool) 
 /// therefore runs past the window on its own — it is the spend figure, not this
 /// one.
 pub(crate) fn chat_context_percent(chat: &Chat, model: &str) -> f64 {
+    chat_context_percent_in(chat, crate::ai::context_window(model))
+}
+
+/// The same gauge against a window the caller resolved.
+///
+/// A connection may name its own window (a local model, or one newer than the
+/// name table); the gauge has to use that figure or it would disagree with
+/// where the engine compacts.
+pub(crate) fn chat_context_percent_in(chat: &Chat, window: u64) -> f64 {
     let in_context = chat
         .messages
         .iter()
         .rev()
         .find(|message| message.context > 0)
         .map_or(0, |message| message.context);
-    let window = crate::ai::context_window(model);
     if in_context == 0 || window == 0 {
         0.0
     } else {

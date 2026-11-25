@@ -15,6 +15,7 @@ import type { AiRequest } from './ai.ts'
 import { roundCount, runAgent } from './agent.ts'
 import type { ApprovalRequest } from './agent.ts'
 import { cacheHitSize } from './stream.ts'
+import { webEventRow, webReport, webSteps } from './web.ts'
 import { deriveWorkflow } from './derive.ts'
 import { describeStep, resolveInputs, runWorkflow } from './engine.ts'
 import type { RunOptions, RunSummary } from './engine.ts'
@@ -22,7 +23,7 @@ import { runFixtures } from './fixtures.ts'
 import { loadWorkflow, strictFindings } from './load.ts'
 import type { LoadedWorkflow } from './load.ts'
 import { loadPlugins } from './plugins.ts'
-import { compactLimits, summarizeRange } from './compact.ts'
+import { compactLimits, estimateTokens, summarizeRange } from './compact.ts'
 import { createMcpHub } from './mcp.ts'
 import { renderReport } from './report.ts'
 import { describeRuntime, resolveRuntime } from './runtime.ts'
@@ -664,6 +665,8 @@ async function commandAi(): Promise<number> {
     resolveRequest = resolve
   })
   const approvals = new Map<string, (allow: boolean) => void>()
+  const questions = new Map<string, (answer: string) => void>()
+  const plans = new Map<string, (approved: boolean) => void>()
 
   input.on('line', (line) => {
     if (!settled) {
@@ -685,7 +688,27 @@ async function commandAi(): Promise<number> {
     } catch {
       return
     }
-    if (answer?.type !== 'approval') return
+    if (answer?.type !== 'approval') {
+      if (answer?.type === 'question') {
+        const call = typeof answer.call === 'string' ? answer.call : ''
+        const resolve = questions.get(call)
+        if (resolve) {
+          questions.delete(call)
+          resolve(typeof answer.answer === 'string' ? answer.answer : '')
+        }
+        return
+      }
+      if (answer?.type === 'plan') {
+        const call = typeof answer.call === 'string' ? answer.call : ''
+        const resolve = plans.get(call)
+        if (resolve) {
+          plans.delete(call)
+          resolve(answer.approved === true)
+        }
+        return
+      }
+      return
+    }
     const call = typeof answer.call === 'string' ? answer.call : ''
     const decide = approvals.get(call)
     if (decide) {
@@ -701,6 +724,10 @@ async function commandAi(): Promise<number> {
     }
     for (const decide of approvals.values()) decide(false)
     approvals.clear()
+    for (const resolve of questions.values()) resolve('')
+    questions.clear()
+    for (const resolve of plans.values()) resolve(false)
+    plans.clear()
   })
 
   const raw = await ready
@@ -721,6 +748,11 @@ async function commandAi(): Promise<number> {
   const onDelta = (text: string): void => {
     process.stdout.write(`${JSON.stringify({ type: 'delta', text })}\n`)
   }
+  // Thinking reaches the window live so it can be shown while it happens, and
+  // the final answer repeats the whole text so a dropped fragment cannot lose it.
+  const onReasoning = (text: string): void => {
+    process.stdout.write(`${JSON.stringify({ type: 'reasoning', text })}\n`)
+  }
   const interactive = request.interactive === true
   const confirmWrites = request.confirmWrites === true
   const ask = async (question: ApprovalRequest): Promise<boolean> => {
@@ -732,6 +764,8 @@ async function commandAi(): Promise<number> {
   }
   // Writes wait only when the window asked for confirmation; otherwise the
   // event is still reported so the card and its undo data reach the transcript.
+  // A one-shot run that asked for confirmation has nobody to ask, so its writes
+  // are refused rather than run unapproved (see `requireWriteApproval`).
   const approve = interactive && confirmWrites ? ask : undefined
   // A command or a move / delete always waits, in both modes: it can do far
   // more than one write.
@@ -744,6 +778,30 @@ async function commandAi(): Promise<number> {
           )
         }
       : undefined
+  // A structured question and a plan review use the same pipe as approvals:
+  // they are emitted once and resolved by the matching typed reply.
+  const askQuestion = interactive
+    ? async (question: {
+        call: string
+        question: string
+        options: string[]
+        allowCustom: boolean
+      }): Promise<string> => {
+        const answer = new Promise<string>((resolve) => questions.set(question.call, resolve))
+        process.stdout.write(`${JSON.stringify({ type: 'question', ...question })}\n`)
+        return await answer
+      }
+    : undefined
+  const reviewPlan = interactive
+    ? async (request: { call: string; plan: string }): Promise<boolean> => {
+        const approved = new Promise<boolean>((resolve) => plans.set(request.call, resolve))
+        process.stdout.write(`${JSON.stringify({ type: 'plan', ...request })}\n`)
+        return await approved
+      }
+    : undefined
+  const onTodo = (items: Array<{ text: string; status: string }>): void => {
+    process.stdout.write(`${JSON.stringify({ type: 'todo', items })}\n`)
+  }
   const scopeRoot =
     request.fileScope === 'full'
       ? null
@@ -761,7 +819,7 @@ async function commandAi(): Promise<number> {
   // on the next one. A plugin that fails to load is reported, never fatal.
   const plugins = request.tools
     ? await loadPlugins({ dir: request.pluginDir, enabled: request.plugins })
-    : { tools: [], prompts: [], errors: [] }
+    : { tools: [], prompts: [], panels: [], errors: [] }
   for (const failure of plugins.errors) {
     process.stderr.write(`[plugin ${failure.id}] ${failure.message}\n`)
   }
@@ -784,9 +842,16 @@ async function commandAi(): Promise<number> {
         readOnlyRoots: request.readOnlyRoots,
         windowTokens: request.windowTokens,
         plugins: plugins.tools,
+        panels: plugins.panels,
         mcpTools: [...mcp.tools, ...(request.tools && (request.mcpServers?.length ?? 0) > 0 ? [mcp.gateway] : [])],
         promptInjections: plugins.prompts,
+        plan: request.plan === true,
+        askUser: askQuestion,
+        reviewPlan,
+        onTodo,
         approve,
+        // Confirmation was asked for, but there is no window to ask through.
+        requireWriteApproval: confirmWrites && !interactive,
         onApproval,
         confirmActions,
         onStep: (step) => {
@@ -825,24 +890,62 @@ async function commandAi(): Promise<number> {
           )
         },
         // The window shows how much of the prompt the definitions take, so it
-        // needs the very schemas this request carries.
+        // needs the very schemas this request carries. Panels are built before
+        // the first round and describe this request; a panel that failed is
+        // reported on its plugin's card, beside the load failures.
         onTools: (report) => {
           process.stdout.write(
             `${JSON.stringify({
               type: 'tools',
               items: report.items,
               prompts: report.prompts,
-              errors: plugins.errors
+              panels: report.panels,
+              errors: [...plugins.errors, ...report.panelErrors]
             })}\n`
           )
         },
-        onDelta
+        onDelta,
+        onReasoning
       })
-      const answer = { text: result.text, model: result.model, usage: result.usage, context: result.context, rounds: result.rounds, roundTokens: result.roundTokens, cacheHits: result.cacheHits, compaction: result.compaction }
+      const answer = { text: result.text, model: result.model, usage: result.usage, context: result.context, rounds: result.rounds, roundTokens: result.roundTokens, roundReasoning: result.roundReasoning, reasoning: result.reasoning, cacheHits: result.cacheHits, webSearch: result.webSearch, serverToolCalls: result.serverCalls, timing: result.timing, compaction: result.compaction }
       process.stdout.write(`${JSON.stringify(answer)}\n`)
       return 0
     }
-    const result = await askModel(request, { onDelta })
+    const startedAt = Date.now()
+    // Live server-tool rows are numbered per question here; the finished rows
+    // use the same prefix and order, so each one replaces its running row.
+    let liveCalls = 0
+    const result = await askModel(request, {
+      onDelta,
+      onReasoning,
+      // One-shot questions have no tool loop either, so a running search is
+      // reported here the same way the loop reports a tool it just started.
+      onServerEvent: (event) => {
+        const row = webEventRow(event, 'web', liveCalls + 1)
+        if (row === null) return
+        liveCalls += 1
+        process.stdout.write(
+          `${JSON.stringify({ type: 'tool_start', call: row.call, tool: row.tool, target: row.target })}\n`
+        )
+      }
+    })
+    // Server tools run on the provider's side, so no step event came out of a
+    // tool loop; the rows are written here, before the answer, so the window
+    // shows the search the way it shows a local tool.
+    for (const step of webSteps(result.serverCalls, result.annotations, 'web')) {
+      process.stdout.write(
+        `${JSON.stringify({
+          type: 'step',
+          tool: step.tool,
+          target: step.target,
+          ok: step.ok,
+          detail: step.detail,
+          input: step.input,
+          output: step.output,
+          call: step.call
+        })}\n`
+      )
+    }
     // One request with no tool loop still reports the same shape the agent
     // does: the window shows the round's prompt and answer beside the bill, so
     // leaving `roundTokens` empty made that request look like it cost nothing.
@@ -854,7 +957,15 @@ async function commandAi(): Promise<number> {
       context: result.context,
       rounds: 1,
       roundTokens: counted === null ? [] : [[counted[0], counted[1], 0]],
-      cacheHits: cacheHitSize(result.usage)
+      // One request, one round: its thinking is the only one there is.
+      roundReasoning: [estimateTokens(result.reasoning)],
+      reasoning: result.reasoning,
+      cacheHits: cacheHitSize(result.usage),
+      webSearch: webReport(result.serverCalls, result.annotations),
+      serverToolCalls: result.serverCalls,
+      // No tool loop, so the whole call was model time; the window still gets
+      // the same shape and can show it beside a tool-using request.
+      timing: { modelMs: Date.now() - startedAt, toolMs: 0 }
     }
     process.stdout.write(`${JSON.stringify(answer)}\n`)
     return 0

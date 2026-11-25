@@ -1,8 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
-  <!-- A lightbulb: an enabled skill is guidance switched on. -->
-  <g fill="#000">
-    <path d="M12 2.2a7 7 0 0 0-4.2 12.6c.8.6 1.2 1.4 1.2 2.3v.6h6v-.6c0-.9.4-1.7 1.2-2.3A7 7 0 0 0 12 2.2z"/>
-    <rect x="8.5" y="18.5" width="7" height="2" rx="1"/>
-    <rect x="9.5" y="21.1" width="5" height="1.5" rx="0.75"/>
-  </g>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 17 17" fill="none" stroke-width="1"><!-- Skill: a page with a spark. From the dsh product icon set, regular weight. --><path d="M4.57788 5.77124H10.7029" stroke="currentColor"></path><path d="M4.57788 8.89819H7.91879" stroke="currentColor"></path><path d="M12.1404 1.19446C12.9442 1.19446 13.6404 1.81999 13.6404 2.64465V8.89856H12.6404V2.64465C12.6404 2.42015 12.4411 2.19446 12.1404 2.19446H3.14038C2.83968 2.19446 2.64038 2.42015 2.64038 2.64465V13.0929C2.64082 13.3172 2.84001 13.5421 3.14038 13.5421H8.88159V14.5421H3.14038C2.33675 14.5421 1.6408 13.9172 1.64038 13.0929V2.64465C1.64038 1.81999 2.33651 1.19446 3.14038 1.19446H12.1404Z" fill="currentColor"></path><path d="M12.0051 15.1056C12.0051 13.6395 10.8166 12.451 9.35059 12.451C10.8166 12.451 12.0051 11.2626 12.0051 9.79651C12.0051 11.2626 13.1936 12.451 14.6597 12.451C13.1936 12.451 12.0051 13.6395 12.0051 15.1056Z" stroke="currentColor"></path></svg>

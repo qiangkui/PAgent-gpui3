@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, readFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -763,12 +763,22 @@ test('ai without tools still reports the round counts', async () => {
       rounds?: number
       roundTokens?: number[][]
       cacheHits?: number
+      timing?: { modelMs?: number; toolMs?: number }
+      roundReasoning?: number[]
+      reasoning?: string
     }
     // One round with no tool calls, carrying the split the window needs to show
     // that request's prompt and answer beside its bill.
     assert.equal(answer.rounds, 1)
     assert.deepEqual(answer.roundTokens, [[120, 8, 0]])
     assert.equal(answer.cacheHits, 40)
+    // No tool loop, so the whole call is model time and the window gets the same
+    // timing shape a tool-using request reports.
+    assert.equal(typeof answer.timing?.modelMs, 'number')
+    assert.equal(answer.timing?.toolMs, 0)
+    // The thinking figure arrives in the same shape for a plain request.
+    assert.deepEqual(answer.roundReasoning, [0])
+    assert.equal(answer.reasoning, '')
   } finally {
     await new Promise<void>(resolve => server.close(() => resolve()))
   }
@@ -855,4 +865,86 @@ test('derive writes a reviewed-later skeleton next to the session', () => {
   const ran = cli(['run', file])
   assert.equal(ran.code, 0, ran.out)
   assert.match(ran.out, /\[OK  \] bash/)
+})
+
+test('reports plugin panels with the tools event', async () => {
+  // A panel is built before the first round, so the window needs it beside the
+  // tool schemas of the same request; dropping it here made the feature dead.
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-panels-'))
+  const pluginDir = join(dir, 'plugins')
+  const demo = join(pluginDir, 'demo')
+  await mkdir(demo, { recursive: true })
+  await writeFile(join(demo, 'plugin.json'), JSON.stringify({ api: 1 }), 'utf8')
+  await writeFile(
+    join(demo, 'index.js'),
+    `export function activate(api) {
+       api.registerPanel({ id: 'budget', title: '本次构成' }, (context) => ({
+         summary: [{ label: '窗口', value: String(context.contextWindow) }],
+         sections: [{
+           title: '按类',
+           kind: 'bars',
+           items: [{ label: '系统', value: context.systemChars, note: 'chars' }]
+         }]
+       }))
+     }`,
+    'utf8'
+  )
+  const server = createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      response.writeHead(200, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }))
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+
+  try {
+    const answer = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, [CLI, 'ai'], {
+        cwd: dir,
+        stdio: ['pipe', 'pipe', 'pipe']
+      })
+      let out = ''
+      const timer = setTimeout(() => reject(new Error(`ai did not finish: ${out}`)), 10_000)
+      child.stdout.setEncoding('utf8').on('data', chunk => {
+        out += chunk
+      })
+      child.stderr.setEncoding('utf8').on('data', chunk => {
+        out += chunk
+      })
+      child.on('error', reject)
+      child.on('close', () => {
+        clearTimeout(timer)
+        resolve(out)
+      })
+      child.stdin.write(`${JSON.stringify({
+        prompt: 'hi',
+        apiKey: 'sk-test',
+        baseUrl: `http://127.0.0.1:${port}`,
+        model: 'm',
+        tools: true,
+        contextWindow: 64000,
+        pluginDir,
+        plugins: ['demo']
+      })}\n`)
+    })
+    const events = answer
+      .split('\n')
+      .map(line => line.trim())
+      .filter(line => line.startsWith('{'))
+      .map(line => JSON.parse(line) as Record<string, unknown>)
+    const tools = events.find(event => event.type === 'tools')
+    assert.ok(tools, answer)
+    const panels = tools.panels as Array<Record<string, unknown>>
+    assert.equal(panels.length, 1)
+    assert.equal(panels[0].id, 'budget')
+    assert.equal(panels[0].plugin, 'demo')
+    assert.deepEqual(panels[0].summary, [{ label: '窗口', value: '64000' }])
+    const sections = panels[0].sections as Array<Record<string, unknown>>
+    assert.equal(sections[0].kind, 'bars')
+  } finally {
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  }
 })

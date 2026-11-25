@@ -9,12 +9,14 @@
 
 import { streamCompletion } from './stream.ts'
 import { contextSize } from './stream.ts'
+import { estimateTokens } from './compact.ts'
+import { serverToolDeclarations } from './web.ts'
 
 /** Default provider endpoint; DeepSeek is OpenAI-compatible here. */
 export const DEFAULT_BASE_URL = 'https://api.deepseek.com'
 
 /** Model used when the request and the environment do not name one. */
-export const DEFAULT_MODEL = 'deepseek-chat'
+export const DEFAULT_MODEL = 'deepseek-flash'
 
 /** One request as it arrives on stdin. */
 /** One earlier turn as the window sends it. */
@@ -23,6 +25,13 @@ export interface WireTurn {
   role?: string
   /** What was said. */
   content?: string
+  /**
+   * Server-tool calls of an assistant turn, raw as the provider sent them.
+   * Passing them back is what lets the provider restore the pages it read
+   * earlier; a framework that drops them still gets an answer, just without
+   * that context.
+   */
+  serverToolCalls?: unknown[]
 }
 
 /** One attached file as the window sends it: base64 bytes, no `data:` prefix. */
@@ -91,6 +100,20 @@ export interface AiRequest {
   temperature?: number
   /** Upper bound on generated tokens. */
   maxTokens?: number
+  /**
+   * Thinking choice: `off` answers without reasoning, `low` / `high` / `max`
+   * set how hard the model thinks, anything else leaves it to the endpoint.
+   * Unknown values send nothing, which keeps older windows working.
+   */
+  reasoning?: string
+  /**
+   * True to declare DeepSeek's server tools (`deepseek_web_search`,
+   * `deepseek_read_url`). The model decides whether to search, and the search
+   * runs on the provider's side, so nothing in this engine executes it. Only
+   * `deepseek-flash` offers them; an endpoint that refuses the entries is
+   * asked again without them rather than failing the question.
+   */
+  webSearch?: boolean
   /** Model context window in tokens, as the window reports it; 0 when unknown. */
   contextWindow?: number
   /** Abort the request after this many milliseconds. */
@@ -115,6 +138,8 @@ export interface AiRequest {
   mcpDir?: string
   /** True when the caller keeps stdin open for approval replies. */
   interactive?: boolean
+  /** True when this question runs in plan mode: investigate, then submit a plan. */
+  plan?: boolean
   /** True when `write` / `edit` wait for a decision before running. */
   confirmWrites?: boolean
   /** `workspace` keeps writes under `scopeRoot`; `full` allows any path. */
@@ -144,6 +169,17 @@ export interface AiResult {
   usage?: unknown
   /** Prompt + answer tokens of the request: how much it put in the window. */
   context: number
+  /**
+   * Thinking text the provider streamed before the answer, when it has one.
+   * The window estimates tokens from it, so none of that output is invisible.
+   */
+  reasoning: string
+  /** Server tools the provider ran on its own side, raw as they came. */
+  serverCalls: unknown[]
+  /** Citation entries of the answer (`url_citation`), raw as they came. */
+  annotations: unknown[]
+  /** Why the round ended: `stop`, `length`, `content_filter`, or `''`. */
+  finishReason: string
 }
 
 /** What a model listing answered. */
@@ -164,12 +200,21 @@ export interface AskOptions {
   env?: Record<string, string | undefined>
   /** Called with each fragment of the answer, as the model writes it. */
   onDelta?: (text: string) => void
+  /** Called with each fragment of the model's thinking, when it streams one. */
+  onReasoning?: (text: string) => void
+  /** Called with each server-tool event, so a search can be shown as it runs. */
+  onServerEvent?: (event: unknown) => void
 }
 
 /** One chat message in the provider's shape. */
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
   content: UserContent
+  /**
+   * Server tools the provider ran in this assistant turn, passed back verbatim
+   * so it can restore the pages it read. Absent on user turns.
+   */
+  server_tool_calls?: unknown[]
 }
 
 /**
@@ -213,13 +258,16 @@ export function userContent(prompt: string, attachments: WireAttachment[] | unde
 export const MAX_HISTORY = 40
 
 /**
- * Rough character budget for those turns.
+ * Rough token budget for those turns.
  *
  * A message count alone is not enough: a few long answers can fill the window
- * even when the conversation is short. The window applies the same budget, so
- * a shell caller gets the same cut-down history the UI would send.
+ * even when the conversation is short. Measured in tokens, not characters,
+ * because the two units disagree by a factor of four: 120k characters is about
+ * 30k tokens of English but about 120k tokens of Chinese, which alone fills a
+ * small window. The window keeps its own history to 30k tokens, so a shell
+ * caller gets the same cut-down history the UI would send.
  */
-export const MAX_HISTORY_CHARS = 120_000
+export const MAX_HISTORY_TOKENS = 30_000
 
 /**
  * Turn the window's history into wire messages.
@@ -227,27 +275,61 @@ export const MAX_HISTORY_CHARS = 120_000
  * The window sends the conversation so a follow-up question ("那它呢？") still has
  * a subject. Unknown roles and blank turns are dropped rather than failing the
  * request; the last {@link MAX_HISTORY} turns are kept, and whole oldest turns
- * are dropped while the text exceeds {@link MAX_HISTORY_CHARS} so a long
+ * are dropped while the text exceeds {@link MAX_HISTORY_TOKENS} so a long
  * conversation cannot blow up the prompt.
  * @param history - earlier turns, oldest first.
  * @returns messages the provider accepts, oldest first.
  */
 export function historyMessages(history: WireTurn[] | undefined): ChatMessage[] {
   const messages: ChatMessage[] = []
+  // Measured as each turn is accepted: the content of a user turn may become
+  // content parts later, and the estimate is what the window itself uses.
+  const sizes: number[] = []
   for (const turn of history ?? []) {
     const role = turn?.role === 'assistant' ? 'assistant' : turn?.role === 'user' ? 'user' : null
     const content = (turn?.content ?? '').trim()
-    if (role && content) messages.push({ role, content })
+    if (!role || !content) continue
+    // The provider reads its own server calls back from the assistant turn; the
+    // shape is opaque to this engine, so it is passed through untouched.
+    const calls = role === 'assistant' ? turn.serverToolCalls : undefined
+    messages.push(
+      calls && calls.length > 0 ? { role, content, server_tool_calls: calls } : { role, content }
+    )
+    sizes.push(estimateTokens(content))
   }
-  const kept = messages.slice(-MAX_HISTORY)
-  let total = kept.reduce((sum, message) => sum + message.content.length, 0)
+  const first = Math.max(0, messages.length - MAX_HISTORY)
+  const kept = messages.slice(first)
+  const keptSizes = sizes.slice(first)
+  let total = keptSizes.reduce((sum, size) => sum + size, 0)
   let drop = 0
   // Keep at least one turn: dropping every message would erase the subject.
-  while (total > MAX_HISTORY_CHARS && drop + 1 < kept.length) {
-    total -= kept[drop].content.length
+  while (total > MAX_HISTORY_TOKENS && drop + 1 < kept.length) {
+    total -= keptSizes[drop]!
     drop += 1
   }
   return kept.slice(drop)
+}
+
+/**
+ * Apply the window's thinking choice to a request body.
+ *
+ * DeepSeek's `deepseek-flash` and `deepseek-v4-pro` think by default. The API
+ * switches that off with `{"thinking":{"type":"disabled"}}` and trades depth for
+ * latency with `reasoning_effort` (`low` / `high` / `max`); the effort is only
+ * sent for a choice that names one, so the endpoint keeps its own default
+ * otherwise. Endpoints that know neither key ignore what they do not recognise,
+ * and `default` sends nothing at all.
+ * @param body - the request body being built.
+ * @param reasoning - the choice from the window, when there is one.
+ */
+export function applyThinking(body: Record<string, unknown>, reasoning?: string): void {
+  if (reasoning === 'off') {
+    body.thinking = { type: 'disabled' }
+    return
+  }
+  if (reasoning === 'low' || reasoning === 'high' || reasoning === 'max') {
+    body.reasoning_effort = reasoning
+  }
 }
 
 /**
@@ -277,6 +359,10 @@ export async function askModel(request: AiRequest, options: AskOptions = {}): Pr
   const body: Record<string, unknown> = { model, messages, stream: true, stream_options: { include_usage: true } }
   if (typeof request.temperature === 'number') body.temperature = request.temperature
   if (typeof request.maxTokens === 'number') body.max_tokens = request.maxTokens
+  applyThinking(body, request.reasoning)
+  // The server tools are the whole `tools` array here: a one-shot question has
+  // no function tools to mix them with.
+  if (request.webSearch === true) body.tools = serverToolDeclarations()
 
   const answer = await streamCompletion({
     url: `${baseUrl}/chat/completions`,
@@ -286,11 +372,38 @@ export async function askModel(request: AiRequest, options: AskOptions = {}): Pr
     body,
     fetchImpl: options.fetchImpl,
     timeoutMs: request.timeoutMs,
-    onDelta: options.onDelta
+    onDelta: options.onDelta,
+    onReasoning: options.onReasoning,
+    onServerEvent: options.onServerEvent
   })
   const text = answer.content.trim()
-  if (!text) throw new Error(`${model} 没有返回内容`)
-  return { text, model, usage: answer.usage, context: contextSize(answer.usage) }
+  if (!text) throw new Error(emptyAnswerReason(model, answer.finishReason))
+  return {
+    text,
+    model,
+    usage: answer.usage,
+    context: contextSize(answer.usage),
+    reasoning: answer.reasoning,
+    serverCalls: answer.serverCalls,
+    annotations: answer.annotations,
+    finishReason: answer.finishReason
+  }
+}
+
+/**
+ * Why a round came back empty, in the words the window shows.
+ *
+ * `content_filter` is the provider's review refusing the answer, and `length`
+ * is the output cap cutting it off before any text survived; both used to read
+ * as the vague "没有返回内容".
+ * @param model - model id, for the message.
+ * @param finishReason - what the provider reported, when it reported anything.
+ * @returns a sentence naming the cause.
+ */
+export function emptyAnswerReason(model: string, finishReason: string): string {
+  if (finishReason === 'content_filter') return `${model} 的回答被内容审核拒绝（content_filter）`
+  if (finishReason === 'length') return `${model} 的输出达到长度上限（length），没有可用文本`
+  return `${model} 没有返回内容`
 }
 
 /**

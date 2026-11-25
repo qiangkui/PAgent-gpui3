@@ -22,9 +22,6 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// Most servers the window will list, so a stray folder cannot flood the page.
 pub const MAX_MCP_SERVERS: usize = 64;
 
-/// Folder name used by the generated example.
-pub const EXAMPLE_MCP_ID: &str = "example-server";
-
 /// One MCP server found on disk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct McpServer {
@@ -663,103 +660,6 @@ fn write_json(file: &Path, value: &serde_json::Value) -> Result<(), String> {
         .map_err(|error| format!("写入 {} 失败：{error}", file.display()))
 }
 
-/// The manifest written by 「生成示例服务器」.
-pub const EXAMPLE_MCP_MANIFEST: &str = r#"{
-  "name": "示例 MCP 服务器",
-  "version": "1.0.0",
-  "description": "一个最小的 stdio MCP 服务器，提供 echo 工具；不需要网络。",
-  "transport": "stdio",
-  "command": "node",
-  "args": ["server.js"]
-}
-"#;
-
-/// A real, dependency-free MCP server: enough for the engine to initialize,
-/// list tools and call one.
-pub const EXAMPLE_MCP_SERVER: &str = r#"#!/usr/bin/env node
-// 最小 MCP 服务器：换行分隔的 JSON-RPC，只提供 echo。
-process.stdin.setEncoding('utf8')
-let buffer = ''
-const tools = [
-  {
-    name: 'echo',
-    description: '把输入原样返回，用来确认 MCP 链路可用。',
-    inputSchema: {
-      type: 'object',
-      properties: { text: { type: 'string', description: '要返回的文字' } },
-      required: ['text']
-    }
-  }
-]
-function send(message) {
-  process.stdout.write(JSON.stringify(message) + '\n')
-}
-function handle(message) {
-  if (message.id === undefined) return
-  if (message.method === 'initialize') {
-    send({
-      jsonrpc: '2.0',
-      id: message.id,
-      result: {
-        protocolVersion: '2024-11-05',
-        capabilities: { tools: {} },
-        serverInfo: { name: 'example-server', version: '1.0.0' }
-      }
-    })
-    return
-  }
-  if (message.method === 'tools/list') {
-    send({ jsonrpc: '2.0', id: message.id, result: { tools } })
-    return
-  }
-  if (message.method === 'tools/call') {
-    const params = message.params || {}
-    if (params.name !== 'echo') {
-      send({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: '未知工具：' + params.name } })
-      return
-    }
-    const text = String((params.arguments || {}).text || '')
-    send({ jsonrpc: '2.0', id: message.id, result: { content: [{ type: 'text', text }] } })
-    return
-  }
-  if (message.method === 'ping') {
-    send({ jsonrpc: '2.0', id: message.id, result: {} })
-    return
-  }
-  send({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: '不支持：' + message.method } })
-}
-process.stdin.on('data', (chunk) => {
-  buffer += chunk
-  let end
-  while ((end = buffer.indexOf('\n')) >= 0) {
-    const line = buffer.slice(0, end).trim()
-    buffer = buffer.slice(end + 1)
-    if (!line) continue
-    try {
-      handle(JSON.parse(line))
-    } catch {
-      // 坏行忽略，保持服务继续读取。
-    }
-  }
-})
-process.stdin.on('end', () => process.exit(0))
-"#;
-
-/// Write the example server unless that folder already exists.
-///
-/// @returns the folder and whether it was created.
-pub fn create_example(dir: &Path) -> Result<(PathBuf, bool), String> {
-    let folder = dir.join(EXAMPLE_MCP_ID);
-    if folder.exists() {
-        return Ok((folder, false));
-    }
-    std::fs::create_dir_all(&folder)
-        .and_then(|()| std::fs::write(folder.join("mcp.json"), EXAMPLE_MCP_MANIFEST))
-        .and_then(|()| std::fs::write(folder.join("server.js"), EXAMPLE_MCP_SERVER))
-        .map_err(|error| format!("无法写入 {}：{error}", folder.display()))?;
-    Ok((folder, true))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -934,22 +834,6 @@ mod tests {
 
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, "b");
-    }
-
-    #[test]
-    fn the_example_is_written_once() {
-        let dir = temp_dir("example");
-        let (folder, created) = create_example(&dir).unwrap();
-        assert!(created);
-        assert!(folder.join("mcp.json").is_file());
-        assert!(folder.join("server.js").is_file());
-        let (_, again) = create_example(&dir).unwrap();
-        assert!(!again);
-        let found = scanned(&dir);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(found.len(), 1);
-        assert!(found[0].problem.is_empty());
-        assert_eq!(found[0].id, EXAMPLE_MCP_ID);
     }
 
     #[test]
