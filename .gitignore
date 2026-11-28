@@ -9,6 +9,11 @@
 **/.dsh-flow/
 *.log
 
+# The business workflows the window scans for at start-up, together with their
+# drafts and run evidence. Private by construction: a draft or a run log can
+# hold a real account, a page URL or a captured credential.
+/workflows/
+
 # Node dependencies
 /dsh-flow/node_modules/
 
