@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { existsSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { createMockBackend } from '../src/backend.ts'
@@ -7,7 +8,7 @@ import { runWorkflow } from '../src/engine.ts'
 import type { RunSummary } from '../src/engine.ts'
 import { loadWorkflow, strictFindings } from '../src/load.ts'
 import type { RunLevel } from '../src/types.ts'
-import { makeProject, nodeEcho } from './helpers.ts'
+import { DOT_PNG, makeProject, nodeEcho } from './helpers.ts'
 
 const AI_MANIFEST = `name: triage
 description: classify one report
@@ -200,6 +201,116 @@ steps:
   assert.equal(findings.length, 2)
   assert.match(findings.join('\n'), /需要 "why"/)
   assert.match(findings.join('\n'), /需要 "schema"/)
+})
+
+/**
+ * A manifest whose only step reads a picture.
+ *
+ * `cache` is written only when the test needs it, so the default (`true`, i.e.
+ * replay) stays the thing being compared against.
+ * @param cache - value for `ai.cache`, when the step should say it.
+ * @returns the manifest text.
+ */
+function visionManifest(cache?: boolean): string {
+  const cacheLine = cache === undefined ? '' : `      cache: ${cache}\n`
+  return `name: vision
+description: read a captcha
+steps:
+  - id: read
+    why: a captcha is a picture judgment no rule can enumerate
+    save: code
+    ai:
+      prompt: read the four characters in the picture
+      images: [shot.png]
+${cacheLine}      schema:
+        type: object
+        required: [code]
+        properties:
+          code:
+            type: string
+`
+}
+
+test('an ai step sends the pictures it names as base64', async () => {
+  const dir = makeProject({ 'flow.yml': visionManifest() })
+  writeFileSync(join(dir, 'shot.png'), DOT_PNG)
+  const backend = createMockBackend(['{"code":"AB12"}'])
+  const summary = await runWorkflow({
+    loaded: loadWorkflow(join(dir, 'flow.yml')),
+    inputs: {},
+    backend,
+    log: () => {},
+  })
+  assert.equal(summary.status, 'ok')
+  const ask = backend.calls[0]
+  assert.equal(ask?.images?.length, 1)
+  assert.equal(ask?.images?.[0]?.mime, 'image/png')
+  assert.equal(ask?.images?.[0]?.path, join(dir, 'shot.png'))
+  assert.equal(ask?.images?.[0]?.data, DOT_PNG.toString('base64'))
+})
+
+test('a different picture is a different decision, even when the prompt repeats', async () => {
+  // Replaying the recorded answer here would hand back yesterday's captcha, so
+  // the image digest is part of the decision key.
+  const dir = makeProject({ 'flow.yml': visionManifest() })
+  writeFileSync(join(dir, 'shot.png'), DOT_PNG)
+  const backend = createMockBackend(['{"code":"AB12"}', '{"code":"CD34"}'])
+  const loaded = loadWorkflow(join(dir, 'flow.yml'))
+  const first = await runWorkflow({ loaded, inputs: {}, backend, log: () => {} })
+  assert.equal(first.status, 'ok')
+  assert.equal(first.steps.read?.cached, undefined)
+
+  const other = Buffer.from(DOT_PNG)
+  other[other.length - 1] = other[other.length - 1]! ^ 0x01
+  writeFileSync(join(dir, 'shot.png'), other)
+  const second = await runWorkflow({ loaded, inputs: {}, backend, log: () => {} })
+  assert.equal(second.status, 'ok')
+  assert.equal(backend.calls.length, 2)
+  assert.equal(second.steps.read?.cached, undefined)
+})
+
+test('ai.cache: false asks every time and records nothing', async () => {
+  const dir = makeProject({ 'flow.yml': visionManifest(false) })
+  writeFileSync(join(dir, 'shot.png'), DOT_PNG)
+  const backend = createMockBackend(['{"code":"AB12"}', '{"code":"CD34"}'])
+  const loaded = loadWorkflow(join(dir, 'flow.yml'))
+  await runWorkflow({ loaded, inputs: {}, backend, log: () => {} })
+  const second = await runWorkflow({ loaded, inputs: {}, backend, log: () => {} })
+  assert.equal(second.status, 'ok')
+  assert.equal(backend.calls.length, 2)
+  assert.equal(second.steps.read?.cached, undefined)
+  // Nothing was written for it: there is no recorded decision to replay, in this
+  // run or in any later one.
+  assert.equal(existsSync(join(dir, '.dsh-flow', 'answers', 'read')), false)
+})
+
+test('manual mode explains why a fresh judgment cannot run', async () => {
+  const dir = makeProject({ 'flow.yml': visionManifest(false) })
+  writeFileSync(join(dir, 'shot.png'), DOT_PNG)
+  const summary = await runWorkflow({
+    loaded: loadWorkflow(join(dir, 'flow.yml')),
+    inputs: {},
+    level: 'manual',
+    backend: forbiddenBackend(),
+    log: () => {},
+  })
+  assert.equal(summary.status, 'failed')
+  assert.match(summary.steps.read?.error ?? '', /ai\.cache: false/)
+})
+
+test('a missing picture fails the step before the model is asked', async () => {
+  const dir = makeProject({ 'flow.yml': visionManifest() })
+  const backend = createMockBackend(['{"code":"AB12"}'])
+  const summary = await runWorkflow({
+    loaded: loadWorkflow(join(dir, 'flow.yml')),
+    inputs: {},
+    backend,
+    log: () => {},
+  })
+  assert.equal(summary.status, 'failed')
+  assert.match(summary.steps.read?.error ?? '', /ai\.images/)
+  assert.match(summary.steps.read?.error ?? '', /shot\.png/)
+  assert.equal(backend.calls.length, 0)
 })
 
 test('rejects malformed ai specs at load time', () => {

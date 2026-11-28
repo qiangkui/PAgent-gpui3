@@ -140,12 +140,26 @@ export interface AiRequest {
   interactive?: boolean
   /** True when this question runs in plan mode: investigate, then submit a plan. */
   plan?: boolean
+  /**
+   * True when the host keeps a long-term memory file, which is what makes the
+   * `remember` tool available. The file itself belongs to the window: the
+   * engine only reports the entry and the host writes it.
+   */
+  memory?: boolean
   /** True when `write` / `edit` wait for a decision before running. */
   confirmWrites?: boolean
   /** `workspace` keeps writes under `scopeRoot`; `full` allows any path. */
   fileScope?: 'workspace' | 'full'
   /** Writable root for the `workspace` scope. */
   scopeRoot?: string
+  /**
+   * Top-level folder names under the workspace that searches must not walk.
+   *
+   * Every conversation is a folder directly under the workspace, so without this
+   * `glob` / `grep` / `tree` from one conversation would list and search the files
+   * another conversation's assistant wrote.
+   */
+  skipDirs?: string[]
   /**
    * Folders outside the workspace that `shell`, `python` and `node` may run in
    * and refer to. Only consulted while `fileScope` is `workspace`; the

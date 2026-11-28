@@ -17,6 +17,7 @@ import type { ApprovalRequest } from './agent.ts'
 import { cacheHitSize } from './stream.ts'
 import { webEventRow, webReport, webSteps } from './web.ts'
 import { deriveWorkflow } from './derive.ts'
+import { distillChat } from './distill.ts'
 import { describeStep, resolveInputs, runWorkflow } from './engine.ts'
 import type { RunOptions, RunSummary } from './engine.ts'
 import { runFixtures } from './fixtures.ts'
@@ -25,6 +26,8 @@ import type { LoadedWorkflow } from './load.ts'
 import { loadPlugins } from './plugins.ts'
 import { compactLimits, estimateTokens, summarizeRange } from './compact.ts'
 import { createMcpHub } from './mcp.ts'
+import { detachBrowser, runBrowser } from './tools/browser.ts'
+import type { ToolResult } from './tools/types.ts'
 import { renderReport } from './report.ts'
 import { describeRuntime, resolveRuntime } from './runtime.ts'
 import type { RunLevel, Scope, Step, TraceRecord } from './types.ts'
@@ -50,8 +53,12 @@ Usage:
   dsh-flow test <manifest> [--update] [--filter <step-id>]
   dsh-flow init <directory> [--lang python|node]
   dsh-flow derive <session.jsonl> [--out <dir>] [--name <name>]
+  dsh-flow distill <chat.json> [--out <dir>] [--turn <n>] [--name <name>]
   dsh-flow ai                       (one JSON request on stdin, JSON answer on stdout)
   dsh-flow models                   (list a provider's models: JSON in, JSON out)
+  dsh-flow browser [json] [--workdir dir] [--json]
+                                    (one browser action: the tool's own arguments,
+                                     JSON in / text or JSON out)
   dsh-flow mcp-skills               (connect one MCP server and write its skills: JSON in, JSON out)
   dsh-flow compact                  (condense one conversation span: JSON in, JSON out)
 
@@ -62,7 +69,9 @@ Options for run:
                        assist = replay recorded decisions, ask only when missing
                        draft  = always ask, then record
   --no-strict          allow ai steps without "why" or "schema" (drafting only)
-  --credentials-stdin  read {"apiKey","baseUrl","model"} from stdin for ai steps
+  --credentials-stdin  read {"apiKey","baseUrl","model","secrets"} from stdin for ai steps
+  --secrets-stdin      same payload, only {"secrets": {name: value}} (secret inputs)
+  --events             print one NDJSON record per step boundary on stdout
   --dry                render steps without executing them
   --report <file>      write a self-contained HTML report
   --json               print the run summary as JSON
@@ -98,7 +107,9 @@ async function main(argv: string[]): Promise<number> {
     if (parsed.command === 'test') return await commandTest(parsed)
     if (parsed.command === 'init') return commandInit(parsed)
     if (parsed.command === 'derive') return commandDerive(parsed)
+    if (parsed.command === 'distill') return commandDistill(parsed)
     if (parsed.command === 'ai') return await commandAi()
+    if (parsed.command === 'browser') return await commandBrowser(parsed)
     if (parsed.command === 'models') return await commandModels()
     if (parsed.command === 'mcp-skills') return await commandMcpSkills()
     if (parsed.command === 'compact') return await commandCompact()
@@ -119,13 +130,17 @@ async function commandRun(parsed: ParsedArgs): Promise<number> {
   const loaded = loadWorkflow(requireManifest(parsed))
   const quiet = parsed.flags.has('quiet')
   const asJson = parsed.flags.has('json')
+  const asEvents = parsed.flags.has('events')
+  if (asJson && asEvents) throw new Error('--json 与 --events 只能选一个（--events 最后同样打印汇总）')
+  const structured = asJson || asEvents
   const level = parseLevel(parsed)
   const strict = !parsed.flags.has('no-strict')
   const log = (line: string): void => {
     if (quiet && !line.includes('FAIL')) return
-    // With `--json`, stdout carries only the summary; progress (including
-    // service output) goes to stderr, which the window shows in its log pane.
-    const sink = asJson ? process.stderr : process.stdout
+    // With `--json` / `--events`, stdout carries only the machine-readable
+    // stream; progress (including service output) goes to stderr, which the
+    // window shows in its log pane.
+    const sink = structured ? process.stderr : process.stdout
     sink.write(`${line}\n`)
   }
   for (const warning of loaded.warnings) process.stderr.write(`warning: ${warning}\n`)
@@ -135,19 +150,28 @@ async function commandRun(parsed: ParsedArgs): Promise<number> {
 
   const runsDir = join(loaded.dir, '.dsh-flow', 'runs')
   const trace: TraceRecord[] = []
+  const handover = await readHandover(
+    parsed.flags.has('credentials-stdin') || parsed.flags.has('secrets-stdin'),
+  )
   const options: RunOptions = {
     loaded,
     inputs: parsed.inputs,
+    secrets: handover.secrets,
     dryRun: parsed.flags.has('dry'),
     level,
     onceLedger: join(loaded.dir, '.dsh-flow', 'ledger.json'),
     forceOnce: parsed.flags.has('force'),
-    aiEnv: await readCredentials(parsed.flags.has('credentials-stdin')),
+    aiEnv: handover.aiEnv,
     log,
-    trace: record => trace.push(record),
+    trace: record => {
+      trace.push(record)
+      // `--events` is the window's live channel: one NDJSON record per boundary,
+      // printed the moment it happens rather than after the run is over.
+      if (asEvents) process.stdout.write(`${JSON.stringify(record)}\n`)
+    },
   }
 
-  if (!asJson) process.stdout.write(`▶ ${loaded.workflow.name} — ${loaded.workflow.description}\n`)
+  if (!structured) process.stdout.write(`▶ ${loaded.workflow.name} — ${loaded.workflow.description}\n`)
   const summary = await runWorkflow(options)
 
   mkdirSync(runsDir, { recursive: true })
@@ -163,11 +187,16 @@ async function commandRun(parsed: ParsedArgs): Promise<number> {
     writeFileSync(fallbackReport, renderReport(loaded, summary), 'utf8')
   }
 
-  if (asJson) {
-    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`)
+  if (structured) {
+    // The summary always closes the stream, so a reader takes the last plain
+    // object as the verdict and every earlier `type` line as progress.
+    process.stdout.write(`${JSON.stringify(summary, null, asJson ? 2 : 0)}\n`)
+    if (asEvents && summary.status === 'failed') {
+      process.stderr.write(`report: ${reportPath ?? fallbackReport}\n`)
+    }
   } else {
     const kinds = countKinds(loaded.workflow.steps)
-    const total = kinds.run + kinds.set + kinds.map + kinds.ai
+    const total = kinds.run + kinds.set + kinds.map + kinds.use + kinds.ai
     process.stdout.write(`\n${summary.status === 'ok' ? 'done' : 'FAILED'} in ${summary.durationMs} ms · ${total} steps · ${total - kinds.ai} deterministic · ${kinds.ai} ai (${level})\n`)
     if (reportPath !== undefined) process.stdout.write(`report: ${reportPath}\n`)
     else if (summary.status === 'failed') process.stdout.write(`report: ${fallbackReport}\n`)
@@ -187,34 +216,56 @@ function parseLevel(parsed: ParsedArgs): RunLevel {
   throw new Error(`--level must be manual, assist, or draft (got "${String(raw)}")`)
 }
 
+/** What the window hands over on stdin: endpoint credentials and secret inputs. */
+interface Handover {
+  /** Environment additions for the HTTP backend, when a key was sent. */
+  aiEnv?: Record<string, string>
+  /** Secret inputs by name. */
+  secrets?: Record<string, string>
+}
+
 /**
- * Read the endpoint credentials the window hands over on stdin.
+ * Read what the window hands over on stdin.
  *
- * The key never appears on the command line, so it cannot leak through the
- * process list or the log pane. An empty payload (or a missing flag) means the
- * run falls back to the `DEEPSEEK_*` environment variables.
- * @param enabled - whether `--credentials-stdin` was given.
- * @returns environment additions for the HTTP backend, or undefined.
+ * Neither the API key nor a password ever appears on the command line, so
+ * neither can leak through the process list or the log pane. An empty payload
+ * (or a missing flag) means the run falls back to `DEEPSEEK_*` and
+ * `DSH_SECRET_*` in the environment.
+ * @param enabled - whether `--credentials-stdin` or `--secrets-stdin` was given.
+ * @returns the endpoint environment and the secret inputs.
  */
-async function readCredentials(enabled: boolean): Promise<Record<string, string> | undefined> {
-  if (!enabled) return undefined
+async function readHandover(enabled: boolean): Promise<Handover> {
+  if (!enabled) return {}
   const raw = (await readStdin()).trim()
-  if (raw === '') return undefined
+  if (raw === '') return {}
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
   } catch {
-    throw new Error('--credentials-stdin 需要一份 JSON：{"apiKey": "…", "baseUrl": "…", "model": "…"}')
+    throw new Error(
+      '--credentials-stdin 需要一份 JSON：{"apiKey": "…", "baseUrl": "…", "model": "…", "secrets": {"password": "…"}}',
+    )
   }
   if (!isRecord(parsed)) throw new Error('--credentials-stdin 需要 JSON 对象')
+  const secrets: Record<string, string> = {}
+  if (isRecord(parsed.secrets)) {
+    for (const [name, value] of Object.entries(parsed.secrets)) {
+      const entry = text(value)
+      if (entry !== '') secrets[name] = entry
+    }
+  }
   const apiKey = text(parsed.apiKey)
-  if (apiKey === '') throw new Error('--credentials-stdin 缺少 apiKey')
+  if (apiKey === '') {
+    // A run whose only extra values are secrets needs no endpoint key.
+    if (Object.keys(secrets).length > 0) return { secrets }
+    throw new Error('--credentials-stdin 缺少 apiKey')
+  }
   const env: Record<string, string> = { DEEPSEEK_API_KEY: apiKey }
   const baseUrl = text(parsed.baseUrl)
   if (baseUrl !== '') env.DEEPSEEK_BASE_URL = baseUrl
   const model = text(parsed.model)
   if (model !== '') env.DEEPSEEK_MODEL = model
-  return env
+  return Object.keys(secrets).length > 0 ? { aiEnv: env, secrets } : { aiEnv: env }
 }
 
 /**
@@ -295,6 +346,63 @@ function commandDerive(parsed: ParsedArgs): number {
 }
 
 /**
+ * `distill`: turn a saved chat run into a workflow draft plus a review report.
+ *
+ * The transcript is the window's `data/chats/chat-N/chat.json`. Unlike a dsh
+ * session log it is one JSON document, so `derive` cannot read it. The draft
+ * keeps replayable shell commands as `run` steps and every other real action as
+ * a `skip` placeholder; exploration and page probing are dropped and counted in
+ * the report. No `ai` step is written: that promotion is the reviewer's call.
+ * @param parsed - the parsed command line.
+ * @returns the exit code.
+ */
+function commandDistill(parsed: ParsedArgs): number {
+  const chat = parsed.positionals[0]
+  if (chat === undefined) throw new Error('distill needs a chat.json path')
+  const file = resolve(chat)
+  const source = readFileSync(file, 'utf8')
+  const nameFlag = parsed.flags.get('name')
+  const descriptionFlag = parsed.flags.get('description')
+  const turnFlag = parsed.flags.get('turn')
+  const turn = typeof turnFlag === 'string' ? Number.parseInt(turnFlag, 10) : undefined
+  if (turn !== undefined && (!Number.isFinite(turn) || turn < 1)) {
+    throw new Error('--turn must be a positive number')
+  }
+
+  const report = distillChat(source, {
+    name: typeof nameFlag === 'string' ? nameFlag : undefined,
+    description: typeof descriptionFlag === 'string' ? descriptionFlag : undefined,
+    source: file,
+    turn,
+  })
+  const { summary } = report
+  process.stderr.write(
+    `distilled ${summary.steps} step(s) · ${summary.commands} run · ${summary.placeholders} placeholder` +
+    ` · ${summary.merged} merged · ${summary.repeated} repeated · ${summary.dropped} dropped\n`,
+  )
+
+  const outFlag = parsed.flags.get('out')
+  if (typeof outFlag === 'string') {
+    const dir = resolve(outFlag)
+    mkdirSync(dir, { recursive: true })
+    const draft = join(dir, 'flow.draft.yml')
+    const actions = join(dir, 'actions.json')
+    const markdown = join(dir, 'distill.md')
+    writeFileSync(draft, report.draft, 'utf8')
+    writeFileSync(
+      actions,
+      `${JSON.stringify({ source: file, summary, actions: report.actions }, null, 2)}\n`,
+      'utf8',
+    )
+    writeFileSync(markdown, report.report, 'utf8')
+    process.stdout.write(`${draft}\n${actions}\n${markdown}\n`)
+    return 0
+  }
+  process.stdout.write(report.draft)
+  return 0
+}
+
+/**
  * `explain`: show the step plan and how much of it is deterministic.
  * @param parsed - the parsed command line.
  * @returns the exit code.
@@ -315,7 +423,15 @@ function commandExplain(parsed: ParsedArgs): number {
   const aiSteps: Step[] = []
   const walk = (steps: Step[], depth: number): void => {
     for (const step of steps) {
-      const kind = step.run !== undefined ? 'run' : step.set !== undefined ? 'set' : step.ai !== undefined ? 'ai' : 'map'
+      const kind = step.run !== undefined
+        ? 'run'
+        : step.set !== undefined
+          ? 'set'
+          : step.ai !== undefined
+            ? 'ai'
+            : step.use !== undefined
+              ? 'use'
+              : 'map'
       if (step.ai !== undefined) aiSteps.push(step)
       const flags = [
         step.when === undefined ? '' : 'when',
@@ -330,9 +446,14 @@ function commandExplain(parsed: ParsedArgs): number {
   walk(workflow.steps, 0)
   process.stdout.write(`${lines.join('\n')}\n\n`)
   const kinds = countKinds(workflow.steps)
-  const total = kinds.run + kinds.set + kinds.map + kinds.ai
+  const total = kinds.run + kinds.set + kinds.map + kinds.use + kinds.ai
+  const breakdown = [`run ${kinds.run}`, `set ${kinds.set}`, `map ${kinds.map}`]
+  // Only shown when it is not zero, so a manifest without sub-flows reads the
+  // same as it always did.
+  if (kinds.use > 0) breakdown.push(`use ${kinds.use}`)
+  breakdown.push(`ai ${kinds.ai}`)
   process.stdout.write(
-    `steps: ${total} · run ${kinds.run}, set ${kinds.set}, map ${kinds.map}, ai ${kinds.ai} · ` +
+    `steps: ${total} · ${breakdown.join(', ')} · ` +
     `${percent(total - kinds.ai, total)}% executed without a model\n`,
   )
   if (aiSteps.length > 0) {
@@ -342,7 +463,117 @@ function commandExplain(parsed: ParsedArgs): number {
       process.stdout.write(`  ${step.id} — ${why}\n`)
     }
   }
+  const subs = subFlowSummaries(workflow.steps, loaded.dir, 0)
+  if (subs.length > 0) {
+    // A `use` step hides its child's judgments: the root manifest can read as
+    // 100% deterministic while the child asks a model. Say both numbers.
+    const nestedSteps = subs.reduce((sum, sub) => sum + sub.steps, 0)
+    const nestedAi = subs.reduce((sum, sub) => sum + sub.ai, 0)
+    process.stdout.write(`\nsub-flows (${subs.length}) — 判断点也可能在子清单里：\n`)
+    for (const sub of subs) {
+      if (sub.problem !== undefined) {
+        process.stdout.write(`  ${sub.id} → ${sub.manifest}：读不了（${sub.problem}）\n`)
+        continue
+      }
+      process.stdout.write(`  ${sub.id} → ${sub.manifest}：${sub.steps} 步 · ai ${sub.ai}\n`)
+      for (const reason of sub.reasons) {
+        process.stdout.write(`    ${reason.id} — ${reason.why}\n`)
+      }
+    }
+    if (nestedSteps > 0) {
+      const combined = total + nestedSteps
+      const combinedAi = kinds.ai + nestedAi
+      process.stdout.write(
+        `\n含子流程：${combined} 步 · ai ${combinedAi} · ` +
+        `${percent(combined - combinedAi, combined)}% executed without a model\n`,
+      )
+    }
+  }
   return 0
+}
+
+/** One sub-flow reachable from a manifest through a literal `use` path. */
+interface SubFlowSummary {
+  /** The calling step id. */
+  id: string
+  /** Path as written in the manifest. */
+  manifest: string
+  /** Steps in the child, fan-out bodies included. */
+  steps: number
+  /** Model calls the child makes. */
+  ai: number
+  /** Why each of them exists. */
+  reasons: Array<{ id: string, why: string }>
+  /** Why the child could not be read, when it could not. */
+  problem?: string
+}
+
+/**
+ * Summarise every sub-flow a manifest calls, one level deeper each time.
+ * @param steps - steps to scan.
+ * @param dir - folder the `use` paths resolve against.
+ * @param depth - how deep this scan already is.
+ * @returns one entry per reachable manifest.
+ */
+function subFlowSummaries(steps: Step[], dir: string, depth: number): SubFlowSummary[] {
+  const found: SubFlowSummary[] = []
+  if (depth >= 5) return found
+  for (const step of steps) {
+    if (step.map !== undefined) found.push(...subFlowSummaries(step.map.steps, dir, depth))
+    if (step.use === undefined) continue
+    const written = step.use.manifest.trim()
+    if (written.includes('{{')) {
+      found.push({
+        id: step.id,
+        manifest: written,
+        steps: 0,
+        ai: 0,
+        reasons: [],
+        problem: '路径是模板，静态读不出来',
+      })
+      continue
+    }
+    try {
+      const child = loadWorkflow(resolve(dir, written))
+      const kinds = countKinds(child.workflow.steps)
+      found.push({
+        id: step.id,
+        manifest: written,
+        steps: kinds.run + kinds.set + kinds.map + kinds.use + kinds.ai,
+        ai: kinds.ai,
+        reasons: aiReasons(child.workflow.steps),
+      })
+      found.push(...subFlowSummaries(child.workflow.steps, child.dir, depth + 1))
+    } catch (error) {
+      found.push({
+        id: step.id,
+        manifest: written,
+        steps: 0,
+        ai: 0,
+        reasons: [],
+        problem: messageOf(error),
+      })
+    }
+  }
+  return found
+}
+
+/**
+ * Why each model call in a step list exists, fan-out bodies included.
+ * @param steps - steps to scan.
+ * @param depth - fan-out nesting already walked.
+ * @returns the step ids and their `why`.
+ */
+function aiReasons(steps: Step[], depth = 0): Array<{ id: string, why: string }> {
+  const reasons: Array<{ id: string, why: string }> = []
+  if (depth >= 5) return reasons
+  for (const step of steps) {
+    if (step.ai !== undefined) {
+      reasons.push({ id: step.id, why: step.why ?? '缺少 why（严格模式会报错）' })
+    }
+    if (step.map !== undefined) reasons.push(...aiReasons(step.map.steps, depth + 1))
+  }
+  return reasons
 }
 
 /**
@@ -475,13 +706,14 @@ function missingRuntimes(loaded: LoadedWorkflow): string[] {
  * @param steps - the step list.
  * @returns counts.
  */
-function countKinds(steps: Step[]): { run: number, set: number, map: number, ai: number } {
-  const totals = { run: 0, set: 0, map: 0, ai: 0 }
+function countKinds(steps: Step[]): { run: number, set: number, map: number, use: number, ai: number } {
+  const totals = { run: 0, set: 0, map: 0, use: 0, ai: 0 }
   const walk = (list: Step[]): void => {
     for (const step of list) {
       if (step.run !== undefined) totals.run += 1
       else if (step.set !== undefined) totals.set += 1
       else if (step.ai !== undefined) totals.ai += 1
+      else if (step.use !== undefined) totals.use += 1
       else totals.map += 1
       if (step.map !== undefined) walk(step.map.steps)
     }
@@ -576,7 +808,7 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 /** Flags that consume the following token as their value. */
-const VALUED_FLAGS = new Set(['report', 'filter', 'lang', 'level', 'out', 'name', 'description'])
+const VALUED_FLAGS = new Set(['report', 'filter', 'lang', 'level', 'out', 'name', 'description', 'workdir', 'turn'])
 
 /**
  * Split `name=value`.
@@ -596,6 +828,76 @@ function splitPair(text: string): [string, string] {
  */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * `browser`: run one browser action and report it, JSON in and JSON out.
+ *
+ * The assistant drives the browser through the same function, but a workflow
+ * step is a real program and cannot call a tool. This subcommand is what lets a
+ * Python or Node step open a page, fill a form, take a screenshot or wait for a
+ * download — sharing the conversation's browser, its open page and its login
+ * state (`<workdir>/.dsh-flow/browser/session.json`) with whatever ran before.
+ *
+ * The request is the tool's own argument object: `{"action":"goto","url":"…"}`.
+ * It comes from the last positional argument or from stdin, so a long `eval`
+ * body never has to survive shell quoting.
+ * @param parsed - the parsed command line.
+ * @returns the exit code: 0 when the action worked, 1 when it did not.
+ */
+async function commandBrowser(parsed: ParsedArgs): Promise<number> {
+  const dirFlag = parsed.flags.get('workdir')
+  const workdir = typeof dirFlag === 'string' ? resolve(dirFlag) : process.cwd()
+  const asJson = parsed.flags.has('json')
+  let raw = parsed.positionals.join(' ').trim()
+  // A terminal has no JSON to give; reading one there would wait forever, so
+  // stdin only counts when it is a pipe or a file (`echo '{}' | dsh-flow browser`).
+  if (raw === '' && process.stdin.isTTY !== true) raw = (await readStdin()).trim()
+  if (raw === '') throw new Error('browser 需要一份请求 JSON（作为参数，或从 stdin 传入）')
+
+  let request: Record<string, unknown>
+  try {
+    const parsedRequest: unknown = JSON.parse(raw)
+    if (parsedRequest === null || typeof parsedRequest !== 'object' || Array.isArray(parsedRequest)) {
+      throw new Error('请求必须是一个 JSON 对象')
+    }
+    request = parsedRequest as Record<string, unknown>
+  } catch (error) {
+    throw new Error(`browser 的请求不是 JSON 对象：${messageOf(error)}`)
+  }
+
+  let result: ToolResult
+  try {
+    result = await runBrowser(workdir, request)
+  } catch (error) {
+    // A failed action is still an answer the caller can branch on, so it is
+    // reported instead of thrown; the exit code carries the verdict.
+    result = { ok: false, text: messageOf(error) }
+  }
+  // The DevTools socket is left open for the next call; `main` closes it once
+  // this process is done, which is what lets the browser outlive the step.
+
+  if (asJson) {
+    const payload = {
+      ok: result.ok,
+      action: typeof request.action === 'string' ? request.action : 'snapshot',
+      text: result.text,
+      ...(result.image?.path === undefined
+        ? {}
+        : { image: { mime: result.image.mime, path: result.image.path } }),
+      ...(result.files === undefined ? {} : { files: result.files }),
+      // `eval` answers with the page's own value here; steps read this instead of
+      // parsing `text`, which may carry a human-facing note in front.
+      ...(result.value === undefined ? {} : { value: result.value }),
+    }
+    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`)
+  } else {
+    process.stdout.write(`${result.text}\n`)
+    for (const file of result.files ?? []) {
+      process.stdout.write(`文件：${file.path}（${file.bytes} 字节）\n`)
+    }
+  }
+  return result.ok ? 0 : 1
 }
 
 /**
@@ -802,6 +1104,16 @@ async function commandAi(): Promise<number> {
   const onTodo = (items: Array<{ text: string; status: string }>): void => {
     process.stdout.write(`${JSON.stringify({ type: 'todo', items })}\n`)
   }
+  // The window owns the memory file: the entry goes out as an event and the
+  // window appends it. There is no reply to wait for, the same way a todo list
+  // is written without the model waiting on the disk.
+  const onMemory = interactive
+    ? (entry: { call: string; text: string }): void => {
+        process.stdout.write(
+          `${JSON.stringify({ type: 'memory', call: entry.call, text: entry.text })}\n`
+        )
+      }
+    : undefined
   const scopeRoot =
     request.fileScope === 'full'
       ? null
@@ -849,6 +1161,7 @@ async function commandAi(): Promise<number> {
         askUser: askQuestion,
         reviewPlan,
         onTodo,
+        remember: onMemory,
         approve,
         // Confirmation was asked for, but there is no window to ask through.
         requireWriteApproval: confirmWrites && !interactive,
@@ -864,7 +1177,9 @@ async function commandAi(): Promise<number> {
               detail: step.detail,
               input: step.input,
               output: step.output,
-              call: step.call
+              call: step.call,
+              ...(step.image === undefined ? {} : { image: step.image }),
+              ...(step.files === undefined ? {} : { files: step.files })
             })}\n`
           )
         },
@@ -1085,4 +1400,10 @@ async function readStdin(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8')
 }
 
-process.exitCode = await main(process.argv.slice(2))
+const code = await main(process.argv.slice(2))
+// A `browser` session leaves its DevTools socket open so the next question can
+// rejoin the browser. That socket would also keep this process (and the window
+// reading its pipe) alive forever, so it is closed here while the browser itself
+// keeps running.
+await detachBrowser()
+process.exitCode = code

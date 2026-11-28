@@ -9,11 +9,15 @@ import {
   MAX_TOOL_CONTEXT,
   MAX_TOOL_MESSAGE,
   MAX_WIRE_ARGUMENTS,
+  droppedToolResult,
   runAgent,
-  summarise
+  summarise,
+  toolBudgets,
+  unfulfilledPromise
 } from '../src/agent.ts'
 import type { AgentProgress, AgentStep, ApprovalRequest } from '../src/agent.ts'
-import { stubFetch } from './helpers.ts'
+import { MAX_MEMORY_ENTRY } from '../src/tools.ts'
+import { DOT_PNG, stubFetch } from './helpers.ts'
 
 /**
  * A throw-away working directory.
@@ -22,6 +26,89 @@ import { stubFetch } from './helpers.ts'
 async function workspace(): Promise<string> {
   return await mkdtemp(path.join(tmpdir(), 'dsh-agent-'))
 }
+
+test('a promise-only reply gets one reminder and then acts', async () => {
+  const stub = stubFetch([
+    { choices: [{ message: { content: '我先读一下这个目录里有什么。' } }] },
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              { id: 'c1', type: 'function', function: { name: 'list', arguments: '{}' } }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: '目录已经看过了。' } }] }
+  ])
+  const steps: AgentStep[] = []
+  const result = await runAgent(
+    { prompt: '看看目录', apiKey: 'sk-test', model: 'deepseek-chat' },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root: await workspace(),
+      onStep: (step) => steps.push(step)
+    }
+  )
+  assert.equal(stub.calls.length, 3, '回答 + 提醒 + 工具轮')
+  const reminded = stub.calls[1].body.messages[stub.calls[1].body.messages.length - 1]
+  assert.equal(reminded?.role, 'user')
+  assert.match(String(reminded?.content), /没有调用任何工具/)
+  assert.match(String(reminded?.content), /tools 为准/)
+  assert.equal(steps.length, 1)
+  assert.equal(result.text, '目录已经看过了。')
+  assert.equal(result.rounds, 3)
+})
+
+test('a second promise-only reply says the answer stopped without tools', async () => {
+  const stub = stubFetch([
+    { choices: [{ message: { content: '让我先打开这个页面看看。' } }] },
+    { choices: [{ message: { content: '我先检查一下验证码是什么形式。' } }] }
+  ])
+  const result = await runAgent(
+    { prompt: '打开页面', apiKey: 'sk-test', model: 'deepseek-chat' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  // The reminder is sent once; a second promise ends the answer with a note.
+  assert.equal(stub.calls.length, 2)
+  assert.match(result.text, /我先检查一下验证码是什么形式。/)
+  assert.match(result.text, /回复「继续」/)
+})
+
+test('a finished answer is not interrupted by the reminder', async () => {
+  const stub = stubFetch([{ choices: [{ message: { content: '已把页面打开了，标题是「示例」。' } }] }])
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', model: 'deepseek-chat' },
+    { fetchImpl: stub.fetchImpl, env: {}, root: await workspace() }
+  )
+  assert.equal(stub.calls.length, 1, '没有承诺就不该多问一轮')
+  assert.equal(result.text, '已把页面打开了，标题是「示例」。')
+})
+
+test('only short, code-free promises are treated as unfinished work', () => {
+  for (const text of [
+    '我先打开这个登录页，看看验证码是什么形式。',
+    '让我先读一下这个文件。',
+    '现在我检查一下接口返回。',
+    'Let me open that page and check the captcha.'
+  ]) {
+    assert.equal(unfulfilledPromise(text), true, text)
+  }
+  for (const text of [
+    '已打开页面，标题是「示例」。',
+    '这个页面没有验证码。',
+    // A long explanation may quote the phrasing without promising anything.
+    '我先说明一下结论：' + '这个页面使用了滑块验证码，需要人工拖动。'.repeat(20),
+    // Code is never a promise.
+    '我来写一段脚本：\n```js\nconsole.log(1)\n```'
+  ]) {
+    assert.equal(unfulfilledPromise(text), false, text)
+  }
+})
 
 test('answers without calling a tool', async () => {
   const stub = stubFetch([{ choices: [{ message: { content: 'hello' } }] }])
@@ -1292,6 +1379,54 @@ test('runs a tool and feeds the result back', async () => {
   assert.match(String(second[second.length - 1].content), /alpha/)
 })
 
+test('shows a tool image to the model as a user message', async () => {
+  const root = await workspace()
+  await writeFile(path.join(root, 'dot.png'), DOT_PNG)
+  const steps: AgentStep[] = []
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'read_image',
+                  arguments: JSON.stringify({ path: 'dot.png' })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: '看到了' } }] }
+  ])
+  const result = await runAgent(
+    { prompt: '看看这张图', apiKey: 'sk-test' },
+    { fetchImpl: stub.fetchImpl, env: {}, root, onStep: (step) => steps.push(step) }
+  )
+  assert.equal(result.text, '看到了')
+  // The window is told which file holds the picture, so the next question can
+  // show it again without taking it twice.
+  assert.equal(steps[0]?.image?.mime, 'image/png')
+  assert.match(steps[0]?.image?.path ?? '', /dot\.png$/)
+  const messages = stub.calls[1].body.messages
+  const toolIndex = messages.findIndex((message) => message.role === 'tool')
+  assert.ok(toolIndex >= 0, 'the tool answered first')
+  const attached = messages[toolIndex + 1]
+  assert.equal(attached?.role, 'user', 'the picture follows its tool result')
+  const parts = attached?.content as Array<Record<string, unknown>>
+  assert.equal(parts[1]?.type, 'image_url')
+  const url = String(
+    (parts[1] as { image_url?: { url?: string } } | undefined)?.image_url?.url ?? ''
+  )
+  assert.match(url, /^data:image\/png;base64,/)
+})
+
 test('adds up the tokens of every round', async () => {
   const root = await workspace()
   await writeFile(path.join(root, 'notes.txt'), 'alpha\n', 'utf8')
@@ -1599,6 +1734,41 @@ test('reports a broken approval callback instead of dropping the answer', async 
   await assert.rejects(readFile(path.join(root, 'x.txt')), 'the write must not happen')
 })
 
+test('a replace dryRun needs no approval bridge', async () => {
+  const root = await workspace()
+  await writeFile(path.join(root, 'a.txt'), 'old\n', 'utf8')
+  const call = {
+    id: 'c1',
+    type: 'function',
+    function: {
+      name: 'replace',
+      arguments: JSON.stringify({ pattern: '*.txt', old: 'old', new: 'new', dryRun: true })
+    }
+  }
+  const stub = stubFetch([
+    { choices: [{ message: { content: null, tool_calls: [call] } }] },
+    { choices: [{ message: { content: 'done' } }] }
+  ])
+  const approvals: ApprovalRequest[] = []
+  const result = await runAgent(
+    { prompt: 'preview', apiKey: 'sk-test', allowedTools: ['replace'] },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root,
+      requireWriteApproval: true,
+      onApproval: (request) => approvals.push(request)
+    }
+  )
+  assert.equal(result.text, 'done')
+  // A write would have been refused without a bridge; a preview runs and asks
+  // nobody, because it changes nothing.
+  assert.equal(approvals.length, 0)
+  const tool = stub.calls[1].body.messages.find((message) => message.role === 'tool')
+  assert.match(String(tool?.content), /预览，未写盘/)
+  assert.equal(await readFile(path.join(root, 'a.txt'), 'utf8'), 'old\n')
+})
+
 test('shrinks older tool results so the transcript stays inside its budget', async () => {
   const root = await workspace()
   await writeFile(path.join(root, 'big.txt'), 'x'.repeat(MAX_TOOL_MESSAGE + 500), 'utf8')
@@ -1624,10 +1794,39 @@ test('shrinks older tool results so the transcript stays inside its budget', asy
   )
   const full = tools.filter((message) => String(message.content).startsWith('1\t'))
   assert.equal(full.length, 2, 'only the newest results survive in full')
-  const dropped = tools.filter((message) => message.content === DROPPED_TOOL_RESULT)
+  const dropped = tools.filter((message) =>
+    String(message.content).includes('较早的')
+  )
   assert.equal(dropped.length, 3)
+  // The note names the result it replaced, so the model knows what to re-run.
+  assert.ok(
+    dropped.every((message) => String(message.content).includes('read big.txt')),
+    dropped.map((message) => String(message.content)).join(' | ')
+  )
   const total = tools.reduce((sum, message) => sum + String(message.content).length, 0)
   assert.ok(total <= MAX_TOOL_CONTEXT, `${total} characters`)
+})
+
+test('a bigger window keeps more tool text than a small one', () => {
+  // A 128k window keeps exactly what it used to: the old constants are floors.
+  assert.deepEqual(toolBudgets(128_000), {
+    message: MAX_TOOL_MESSAGE,
+    context: MAX_TOOL_CONTEXT
+  })
+  // A model that can hold 1M tokens is not forced into the same 60k budget.
+  const large = toolBudgets(1_000_000)
+  assert.ok(large.message > MAX_TOOL_MESSAGE, `${large.message}`)
+  assert.ok(large.context > MAX_TOOL_CONTEXT, `${large.context}`)
+  // Two results at the per-result cap always fit the question's budget.
+  assert.ok(large.context >= large.message * 2)
+  // An unknown window falls back to the default rather than to zero.
+  assert.deepEqual(toolBudgets(0), toolBudgets(128_000))
+})
+
+test('a dropped result says which call it was', () => {
+  assert.match(droppedToolResult('read src/a.ts'), /较早的 read src\/a\.ts 结果已省略/)
+  // Without a label the generic note is still there, for callers that have none.
+  assert.equal(droppedToolResult(''), DROPPED_TOOL_RESULT)
 })
 
 test('refuses a request without a key', async () => {
@@ -2007,6 +2206,95 @@ test('plan mode adds its guidance and exit tool only when asked', async () => {
   const plannedTools = (planned.calls[0].body.tools ?? []) as Array<{ function: { name: string } }>
   assert.ok(plannedTools.some((tool) => tool.function.name === 'exit_plan_mode'))
   assert.ok(String(planned.calls[0].body.messages[0].content).includes('计划模式'))
+})
+
+test('the remember tool is offered only with a host memory file', async () => {
+  const plain = stubFetch([{ choices: [{ message: { content: 'ok' } }] }])
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test' },
+    { fetchImpl: plain.fetchImpl, env: {}, root: await workspace() }
+  )
+  const plainTools = (plain.calls[0].body.tools ?? []) as Array<{ function: { name: string } }>
+  assert.ok(!plainTools.some((tool) => tool.function.name === 'remember'), 'no file, no tool')
+
+  const kept: string[] = []
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: { name: 'remember', arguments: JSON.stringify({ text: '先跑 cargo test' }) }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: '记下了' } }] }
+  ])
+  const result = await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', memory: true },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root: await workspace(),
+      remember: (entry) => {
+        kept.push(entry.text)
+      }
+    }
+  )
+  const tools = (stub.calls[0].body.tools ?? []) as Array<{ function: { name: string } }>
+  assert.ok(tools.some((tool) => tool.function.name === 'remember'))
+  assert.deepEqual(kept, ['先跑 cargo test'])
+  assert.equal(result.text, '记下了')
+  const toolResult = stub.calls[1].body.messages.find((message) => message.role === 'tool')
+  assert.ok(String(toolResult?.content).includes('已记入长期记忆'))
+})
+
+test('a memory entry that is too long is refused before the host sees it', async () => {
+  const stub = stubFetch([
+    {
+      choices: [
+        {
+          message: {
+            content: '',
+            tool_calls: [
+              {
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'remember',
+                  arguments: JSON.stringify({ text: 'x'.repeat(MAX_MEMORY_ENTRY + 1) })
+                }
+              }
+            ]
+          }
+        }
+      ]
+    },
+    { choices: [{ message: { content: 'ok' } }] }
+  ])
+  let called = false
+  await runAgent(
+    { prompt: 'hi', apiKey: 'sk-test', memory: true },
+    {
+      fetchImpl: stub.fetchImpl,
+      env: {},
+      root: await workspace(),
+      remember: () => {
+        called = true
+        return true
+      }
+    }
+  )
+  const toolResult = stub.calls[1].body.messages.find((message) => message.role === 'tool')
+  assert.ok(String(toolResult?.content).includes('太长'))
+  assert.equal(called, false, 'the host never sees an oversized entry')
 })
 
 test('the todo tool replaces the list and reports it to the window', async () => {

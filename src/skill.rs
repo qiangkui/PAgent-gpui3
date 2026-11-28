@@ -404,6 +404,24 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_workflow_distill_skill_is_installable() {
+        // `skills/` holds source folders that the Skill page copies into
+        // `<home>/skills`. Reading it with the same scanner catches a broken
+        // manifest here instead of after a user imported it.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("skills");
+        let found = scanned_skills(&dir);
+        let skill = found
+            .iter()
+            .find(|skill| skill.id == "workflow-distill")
+            .expect("skills/workflow-distill is shipped");
+        assert_eq!(skill.problem, "");
+        assert_eq!(skill.name, "工作流固化");
+        assert!(!skill.description.is_empty());
+        assert!(skill.instructions.contains("node src/cli.ts distill"));
+        assert!(skill.instructions.chars().count() <= MAX_INSTRUCTIONS);
+    }
+
+    #[test]
     fn joins_skills_until_the_prompt_budget_is_spent() {
         let skill = |id: &str, text: &str| InstalledSkill {
             id: id.to_string(),

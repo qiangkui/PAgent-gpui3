@@ -7,18 +7,21 @@
 //! per-conversation request files when the ledger is first created.
 
 use super::*;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+
+mod cards;
+use cards::*;
 
 /// One hour, in milliseconds.
-const HOUR_MS: u64 = 3_600_000;
+pub(super) const HOUR_MS: u64 = 3_600_000;
 /// One day, in milliseconds.
-const DAY_MS: u64 = 86_400_000;
+pub(super) const DAY_MS: u64 = 86_400_000;
 /// Widest the card area grows; a wider pane leaves equal gutters on both sides.
-const STATS_AREA_WIDTH: f32 = 822.;
+pub(super) const STATS_AREA_WIDTH: f32 = 822.;
 /// Width of one summary tile: three tiles and two gaps fill the area exactly.
-const STATS_TILE_WIDTH: f32 = 266.;
+pub(super) const STATS_TILE_WIDTH: f32 = 266.;
 /// Width of one chart card: two cards and one gap fill the area exactly.
-const STATS_CARD_WIDTH: f32 = 405.;
+pub(super) const STATS_CARD_WIDTH: f32 = 405.;
 /// Height of the three summary tiles on the first row.
 ///
 /// The surface pads 16px top and bottom and puts 8px between its three lines.
@@ -26,22 +29,24 @@ const STATS_CARD_WIDTH: f32 = 405.;
 /// 16px label, the 30px figure and the 12px note need 26 + 49 + 19 pixels:
 /// 142 all told. At 128 the note — the only child that truncates, and therefore
 /// the only one allowed to shrink — collapsed to a sliver of glyph tops.
-const STATS_TILE_HEIGHT: f32 = 144.;
+pub(super) const STATS_TILE_HEIGHT: f32 = 144.;
 /// Height of a chart card placed two per row, so the pair always matches.
-const STATS_CARD_HEIGHT: f32 = 260.;
+pub(super) const STATS_CARD_HEIGHT: f32 = 260.;
 /// Height of the full-width Token 用量 card.
-const STATS_LONG_HEIGHT: f32 = 320.;
+pub(super) const STATS_LONG_HEIGHT: f32 = 320.;
 /// Gap kept below the last element inside the scroll content, so the stop
 /// point leaves that distance visible instead of pulling the content flush.
-const STATS_BOTTOM_GAP: f32 = 16.;
+pub(super) const STATS_BOTTOM_GAP: f32 = 16.;
 /// Plot area of a chart card's bars.
-const CHART_HEIGHT: f32 = 84.;
+pub(super) const CHART_HEIGHT: f32 = 84.;
 /// Equal horizontal bands the chart's grid rules split the plot into.
-const CHART_BANDS: usize = 4;
+pub(super) const CHART_BANDS: usize = 4;
 /// Plot area of the full-width token chart.
-const LONG_CHART_HEIGHT: f32 = 150.;
+pub(super) const LONG_CHART_HEIGHT: f32 = 150.;
 /// Models listed on the distribution card before the rest are folded away.
-const MODELS_SHOWN: usize = 5;
+pub(super) const MODELS_SHOWN: usize = 5;
+/// Tools listed on the distribution card before the rest are folded away.
+pub(super) const TOOLS_SHOWN: usize = 5;
 
 /// The span of time the page covers, and how finely it splits it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,6 +210,9 @@ pub(crate) struct StatsPoint {
     pub(crate) context: u64,
     /// Tool calls the question made; zero when the save did not record them.
     pub(crate) tools: u64,
+    /// How often each tool was called, when the record kept the names; empty
+    /// for requests recorded before it did.
+    pub(crate) tool_calls: BTreeMap<String, u64>,
     /// Prompt tokens the provider served from its cache.
     pub(crate) cache_hits: u64,
     /// Prompt tokens the question sent, summed over its rounds.
@@ -286,6 +294,8 @@ pub(crate) struct StatsReport {
     pub(crate) chats: u64,
     /// Models, busiest first.
     pub(crate) models: Vec<ModelShare>,
+    /// Tools by call count, busiest first; empty when no request kept names.
+    pub(crate) tool_calls: Vec<(String, u64)>,
     /// First millisecond the window covers.
     pub(crate) start_ms: u64,
     /// True when some figure is placed at a conversation's last change.
@@ -429,6 +439,7 @@ pub(crate) fn stats_points_for(
                         .count() as u64
                 };
                 points.push(StatsPoint {
+                    tool_calls: counted_tools(&request.tool_names),
                     at_ms: request.at_ms,
                     chat: chat.dir.clone(),
                     title: chat.title.clone(),
@@ -469,15 +480,23 @@ pub(crate) fn stats_points_for(
         // same time, conversation and model, and the list would read as one
         // request repeated.
         let mut pending_tools = 0u64;
+        // The rows also carry the tool names (`read · a.txt`), so an old
+        // transcript can report which tools did the work, not only how many.
+        let mut pending_tool_names: Vec<String> = Vec::new();
         let mut pending_question = String::new();
         let mut turn = 0u64;
         for message in &chat.messages {
             match message.role {
                 Role::Tool => {
                     pending_tools = pending_tools.saturating_add(1);
+                    let name = tool_name_of(&message.text);
+                    if !name.is_empty() {
+                        pending_tool_names.push(name);
+                    }
                 }
                 Role::User | Role::Attachment => {
                     pending_tools = 0;
+                    pending_tool_names.clear();
                     pending_question = turn_label(&message.text);
                 }
                 // Interaction cards are not user questions or answers.
@@ -495,6 +514,8 @@ pub(crate) fn stats_points_for(
                         pending_tools
                     };
                     pending_tools = 0;
+                    let fallback_tools = counted_tools(&pending_tool_names);
+                    pending_tool_names.clear();
                     let model = if message.model.is_empty() {
                         newest.clone()
                     } else {
@@ -506,6 +527,7 @@ pub(crate) fn stats_points_for(
                         .map(|(prompt, _, _)| *prompt)
                         .sum();
                     points.push(StatsPoint {
+                        tool_calls: fallback_tools,
                         at_ms: chat.updated_ms,
                         chat: chat.dir.clone(),
                         title: chat.title.clone(),
@@ -543,6 +565,7 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
     let mut buckets: Vec<StatsBucket> = (0..count).map(|_| StatsBucket::default()).collect();
     let mut seen: Vec<HashSet<String>> = (0..count).map(|_| HashSet::new()).collect();
     let mut chats: HashSet<String> = HashSet::new();
+    let mut tool_counts: HashMap<String, u64> = HashMap::new();
     let mut models: HashMap<String, ModelShare> = HashMap::new();
     let mut report = StatsReport {
         buckets: Vec::new(),
@@ -559,6 +582,7 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
         reasoning_tokens: 0,
         chats: 0,
         models: Vec::new(),
+        tool_calls: Vec::new(),
         start_ms,
         estimated: false,
     };
@@ -578,6 +602,7 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
         report.requests = report.requests.saturating_add(1);
         report.tokens = report.tokens.saturating_add(point.tokens);
         report.tools = report.tools.saturating_add(point.tools);
+        add_tool_counts(&mut tool_counts, &point.tool_calls);
         report.prompt = report.prompt.saturating_add(point.context);
         report.cache_hits = report.cache_hits.saturating_add(point.cache_hits);
         report.prompt_tokens = report.prompt_tokens.saturating_add(point.prompt_tokens);
@@ -620,6 +645,7 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
     }
     report.buckets = buckets;
     report.chats = chats.len() as u64;
+    report.tool_calls = ranked_tools(tool_counts);
     report.models = models.into_values().collect();
     // Busiest by tokens, then by requests, then by name: a stable order keeps
     // the rows from swapping places while the window rolls forward.
@@ -632,6 +658,60 @@ pub(crate) fn stats_report(points: &[StatsPoint], range: StatsRange, now_ms: u64
     });
     report
 }
+
+/// Count one question's tool names, keeping the map sorted by name.
+///
+/// A name repeated across rounds counts once per round: the ledger answers
+/// "which tools did this question lean on", not "which were offered".
+/// @param names - tool names in call order, duplicates included.
+/// @returns name → times called.
+fn counted_tools(names: &[String]) -> BTreeMap<String, u64> {
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let entry = counts.entry(name.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+    counts
+}
+
+/// The tool name at the head of a transcript row: `read · a.txt — …` → `read`.
+///
+/// A conversation without a request file has no stored names, so they come from
+/// the rows the transcript already shows. A row that names no tool yields
+/// nothing rather than a blank entry.
+/// @param text - the row's text.
+/// @returns the name before the separator, trimmed.
+fn tool_name_of(text: &str) -> String {
+    text.split('·')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// The card's order for per-tool counts: busiest first, then by name.
+/// @param counts - name → times called, in any order.
+/// @returns the pairs the card draws.
+fn ranked_tools(counts: HashMap<String, u64>) -> Vec<(String, u64)> {
+    let mut ranked: Vec<(String, u64)> = counts.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked
+}
+
+/// Add one record's per-tool counts into a running total.
+/// @param total - the window's counts so far.
+/// @param counts - one request's or one day's counts.
+fn add_tool_counts(total: &mut HashMap<String, u64>, counts: &BTreeMap<String, u64>) {
+    for (name, count) in counts {
+        let entry = total.entry(name.clone()).or_insert(0);
+        *entry = entry.saturating_add(*count);
+    }
+}
+
 /// Turn a completed request into a permanent ledger record.
 pub(crate) fn ledger_record(
     chat: &str,
@@ -664,6 +744,7 @@ pub(crate) fn ledger_record(
         web_searches: request.web_searches,
         web_fetches: request.web_fetches,
         reasoning_tokens: u64::from(request.reasoning_tokens),
+        tool_calls: counted_tools(&request.tool_names),
         estimated: false,
     }
 }
@@ -680,6 +761,7 @@ fn point_from_record(record: crate::stats_store::StatsRecord) -> StatsPoint {
         tokens: record.tokens,
         context: record.context,
         tools: record.tools,
+        tool_calls: record.tool_calls,
         cache_hits: record.cache_hits,
         prompt_tokens: record.prompt_tokens,
         model_ms: record.model_ms,
@@ -704,6 +786,7 @@ fn record_from_point(point: StatsPoint) -> crate::stats_store::StatsRecord {
         tokens: point.tokens,
         context: point.context,
         tools: point.tools,
+        tool_calls: point.tool_calls,
         cache_hits: point.cache_hits,
         prompt_tokens: point.prompt_tokens,
         model_ms: point.model_ms,
@@ -727,6 +810,7 @@ fn report_from_daily(
     let mut buckets: Vec<StatsBucket> = (0..count).map(|_| StatsBucket::default()).collect();
     let mut seen: Vec<HashSet<String>> = (0..count).map(|_| HashSet::new()).collect();
     let mut chats: HashSet<String> = HashSet::new();
+    let mut tool_counts: HashMap<String, u64> = HashMap::new();
     let mut models: HashMap<String, ModelShare> = HashMap::new();
     let mut report = StatsReport {
         buckets: Vec::new(),
@@ -743,6 +827,7 @@ fn report_from_daily(
         reasoning_tokens: 0,
         chats: 0,
         models: Vec::new(),
+        tool_calls: Vec::new(),
         start_ms,
         estimated: false,
     };
@@ -764,6 +849,7 @@ fn report_from_daily(
         report.requests = report.requests.saturating_add(day.requests);
         report.tokens = report.tokens.saturating_add(day.tokens);
         report.tools = report.tools.saturating_add(day.tools);
+        add_tool_counts(&mut tool_counts, &day.tool_calls);
         report.prompt = report.prompt.saturating_add(day.prompt);
         report.cache_hits = report.cache_hits.saturating_add(day.cache_hits);
         report.prompt_tokens = report.prompt_tokens.saturating_add(day.prompt_tokens);
@@ -802,6 +888,7 @@ fn report_from_daily(
     }
     report.buckets = buckets;
     report.chats = chats.len() as u64;
+    report.tool_calls = ranked_tools(tool_counts);
     report.models = models.into_values().collect();
     report.models.sort_by(|left, right| {
         right
@@ -1178,8 +1265,9 @@ impl DshFlowApp {
                     palette,
                 ))
             });
-        // The four chart cards go two per row, each pair sharing width and
-        // height so the band reads as a grid rather than a wrapping strip.
+        // The chart cards go two per row, each pair sharing width and height so the
+        // band reads as a grid rather than a wrapping strip; the tools card gets a
+        // row of its own under them.
         let chart_rows = div()
             .flex()
             .flex_col()
@@ -1209,6 +1297,19 @@ impl DshFlowApp {
                     .min_w(px(0.))
                     .child(average_card(&report, self.stats_range, palette))
                     .child(models_card(&report, palette)),
+            )
+            // Which tools did the work is the second half of the same question the
+            // model card answers, so it gets its own row under it.
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap_3()
+                    .w_full()
+                    .min_w(px(0.))
+                    .child(tools_card(&report, palette)),
             );
         let hint = (report.requests == 0).then(|| {
             div()
@@ -1289,603 +1390,6 @@ impl DshFlowApp {
     }
 }
 
-/// One chip of the range picker; the chosen one is filled with the accent.
-fn range_chip(
-    index: usize,
-    range: StatsRange,
-    selected: bool,
-    palette: Palette,
-    cx: &mut Context<DshFlowApp>,
-) -> AnyElement {
-    div()
-        .id(("stats-range", index))
-        .px_3()
-        .py_1()
-        .flex_shrink_0()
-        .rounded_full()
-        .bg(rgb(if selected {
-            palette.accent
-        } else {
-            palette.panel
-        }))
-        .border_1()
-        .border_color(rgb(if selected {
-            palette.accent
-        } else {
-            palette.border
-        }))
-        .text_xs()
-        .text_color(rgb(if selected {
-            palette.accent_text
-        } else {
-            palette.muted
-        }))
-        .cursor_pointer()
-        .hover(move |style| {
-            style.bg(rgb(if selected {
-                palette.accent
-            } else {
-                palette.panel_soft
-            }))
-        })
-        .on_click(cx.listener(move |view, _, _, cx| view.set_stats_range(range, cx)))
-        .child(range.label())
-        .into_any_element()
-}
-
-/// The line above the cards: the window's first moment, its bucket width, and
-/// how many conversations answered in it.
-fn coverage_line(report: &StatsReport, range: StatsRange, palette: Palette) -> Div {
-    let chats = if report.chats == 0 {
-        "还没有对话有请求".to_string()
-    } else {
-        format!("{} 个对话有请求", report.chats)
-    };
-    let dot = || div().text_xs().text_color(rgb(palette.faint)).child("·");
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_wrap()
-        .gap_2()
-        .px_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(palette.muted))
-                .child(format!("{} 至今", stamp_label(report.start_ms))),
-        )
-        .child(dot())
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(format!("每格 {}", range.bucket_name())),
-        )
-        .child(dot())
-        .child(div().text_xs().text_color(rgb(palette.faint)).child(chats))
-}
-
-/// `11-23 00:00`, the first moment of a window.
-fn stamp_label(ms: u64) -> String {
-    let (_, month, day) = civil_from_days((ms / DAY_MS) as i64);
-    let hour = (ms / HOUR_MS) % 24;
-    format!("{month:02}-{day:02} {hour:02}:00")
-}
-
-/// The surface every card shares: the panel colour and a soft shadow, with no
-/// border. Width and height are left to the row the card is placed in.
-fn card_surface(palette: Palette) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .p_4()
-        .rounded_lg()
-        .bg(rgb(palette.panel))
-        .shadow_md()
-}
-
-/// A chart card in the two-per-row grid: the pair shares width and height.
-///
-/// Fixed pixel widths keep both cards on whole pixels, so their shadows never
-/// meet on a fractional edge; a pane narrower than the pair wraps instead of
-/// squeezing the cards into subpixel widths.
-fn chart_card(palette: Palette) -> Div {
-    card_surface(palette)
-        .w(px(STATS_CARD_WIDTH))
-        .h(px(STATS_CARD_HEIGHT))
-}
-
-/// The token chart's card: one full row of its own.
-fn long_card(palette: Palette) -> Div {
-    card_surface(palette).w_full().h(px(STATS_LONG_HEIGHT))
-}
-
-/// One of the three totals on the first row: a label, a big figure and a note.
-///
-/// The three tiles split their row equally, so the three headline figures read
-/// as one band rather than as three differently sized cards.
-fn summary_tile(
-    label: &str,
-    value: String,
-    note: String,
-    colour: u32,
-    palette: Palette,
-) -> AnyElement {
-    card_surface(palette)
-        .w(px(STATS_TILE_WIDTH))
-        .h(px(STATS_TILE_HEIGHT))
-        // A tighter shadow than the chart cards: three of them sit side by side
-        // and the wider blur would meet in the gaps as a visible seam.
-        .shadow_sm()
-        .gap_2()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(status_dot(colour))
-                .child(
-                    div()
-                        .text_base()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(palette.text))
-                        .child(label.to_string()),
-                ),
-        )
-        .child(
-            div()
-                .text_size(px(30.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(palette.text))
-                .child(value),
-        )
-        .child(
-            div()
-                .truncate()
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(note),
-        )
-        .into_any_element()
-}
-
-/// A card's title, with a short note pinned to its right edge.
-fn card_heading(title: &str, note: &str, palette: Palette) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_2()
-        .w_full()
-        .min_w(px(0.))
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_sm()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(palette.text))
-                .child(title.to_string()),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.))
-                .truncate()
-                .text_right()
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(note.to_string()),
-        )
-}
-
-/// The big figure at the top of a card, with its unit beside it.
-fn card_value(value: String, unit: &str, palette: Palette) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_end()
-        .gap_1()
-        .child(
-            div()
-                .text_size(px(26.))
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(palette.text))
-                .child(value),
-        )
-        .child(
-            div()
-                .pb(px(3.))
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(unit.to_string()),
-        )
-}
-
-/// Every digit of a count, for the headline totals where an abbreviation would
-/// hide how much was spent.
-fn full_count(count: u64) -> String {
-    count.to_string()
-}
-
-/// One faint line under a chart: its peak, or what the bars add up to.
-fn chart_foot(text: String, palette: Palette) -> Div {
-    div()
-        .text_xs()
-        .text_color(rgb(palette.faint))
-        .whitespace_normal()
-        .child(text)
-}
-
-/// A bar per bucket, newest on the right and tinted with the card's colour.
-///
-/// `labels` is one per bar, or empty when the window is too dense to name every
-/// bar; `step` lets a day's twelve bars show every other hour. The newest bar
-/// keeps the accent colour, so the reader can always find "now" in the chart.
-/// `vivid` keeps every bar in the card's colour (the rest slightly faded), which
-/// a day's twelve bars need to read at a glance; the longer windows leave the
-/// older bars quiet so the newest one stands out on its own.
-fn bar_chart(
-    values: &[u64],
-    labels: &[String],
-    peak: u64,
-    colour: u32,
-    step: usize,
-    vivid: bool,
-    height: f32,
-    palette: Palette,
-) -> AnyElement {
-    let peak = peak.max(1);
-    let newest = values.len().saturating_sub(1);
-    let mut bars = div()
-        .flex()
-        .flex_row()
-        .items_end()
-        .gap(px(2.))
-        .w_full()
-        .min_w(px(0.))
-        .h(px(height));
-    for (index, value) in values.iter().enumerate() {
-        let bar = if *value == 0 {
-            // A flat bar would be invisible; a hair of the track keeps each
-            // empty bucket visible without pretending it holds a value.
-            div()
-                .w_full()
-                .h(px(1.))
-                .rounded_sm()
-                .bg(rgb(palette.panel_soft))
-        } else {
-            let share = (*value as f32 / peak as f32).clamp(0.05, 1.);
-            let (fill, faded) = if index == newest {
-                (colour, false)
-            } else if vivid {
-                (colour, true)
-            } else {
-                (palette.border, false)
-            };
-            let mut bar = div().w_full().h(relative(share)).rounded_sm().bg(rgb(fill));
-            if faded {
-                bar = bar.opacity(0.7);
-            }
-            bar
-        };
-        bars = bars.child(
-            div()
-                .flex()
-                .flex_col()
-                .justify_end()
-                .flex_1()
-                .min_w(px(2.))
-                .h_full()
-                .child(bar),
-        );
-    }
-    // The plot is the bars over equally spaced horizontal rules. The rules are
-    // painted first, so a bar always sits on top of the line behind it.
-    let mut plot = div()
-        .relative()
-        .w_full()
-        .min_w(px(0.))
-        .h(px(height))
-        .border_b_1()
-        .border_color(rgb(palette.border));
-    for band in 0..CHART_BANDS {
-        plot = plot.child(
-            div()
-                .absolute()
-                .top(relative(band as f32 / CHART_BANDS as f32))
-                .left(px(0.))
-                .w_full()
-                .h(px(1.))
-                .bg(rgb(palette.border))
-                .opacity(0.7),
-        );
-    }
-    plot = plot.child(bars);
-    let mut body = div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .w_full()
-        .min_w(px(0.))
-        .child(plot);
-    if !labels.is_empty() {
-        let mut ticks = div().flex().flex_row().gap(px(2.)).w_full().min_w(px(0.));
-        for index in 0..values.len() {
-            let show = index % step.max(1) == 0 || index == newest;
-            ticks = ticks.child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .truncate()
-                    .text_center()
-                    .text_size(px(9.))
-                    .text_color(rgb(if index == newest {
-                        colour
-                    } else {
-                        palette.faint
-                    }))
-                    .child(if show {
-                        labels.get(index).cloned().unwrap_or_default()
-                    } else {
-                        String::new()
-                    }),
-            );
-        }
-        body = body.child(ticks);
-    }
-    body.into_any_element()
-}
-
-/// How many requests were answered in each bar.
-fn requests_card(report: &StatsReport, range: StatsRange, palette: Palette) -> AnyElement {
-    let values: Vec<u64> = report
-        .buckets
-        .iter()
-        .map(|bucket| bucket.requests)
-        .collect();
-    let labels = range.tick_labels(report.start_ms);
-    let peak = values.iter().copied().max().unwrap_or(0);
-    chart_card(palette)
-        .child(card_heading(
-            "请求次数",
-            &format!("每格 {}", range.bucket_name()),
-            palette,
-        ))
-        .child(card_value(short_count(report.requests), "次", palette))
-        .child(bar_chart(
-            &values,
-            &labels,
-            peak,
-            palette.accent,
-            range.label_step(),
-            range == StatsRange::Day,
-            CHART_HEIGHT,
-            palette,
-        ))
-        .child(chart_foot(
-            format!(
-                "最新在右 · 最高 {} 次 · {} 个对话",
-                short_count(peak),
-                report.chats
-            ),
-            palette,
-        ))
-        .into_any_element()
-}
-
-/// Tokens the endpoint billed, per bar.
-fn tokens_card(report: &StatsReport, range: StatsRange, palette: Palette) -> AnyElement {
-    let values: Vec<u64> = report.buckets.iter().map(|bucket| bucket.tokens).collect();
-    let labels = range.tick_labels(report.start_ms);
-    let peak = values.iter().copied().max().unwrap_or(0);
-    long_card(palette)
-        .child(card_heading(
-            "Token 用量",
-            &format!("每格 {}", range.bucket_name()),
-            palette,
-        ))
-        .child(card_value(full_count(report.tokens), "tokens", palette))
-        .child(bar_chart(
-            &values,
-            &labels,
-            peak,
-            palette.sky,
-            range.label_step(),
-            range == StatsRange::Day,
-            LONG_CHART_HEIGHT,
-            palette,
-        ))
-        .child(chart_foot(
-            format!(
-                "最新在右 · 提示 {} · 平均每次 {} tokens",
-                full_count(report.prompt),
-                full_count(report.average_tokens())
-            ),
-            palette,
-        ))
-        .into_any_element()
-}
-
-/// Conversations that answered in each bar, counted once per bar.
-fn chats_card(report: &StatsReport, range: StatsRange, palette: Palette) -> AnyElement {
-    let values: Vec<u64> = report.buckets.iter().map(|bucket| bucket.chats).collect();
-    let labels = range.tick_labels(report.start_ms);
-    let peak = values.iter().copied().max().unwrap_or(0);
-    chart_card(palette)
-        .child(card_heading(
-            "活跃对话",
-            &format!("每格 {}", range.bucket_name()),
-            palette,
-        ))
-        .child(card_value(report.chats.to_string(), "个", palette))
-        .child(bar_chart(
-            &values,
-            &labels,
-            peak,
-            palette.ok,
-            range.label_step(),
-            range == StatsRange::Day,
-            CHART_HEIGHT,
-            palette,
-        ))
-        .child(chart_foot(
-            format!("最新在右 · 同一对话一格只算一次 · 最高 {peak} 个"),
-            palette,
-        ))
-        .into_any_element()
-}
-
-/// Tokens per request in each bar, so a heavy day shows up even when its
-/// request count looks ordinary.
-fn average_card(report: &StatsReport, range: StatsRange, palette: Palette) -> AnyElement {
-    let values: Vec<u64> = report
-        .buckets
-        .iter()
-        .map(|bucket| bucket.tokens.checked_div(bucket.requests).unwrap_or(0))
-        .collect();
-    let labels = range.tick_labels(report.start_ms);
-    let peak = values.iter().copied().max().unwrap_or(0);
-    chart_card(palette)
-        .child(card_heading(
-            "平均每次请求",
-            &format!("每格 {}", range.bucket_name()),
-            palette,
-        ))
-        .child(card_value(
-            full_count(report.average_tokens()),
-            "tokens / 次",
-            palette,
-        ))
-        .child(bar_chart(
-            &values,
-            &labels,
-            peak,
-            palette.warn,
-            range.label_step(),
-            range == StatsRange::Day,
-            CHART_HEIGHT,
-            palette,
-        ))
-        .child(chart_foot(
-            format!("最新在右 · 按格平均 · 最高 {}", full_count(peak)),
-            palette,
-        ))
-        .into_any_element()
-}
-
-/// Which models answered, as horizontal bars sized by their token share.
-fn models_card(report: &StatsReport, palette: Palette) -> AnyElement {
-    let mut card = chart_card(palette).child(card_heading("模型分布", "按 token 排序", palette));
-    if report.models.is_empty() {
-        return card
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .whitespace_normal()
-                    .child("这段时间还没有请求"),
-            )
-            .into_any_element();
-    }
-    let peak = report
-        .models
-        .iter()
-        .map(|model| model.tokens)
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    // The card has a fixed height, so the rows share it: five models plus a
-    // "还有 N 个" line fit where six rows would spill out.
-    let mut rows = div().flex().flex_col().gap_2().w_full().min_w(px(0.));
-    for model in report.models.iter().take(MODELS_SHOWN) {
-        let bar = if model.tokens == 0 {
-            div()
-                .h(px(1.))
-                .w_full()
-                .rounded_full()
-                .bg(rgb(palette.faint))
-        } else {
-            let share = (model.tokens as f32 / peak as f32).clamp(0.03, 1.);
-            div()
-                .h_full()
-                .w(relative(share))
-                .rounded_full()
-                .bg(rgb(palette.accent))
-        };
-        // A model's cache share rides in the same line as its counts; a model
-        // the endpoint never reported hits for shows only the counts.
-        let cache = (model.cache_hits > 0 && model.prompt_tokens > 0)
-            .then(|| model.cache_hits.min(model.prompt_tokens) as f64 / model.prompt_tokens as f64);
-        let summary = match cache {
-            Some(rate) => format!(
-                "{} 次 · {} · 缓存 {}",
-                short_count(model.requests),
-                short_count(model.tokens),
-                share_text(true, rate)
-            ),
-            None => format!(
-                "{} 次 · {}",
-                short_count(model.requests),
-                short_count(model.tokens)
-            ),
-        };
-        rows = rows.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .w_full()
-                .min_w(px(0.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .w_full()
-                        .min_w(px(0.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.))
-                                .truncate()
-                                .text_xs()
-                                .text_color(rgb(palette.text))
-                                .child(model.model.clone()),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(palette.muted))
-                                .child(summary),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(6.))
-                        .rounded_full()
-                        .bg(rgb(palette.panel_soft))
-                        .child(bar),
-                ),
-        );
-    }
-    card = card.child(rows);
-    let hidden = report.models.len().saturating_sub(MODELS_SHOWN);
-    if hidden > 0 {
-        card = card.child(
-            div()
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(format!("还有 {hidden} 个模型没有列出")),
-        );
-    }
-    card.into_any_element()
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1909,6 +1413,7 @@ mod tests {
             tokens,
             context,
             tools,
+            tool_calls: BTreeMap::new(),
             cache_hits: 0,
             prompt_tokens: 0,
             model_ms: 0,
@@ -2115,6 +1620,7 @@ mod tests {
         assert_eq!(points[0].tokens, 300);
         assert_eq!(points[0].context, 240);
         assert_eq!(points[0].tools, 1);
+        assert_eq!(points[0].tool_calls.get("read"), Some(&1));
         assert_eq!(points[0].model, "old-model");
         // A fallback row still names the question that opened it.
         assert_eq!(points[0].turn, 1);
@@ -2125,6 +1631,50 @@ mod tests {
         let mut older = chat;
         older.updated_ms = start - 1;
         assert!(stats_points(&missing, &[older], start).is_empty());
+    }
+
+    #[test]
+    fn tool_counts_add_up_and_rank_by_calls() {
+        let now = 20_780 * DAY_MS + 9 * HOUR_MS;
+        let mut first = point(now, "chat-a", "m", 10, 5, 3);
+        first.tool_calls = BTreeMap::from([("read".to_string(), 2), ("grep".to_string(), 1)]);
+        let mut second = point(now, "chat-b", "m", 10, 5, 2);
+        second.tool_calls = BTreeMap::from([("read".to_string(), 1), ("shell".to_string(), 1)]);
+        let report = stats_report(&[first, second], StatsRange::Day, now);
+        assert_eq!(report.tools, 5, "the total still comes from the call count");
+        assert_eq!(
+            report.tool_calls,
+            vec![
+                ("read".to_string(), 3),
+                ("grep".to_string(), 1),
+                ("shell".to_string(), 1)
+            ],
+            "busiest first, then by name"
+        );
+        // A request written before names were kept adds no tool rows but still
+        // counts toward the total.
+        let bare = point(now, "chat-c", "m", 10, 5, 1);
+        let report = stats_report(&[bare], StatsRange::Day, now);
+        assert_eq!(report.tools, 1);
+        assert!(report.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn a_request_counts_each_tool_it_called() {
+        let names = vec![
+            "read".to_string(),
+            " ".to_string(),
+            "grep".to_string(),
+            "read".to_string(),
+        ];
+        let counts = counted_tools(&names);
+        assert_eq!(counts.get("read"), Some(&2));
+        assert_eq!(counts.get("grep"), Some(&1));
+        assert_eq!(counts.len(), 2, "a blank name is not a tool");
+        assert_eq!(
+            ranked_tools(counts.into_iter().collect()),
+            vec![("read".to_string(), 2), ("grep".to_string(), 1)]
+        );
     }
 
     #[test]
@@ -2149,6 +1699,7 @@ mod tests {
             web_fetches: 0,
             reasoning: String::new(),
             reasoning_tokens: 0,
+            tool_names: vec!["read".to_string(), "grep".to_string(), "read".to_string()],
             items: vec![
                 StoredRequestItem {
                     kind: ContextKind::User.key().to_string(),

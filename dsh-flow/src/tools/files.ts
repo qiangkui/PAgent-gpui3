@@ -8,10 +8,15 @@ import {
   MAX_TREE_DEPTH, MAX_TREE_ENTRIES, MAX_WRITE_CHARS
 } from './limits.ts'
 import { decodeTextInfo, safeEnd } from './text.ts'
+import { intArg, referenceRoots, resolveReadable, resolveScoped, textArg } from './paths.ts'
 import {
-  absolutePath, intArg, referenceRoots, resolveReadable, resolveScoped, textArg
-} from './paths.ts'
-import { SKIPPED, ignoreRulesFor, isIgnored, walk, wildcard } from './walk.ts'
+  SKIPPED, baseIgnoreLayers, deeperIgnoreLayers, isIgnoredBy, isTopPlace, labelOf, searchRoots,
+  skippedDir, walk, wildcard
+} from './walk.ts'
+import type { IgnoreLayer } from './walk.ts'
+import { isSensitivePath, sensitiveRefusal } from './secrets.ts'
+import { invalidateIndex } from './symbols.ts'
+import { formatPdfReading, looksLikePdf, readPdfText } from './pdf.ts'
 
 /**
  * Describe what a write or edit would change, without touching the file.
@@ -40,7 +45,8 @@ export async function previewTool(
 export async function previewToolScoped(
   workDir: string,
   scopeRoot: ToolScope,
-  call: ToolCall
+  call: ToolCall,
+  skip: readonly string[] = []
 ): Promise<ToolPreview | null> {
   try {
     if (call.name === 'write') {
@@ -64,11 +70,11 @@ export async function previewToolScoped(
       if (info.size > MAX_EDIT_BYTES) return null
       const before = await fs.readFile(target, 'utf8')
       assertText(before, pathArg)
-      const after = applyEdits(before, editPairs(call.args))
+      const after = applyEditCall(before, call.args).after
       return preview(before, after, true)
     }
     if (call.name === 'replace') {
-      return await previewReplace(workDir, scopeRoot, call.args)
+      return await previewReplace(workDir, scopeRoot, call.args, skip)
     }
   } catch {
     return null
@@ -175,6 +181,11 @@ export async function readFile(
 ): Promise<string> {
   const requested = textArg(args, 'path')
   const target = await resolveReadable(workDir, scopeRoot, requested, readOnlyRoots)
+  // A key reaches the provider once and stays in its logs; this asks instead of
+  // reading, and the message says what to do instead.
+  if (isSensitivePath(requested) || isSensitivePath(target)) {
+    throw new Error(sensitiveRefusal(requested))
+  }
   // `readFile` on a folder fails with a platform-specific errno; point the
   // model at the tool that actually handles folders instead.
   const info = await fs.stat(target)
@@ -188,7 +199,21 @@ export async function readFile(
       `文件太大（${Math.round(info.size / (1024 * 1024))} MB，上限 ${MAX_READ_BYTES / (1024 * 1024)} MB）；请用 grep 定位或用 shell 分段查看：${requested}`
     )
   }
-  const decoded = decodeTextInfo(await fs.readFile(target))
+  const bytes = await fs.readFile(target)
+  // A PDF's words sit in compressed streams behind font maps, so `read` hands it
+  // to an extractor instead of showing binary noise. The extension counts too, so
+  // a broken header produces a clear extraction error rather than "binary file".
+  if (looksLikePdf(bytes) || path.extname(target).toLowerCase() === '.pdf') {
+    const pages = args.pages
+    if (pages !== undefined && typeof pages !== 'string' && typeof pages !== 'number') {
+      throw new Error('pages 要写成 3 或 3-7')
+    }
+    // `pages` is a string in the schema; a number is accepted because a model
+    // sometimes sends `"pages": 3` for a single page.
+    const reading = await readPdfText(target, pages === undefined ? '' : String(pages))
+    return formatPdfReading(requested, reading)
+  }
+  const decoded = decodeTextInfo(bytes)
   // Editors on Windows often leave a BOM; the model should see the text, not it.
   const decodedText = decoded.text.charCodeAt(0) === 0xfeff ? decoded.text.slice(1) : decoded.text
   // A GBK source file would otherwise reach the model as mojibake, and every
@@ -239,10 +264,91 @@ export async function writeFile(
   if (content.length > MAX_WRITE_CHARS) {
     throw new Error(`内容太长（${content.length} 字符，上限 ${MAX_WRITE_CHARS}）`)
   }
+  const before = await inspectExisting(target)
+  const notes: string[] = []
+  // `write` speaks UTF-8 only. Replacing a GBK source with it would silently
+  // change the file's encoding, which every later `edit` then refuses; saying so
+  // in the result is the difference between a surprise and a decision.
+  if (before?.foreign === true) {
+    notes.push('\n（原文件不是 UTF-8，这次按 UTF-8 写回；要保留原编码请先转码或用 shell 处理）')
+  } else if (before?.text !== undefined && similarText(before.text, content)) {
+    // A whole-file rewrite that only touches a few lines costs the transcript far
+    // more than an `edit` would; say so once, after the write has already landed.
+    notes.push('\n（这次改动不大：用 edit 只发差异可以省很多上下文；本次已整篇写入）')
+  }
   await fs.mkdir(path.dirname(target), { recursive: true })
   await fs.writeFile(target, scriptText(target, content), 'utf8')
+  await invalidateIndex(indexRoot(workDir, scopeRoot))
   const shown = path.relative(workDir, target) || target
-  return `已写入 ${shown}（${content.length} 字符）`
+  return `已写入 ${shown}（${content.length} 字符）${notes.join('')}`
+}
+
+/** What a file that is about to be overwritten already holds. */
+interface ExistingFile {
+  /** The file's text when it decodes as UTF-8. */
+  text?: string
+  /** True when the file is text but not UTF-8 (GBK, UTF-16, …). */
+  foreign: boolean
+}
+
+/**
+ * Read a file that is about to be overwritten, within the edit size cap.
+ *
+ * Only files small enough for `edit` are read: a huge log is not a source file,
+ * and loading it just to word a hint would cost more than the hint is worth.
+ * @param target - absolute path that the write would replace.
+ * @returns its text (when UTF-8) or why it cannot be compared; null if absent.
+ */
+async function inspectExisting(target: string): Promise<ExistingFile | null> {
+  const info = await fs.stat(target).catch(() => null)
+  if (info === null || !info.isFile() || info.size > MAX_EDIT_BYTES) return null
+  const bytes = await fs.readFile(target).catch(() => null)
+  if (bytes === null) return null
+  // A UTF-16 file is text, and `read` shows it fine: overwriting it in UTF-8 is
+  // exactly the change the note has to mention. Without this the NUL-byte guard
+  // below would quietly call it binary and say nothing.
+  if (
+    bytes.length >= 2 &&
+    ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))
+  ) {
+    return { foreign: true }
+  }
+  if (bytes.includes(0)) return null
+  try {
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(bytes), foreign: false }
+  } catch {
+    return { foreign: true }
+  }
+}
+
+/**
+ * Whether `after` touches only a small part of a large `before`.
+ *
+ * A cheap line-by-line comparison, not a diff: the answer only decides whether a
+ * hint is worth showing, and a false negative costs nothing.
+ * @param before - the file's current text.
+ * @param after - the text about to be written.
+ * @returns true when the file is long and the change is small.
+ */
+function similarText(before: string, after: string): boolean {
+  // Line endings are stripped before comparing: a CRLF file and an LF `content`
+  // would otherwise differ on every line, and a genuinely small edit to a
+  // Windows checkout would never earn the hint.
+  const split = (text: string): string[] => text.split('\n').map((line) => line.replace(/\r$/, ''))
+  const oldLines = split(before)
+  if (oldLines.length < 40) return false
+  const newLines = split(after)
+  const shared = Math.min(oldLines.length, newLines.length)
+  let changed = Math.abs(oldLines.length - newLines.length)
+  for (let index = 0; index < shared; index += 1) {
+    if (oldLines[index] !== newLines[index]) changed += 1
+  }
+  return changed <= Math.max(4, Math.round(Math.max(oldLines.length, newLines.length) * 0.05))
+}
+
+/** The folder the symbol index covers, matching `symbols`' own root. */
+function indexRoot(workDir: string, scopeRoot: ToolScope): string {
+  return scopeRoot === null ? workDir : path.resolve(scopeRoot)
 }
 
 /** One replacement of an `edit` call. */
@@ -251,6 +357,128 @@ interface EditPair {
   new: string
   /** True when every occurrence should change, not only a unique one. */
   replaceAll: boolean
+}
+
+/**
+ * An `edit` addressed by line number instead of by text.
+ *
+ * Text matching is the right default — it is unambiguous about what is being
+ * replaced — but a model that has just read a file knows the line numbers, and
+ * asking it to reproduce a long block exactly is where edits fail. Lines are
+ * 1-based and count the same way `read` numbers them.
+ */
+interface LineEdit {
+  /** First line replaced, 1-based. Absent for an insert. */
+  start?: number
+  /** Last line replaced, inclusive, 1-based. */
+  end?: number
+  /** Line the content goes after, 1-based; 0 means the top of the file. */
+  insertAfter?: number
+  /** Replacement or inserted text; an empty string deletes the addressed lines. */
+  content: string
+}
+
+/** What one `edit` call does to a file. */
+interface EditOutcome {
+  /** The text the file would hold afterwards. */
+  after: string
+  /** Where it changed, for the tool result; empty for a plain text edit. */
+  what: string
+}
+
+/**
+ * Apply one `edit` call, whichever way it addressed the file.
+ * @param text - the file's text now.
+ * @param args - the call's arguments.
+ * @returns the new text plus a short description of what changed.
+ */
+function applyEditCall(text: string, args: Record<string, unknown>): EditOutcome {
+  const line = lineEdit(args)
+  if (line !== null) return applyLineEdit(text, line)
+  const pairs = editPairs(args)
+  return { after: applyEdits(text, pairs), what: pairs.length === 1 ? '' : `${pairs.length} 处` }
+}
+
+/**
+ * The line-addressed edit an `edit` call asks for, or null for a text edit.
+ *
+ * The two styles cannot be mixed in one call: `old` would then be matched
+ * against a file the line edit has already changed, and the order would be
+ * guesswork.
+ */
+function lineEdit(args: Record<string, unknown>): LineEdit | null {
+  const hasStart = args.startLine !== undefined
+  const hasInsert = args.insertAfter !== undefined
+  if (!hasStart && !hasInsert) return null
+  if (args.old !== undefined || args.new !== undefined || args.edits !== undefined) {
+    throw new Error('edit 不能同时用 old / new / edits 和 startLine / insertAfter，二选一')
+  }
+  if (hasStart && hasInsert) throw new Error('startLine 和 insertAfter 只能给一个')
+  if (typeof args.content !== 'string') {
+    throw new Error('按行编辑需要 content 字符串；删除这几行时传空字符串')
+  }
+  if (args.content.length > MAX_WRITE_CHARS) {
+    throw new Error(`内容太长（${args.content.length} 字符，上限 ${MAX_WRITE_CHARS}）`)
+  }
+  if (hasStart) {
+    const start = intArg(args, 'startLine') ?? 0
+    const end = intArg(args, 'endLine') ?? start
+    if (start < 1) throw new Error('startLine 从 1 开始')
+    if (end < start) throw new Error('endLine 不能小于 startLine')
+    return { start, end, content: args.content }
+  }
+  const after = intArg(args, 'insertAfter') ?? -1
+  if (after < 0) throw new Error('insertAfter 从 0 开始（0 = 插入到文件开头）')
+  return { insertAfter: after, content: args.content }
+}
+
+/**
+ * Apply a line-addressed edit without touching the rest of the file.
+ *
+ * Works on character offsets rather than on a `split('\n')` array: that keeps
+ * the file's own line endings byte-for-byte, CRLF included, and never rewrites
+ * lines the model did not address.
+ * @param text - the file's text now.
+ * @param edit - the resolved edit.
+ * @returns the new text plus where it changed.
+ */
+function applyLineEdit(text: string, edit: LineEdit): EditOutcome {
+  const eol: '\n' | '\r\n' = text.includes('\r\n') ? '\r\n' : '\n'
+  const starts: number[] = [0]
+  for (let index = 0; index < text.length; index += 1) {
+    if (text[index] === '\n') starts.push(index + 1)
+  }
+  const piece = withLineEndings(edit.content, eol)
+  if (edit.insertAfter !== undefined) {
+    if (edit.insertAfter > starts.length) {
+      throw new Error(`insertAfter 超出：文件共 ${starts.length} 行`)
+    }
+    const at =
+      edit.insertAfter === 0
+        ? 0
+        : edit.insertAfter < starts.length
+          ? starts[edit.insertAfter]
+          : text.length
+    if (piece.trim() === '') throw new Error('要插入的 content 不能为空')
+    // A file whose last line has no trailing break still needs one before the
+    // inserted text, or the two lines would run together.
+    const lead = at > 0 && text[at - 1] !== '\n' ? eol : ''
+    const where = edit.insertAfter === 0 ? '文件开头' : `第 ${edit.insertAfter} 行后`
+    return { after: text.slice(0, at) + lead + piece + eol + text.slice(at), what: `${where}插入` }
+  }
+  const start = edit.start ?? 1
+  const end = edit.end ?? start
+  if (start > starts.length) throw new Error(`startLine 超出：文件共 ${starts.length} 行`)
+  if (end > starts.length) throw new Error(`endLine 超出：文件共 ${starts.length} 行`)
+  const begin = starts[start - 1]
+  const finish = end < starts.length ? starts[end] : text.length
+  const keepsBreak = finish > 0 && text[finish - 1] === '\n'
+  const replacement = piece === '' ? '' : piece + (keepsBreak ? eol : '')
+  const where = start === end ? `第 ${start} 行` : `第 ${start}–${end} 行`
+  return {
+    after: text.slice(0, begin) + replacement + text.slice(finish),
+    what: `${where} → ${piece === '' ? '删除' : `${piece.split(/\r?\n/).length} 行`}`
+  }
 }
 
 /**
@@ -335,6 +563,216 @@ function applyEdits(text: string, pairs: EditPair[]): string {
   return result
 }
 
+/** What one byte-level edit does to a file that is not UTF-8. */
+interface ByteEditOutcome {
+  /** The file's bytes afterwards. */
+  bytes: Buffer
+  /** What changed, for the tool result; empty for a single text edit. */
+  what: string
+}
+
+/**
+ * Apply an `edit` to a file that is not UTF-8, on its bytes.
+ *
+ * Node can decode GBK but has no GBK encoder, so decoding-and-rewriting would
+ * change the file's encoding. An ASCII-only change needs no encoder: GBK is
+ * ASCII-compatible and every ASCII byte is a whole character, so the change is
+ * made in the buffer and the rest is copied byte for byte. Text with Chinese in
+ * it is refused with a message saying how to proceed — guessing an encoding is
+ * how a source file gets corrupted.
+ * @param bytes - the file as it is on disk.
+ * @param args - the call's arguments.
+ * @returns the new bytes plus a short description of what changed.
+ */
+function applyByteEdit(bytes: Buffer, args: Record<string, unknown>): ByteEditOutcome {
+  const line = lineEdit(args)
+  if (line !== null) return applyByteLineEdit(bytes, line)
+  const pairs = editPairs(args)
+  let result = bytes
+  for (const [index, pair] of pairs.entries()) {
+    const where = pairs.length === 1 ? '' : `（第 ${index + 1} 处）`
+    assertAsciiOnly(pair.old, `old${where}`)
+    assertAsciiOnly(pair.new, `new${where}`)
+    if (pair.old === '') throw new Error(`old 不能为空${where}`)
+    // The file's own line endings win, exactly as they do on the UTF-8 path: a
+    // GBK source checked out on Windows is CRLF, and the model writes `\n`.
+    const variant = byteVariant(pair, result)
+    const replaced = replaceAsciiBytes(result, variant.old, variant.new, pair.replaceAll)
+    if (replaced.count === 0) {
+      throw new Error(`文件里找不到要替换的文本${where}：${shorten(pair.old)}`)
+    }
+    if (replaced.count > 1 && !pair.replaceAll) {
+      throw new Error(`要替换的文本出现不止一次${where}，请写得更具体或加 replaceAll`)
+    }
+    result = replaced.bytes
+  }
+  return { bytes: result, what: pairs.length === 1 ? '' : `${pairs.length} 处` }
+}
+
+/**
+ * The pair tuned to the file's own line endings, for a byte-level edit.
+ *
+ * A GBK source on Windows is CRLF while a model writes `\n`, so the same `old`
+ * that matches a UTF-8 file would otherwise report "找不到" here. Only the line
+ * endings change: the text itself still has to match exactly.
+ * @param pair - the replacement as the call wrote it.
+ * @param bytes - the buffer it will be applied to.
+ * @returns the pair with `\n` or `\r\n`, whichever the file uses.
+ */
+function byteVariant(pair: EditPair, bytes: Buffer): { old: string; new: string } {
+  if (!pair.old.includes('\n') && !pair.new.includes('\n')) return pair
+  const eol = bytes.includes(Buffer.from('\r\n')) ? '\r\n' : '\n'
+  const tune = (text: string): string => text.replace(/\r\n|\n/g, eol)
+  return { old: tune(pair.old), new: tune(pair.new) }
+}
+
+/**
+ * Refuse text that cannot be written in the file's encoding.
+ *
+ * The file is not UTF-8, so a Chinese `old` would have to be encoded back the same
+ * way to be found or written — and the engine has no such encoder. Saying so is
+ * better than writing UTF-8 into a GBK file, which every later `read` would show
+ * as mojibake.
+ * @param text - the argument text.
+ * @param label - which argument it is, for the message.
+ */
+function assertAsciiOnly(text: string, label: string): void {
+  if (!/[^\u0000-\u007f]/.test(text)) return
+  throw new Error(
+    `这个文件不是 UTF-8，只能按 ASCII 原文修改；${label} 里有非 ASCII 字符。先把它转成 UTF-8（例如 shell 里用 iconv），或用 write 整篇重写。`
+  )
+}
+
+/**
+ * Apply a line-addressed `edit` to a file that is not UTF-8, on its bytes.
+ *
+ * Line starts are found by their `\n` bytes and the replacement is written in the
+ * file's own line endings; every line the call did not address is copied
+ * untouched, so the encoded text around it keeps its exact bytes.
+ * @param bytes - the file as it is on disk.
+ * @param edit - the resolved edit.
+ * @returns the new bytes plus where it changed.
+ */
+function applyByteLineEdit(bytes: Buffer, edit: LineEdit): ByteEditOutcome {
+  assertAsciiOnly(edit.content, 'content')
+  const eol = bytes.includes(Buffer.from('\r\n')) ? Buffer.from('\r\n') : Buffer.from('\n')
+  const starts: number[] = [0]
+  for (let index = 0; index < bytes.length; index += 1) {
+    if (bytes[index] === 0x0a) starts.push(index + 1)
+  }
+  const piece = Buffer.from(
+    eol[0] === 0x0d
+      ? edit.content.replace(/\r\n|\n/g, '\r\n')
+      : edit.content.replace(/\r\n/g, '\n'),
+    'latin1'
+  )
+  if (edit.insertAfter !== undefined) {
+    if (edit.insertAfter > starts.length) {
+      throw new Error(`insertAfter 超出：文件共 ${starts.length} 行`)
+    }
+    const at =
+      edit.insertAfter === 0
+        ? 0
+        : edit.insertAfter < starts.length
+          ? (starts[edit.insertAfter] ?? bytes.length)
+          : bytes.length
+    if (edit.content.trim() === '') throw new Error('要插入的 content 不能为空')
+    const lead = at > 0 && bytes[at - 1] !== 0x0a ? eol : Buffer.alloc(0)
+    const where = edit.insertAfter === 0 ? '文件开头' : `第 ${edit.insertAfter} 行后`
+    return {
+      bytes: Buffer.concat([bytes.subarray(0, at), lead, piece, eol, bytes.subarray(at)]),
+      what: `${where}插入`
+    }
+  }
+  const startLine = edit.start ?? 1
+  const endLine = edit.end ?? startLine
+  if (startLine > starts.length) throw new Error(`startLine 超出：文件共 ${starts.length} 行`)
+  if (endLine > starts.length) throw new Error(`endLine 超出：文件共 ${starts.length} 行`)
+  const begin = starts[startLine - 1] ?? 0
+  const finish = endLine < starts.length ? (starts[endLine] ?? bytes.length) : bytes.length
+  const keepsBreak = finish > 0 && bytes[finish - 1] === 0x0a
+  const replacement =
+    piece.length === 0 ? Buffer.alloc(0) : keepsBreak ? Buffer.concat([piece, eol]) : piece
+  const where = startLine === endLine ? `第 ${startLine} 行` : `第 ${startLine}–${endLine} 行`
+  return {
+    bytes: Buffer.concat([bytes.subarray(0, begin), replacement, bytes.subarray(finish)]),
+    what: `${where} → ${piece.length === 0 ? '删除' : `${edit.content.split(/\r?\n/).length} 行`}`
+  }
+}
+
+/**
+ * Replace ASCII text inside a buffer, counting only whole characters.
+ *
+ * The walk steps over characters, so a needle can only match where a character
+ * starts. That matters: a GBK trail byte may itself be an ASCII letter, and a
+ * plain `Buffer.indexOf` would happily replace half of a Chinese character.
+ * @param bytes - the buffer to change.
+ * @param old - ASCII text to find.
+ * @param replacement - ASCII text to put there.
+ * @param all - replace every occurrence instead of the first.
+ * @returns the new buffer and how many places changed.
+ */
+export function replaceAsciiBytes(
+  bytes: Buffer,
+  old: string,
+  replacement: string,
+  all: boolean
+): { bytes: Buffer; count: number } {
+  const needle = Buffer.from(old, 'latin1')
+  const put = Buffer.from(replacement, 'latin1')
+  const pieces: Buffer[] = []
+  let position = 0
+  let count = 0
+  while (position < bytes.length) {
+    const lead = bytes[position] ?? 0
+    if (lead < 0x80 && (all || count === 0) && matchesBytes(bytes, position, needle)) {
+      pieces.push(put)
+      count += 1
+      position += needle.length
+      continue
+    }
+    // A lead byte is followed by its trail byte, which is never a character of
+    // its own; a lone trail at the end of the file is copied as it is.
+    const length = lead < 0x80 ? 1 : 2
+    pieces.push(bytes.subarray(position, Math.min(position + length, bytes.length)))
+    position += length
+  }
+  return { bytes: Buffer.concat(pieces), count }
+}
+
+/** Whether `needle` sits at `at`, compared byte for byte. */
+function matchesBytes(bytes: Buffer, at: number, needle: Buffer): boolean {
+  if (at + needle.length > bytes.length) return false
+  for (let offset = 0; offset < needle.length; offset += 1) {
+    if (bytes[at + offset] !== needle[offset]) return false
+  }
+  return true
+}
+
+/**
+ * Refuse a file that must not be changed at byte level.
+ *
+ * A UTF-16 file is text and `read` shows it, but its bytes interleave NULs with
+ * characters, so an ASCII replacement would miss and a byte rewrite would destroy
+ * it; saying "convert it first" is the only honest answer. Anything else with a
+ * NUL byte is binary — the same rule `read` applies.
+ * @param bytes - the file as it is on disk.
+ * @param requested - the path as the model wrote it, for the message.
+ */
+function assertEditableBytes(bytes: Buffer, requested: string): void {
+  const utf16 =
+    bytes.length >= 2 &&
+    ((bytes[0] === 0xff && bytes[1] === 0xfe) || (bytes[0] === 0xfe && bytes[1] === 0xff))
+  if (utf16) {
+    throw new Error(`文件是 UTF-16 编码，edit 只处理 UTF-8 与非 UTF-8 的 ASCII 原文；先转成 UTF-8：${requested}`)
+  }
+  if (bytes.includes(0)) {
+    throw new Error(
+      `看起来是二进制文件（或是没有 BOM 的 UTF-16），不按文本处理：${requested}；要正常改它先转成 UTF-8（例如用 iconv 或 PowerShell 的 Set-Content）`
+    )
+  }
+}
+
 /** One file a batch replace would change. */
 interface ReplaceChange {
   /** Path as the model sees it: relative, or absolute in a wider workspace. */
@@ -380,28 +818,45 @@ interface ReplacePlan {
 async function planReplace(
   workDir: string,
   scopeRoot: ToolScope,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  skip: readonly string[] = []
 ): Promise<ReplacePlan> {
   const pattern = textArg(args, 'pattern')
+  if (args.path !== undefined && typeof args.path !== 'string') {
+    throw new Error('参数 path 不是字符串')
+  }
   const old = textArg(args, 'old')
   const replacementText = textArg(args, 'new')
   if (old === '') throw new Error('old 不能为空')
   const replaceAll = args.replaceAll === true
 
   const matcher = wildcard(pattern)
-  const base = scopeRoot === null ? workDir : path.resolve(scopeRoot)
-  const absolute = base !== path.resolve(workDir)
-  const own = await walk(base)
-  const matched = own.files.filter((file) => matcher.test(file))
-  const truncated = own.truncated || matched.length > MAX_RESULTS
+  const places = await searchRoots(workDir, scopeRoot, args.path ?? '', [])
   const changes: ReplaceChange[] = []
   const skipped: ReplaceSkip[] = []
   let notFound = 0
+  let truncated = false
+  let matchedTotal = 0
 
-  for (const file of matched.slice(0, MAX_RESULTS)) {
-    const target = path.join(base, file)
-    const label = absolute ? absolutePath(base, file) : file
-    const info = await fs.stat(target).catch(() => null)
+  for (const place of places) {
+    const own = await walk(place.root, {
+      skip: isTopPlace(place, workDir, scopeRoot) ? skip : []
+    })
+    truncated = truncated || own.truncated
+    const matched = own.files.filter((file) => {
+      const relative = place.prefix === '' ? file : `${place.prefix}/${file}`
+      return matcher.test(relative)
+    })
+    matchedTotal += matched.length
+    for (const file of matched) {
+      if (changes.length + skipped.length >= MAX_RESULTS) {
+        truncated = true
+        break
+      }
+      const relative = place.prefix === '' ? file : `${place.prefix}/${file}`
+      const target = path.join(place.root, file)
+      const label = labelOf(place, relative)
+      const info = await fs.stat(target).catch(() => null)
     if (!info || !info.isFile()) {
       skipped.push({ label, reason: '不是文件' })
       continue
@@ -415,7 +870,7 @@ async function planReplace(
     try {
       text = new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(target))
     } catch {
-      skipped.push({ label, reason: '不是 UTF-8 / 二进制' })
+      skipped.push({ label, reason: '不是 UTF-8（批量替换只处理 UTF-8；这一份可用 edit 按 ASCII 原文改）' })
       continue
     }
     if (text.includes('\u0000')) {
@@ -447,8 +902,18 @@ async function planReplace(
       continue
     }
     changes.push({ label, target, after, count })
+    }
   }
-  return { pattern, old, new: replacementText, replaceAll, changes, skipped, notFound, truncated }
+  return {
+    pattern,
+    old,
+    new: replacementText,
+    replaceAll,
+    changes,
+    skipped,
+    notFound,
+    truncated: truncated || matchedTotal > MAX_RESULTS
+  }
 }
 
 /** Write a file in one step, so a failed write leaves the old one whole. */
@@ -480,11 +945,20 @@ const REPLACE_LIST = 30
 export async function replaceFiles(
   workDir: string,
   scopeRoot: ToolScope,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  skip: readonly string[] = []
 ): Promise<string> {
-  const plan = await planReplace(workDir, scopeRoot, args)
+  if (args.dryRun !== undefined && typeof args.dryRun !== 'boolean') {
+    throw new Error('参数 dryRun 不是布尔值')
+  }
+  const plan = await planReplace(workDir, scopeRoot, args, skip)
   if (plan.changes.length === 0 && plan.skipped.length === 0 && plan.notFound === 0) {
     return `没有匹配 ${plan.pattern} 的文件`
+  }
+  // A preview answers with the same plan the card shows, and writes nothing: the
+  // model can check its range before asking for the change.
+  if (args.dryRun === true) {
+    return `（预览，未写盘）\n${replacePlanText(plan)}`
   }
   const changed: ReplaceChange[] = []
   const failures: ReplaceSkip[] = []
@@ -498,6 +972,7 @@ export async function replaceFiles(
     }
   }
   const skipped = plan.skipped.concat(failures)
+  if (changed.length > 0) await invalidateIndex(indexRoot(workDir, scopeRoot))
   const total = changed.reduce((sum, change) => sum + change.count, 0)
   const lines: string[] = []
   if (changed.length === 0) {
@@ -530,21 +1005,14 @@ export async function replaceFiles(
 }
 
 /**
- * The confirmation card for a batch replace: which files, how many places and
- * what is being skipped. No undo pair is kept: one card cannot cover many files.
+ * What a batch replace would do, as text.
+ *
+ * Shared by the confirmation card, the `dryRun` answer and the result, so the
+ * model reads the same words the person sees.
+ * @param plan - what was worked out without writing anything.
+ * @returns the plan, one line per file.
  */
-async function previewReplace(
-  workDir: string,
-  scopeRoot: ToolScope,
-  args: Record<string, unknown>
-): Promise<ToolPreview | null> {
-  let plan: ReplacePlan
-  try {
-    plan = await planReplace(workDir, scopeRoot, args)
-  } catch {
-    return null
-  }
-  if (plan.changes.length === 0) return null
+function replacePlanText(plan: ReplacePlan): string {
   const total = plan.changes.reduce((sum, change) => sum + change.count, 0)
   const lines = [
     `批量替换 ${plan.pattern}${plan.replaceAll ? '（替换所有出现）' : '（每个文件必须唯一）'}`,
@@ -573,7 +1041,27 @@ async function previewReplace(
   if (plan.truncated) {
     lines.push(`…（只处理了前 ${MAX_RESULTS} 个匹配文件）`)
   }
-  let diff = lines.join('\n')
+  return lines.join('\n')
+}
+
+/**
+ * The confirmation card for a batch replace: which files, how many places and
+ * what is being skipped. No undo pair is kept: one card cannot cover many files.
+ */
+async function previewReplace(
+  workDir: string,
+  scopeRoot: ToolScope,
+  args: Record<string, unknown>,
+  skip: readonly string[] = []
+): Promise<ToolPreview | null> {
+  let plan: ReplacePlan
+  try {
+    plan = await planReplace(workDir, scopeRoot, args, skip)
+  } catch {
+    return null
+  }
+  if (plan.changes.length === 0) return null
+  let diff = replacePlanText(plan)
   if (diff.length > DIFF_MAX_CHARS) {
     diff = `${diff.slice(0, safeEnd(diff, DIFF_MAX_CHARS))}\n…（已截断）`
   }
@@ -588,7 +1076,6 @@ export async function editFile(
 ): Promise<string> {
   const pathArg = textArg(args, 'path')
   const target = await resolveScoped(workDir, scopeRoot, pathArg)
-  const pairs = editPairs(args)
   const info = await fs.stat(target)
   if (info.size > MAX_EDIT_BYTES) {
     const limit = MAX_EDIT_BYTES / (1024 * 1024)
@@ -596,21 +1083,35 @@ export async function editFile(
       `文件太大（${info.size} 字节，编辑上限 ${limit} MB）；请用 shell 或分段处理：${pathArg}`
     )
   }
-  // Rewriting is only safe when the bytes were UTF-8 to begin with: `applyEdits`
+  // Rewriting is only safe when the bytes were UTF-8 to begin with: the edit
   // would otherwise write the file back in a different encoding, or the model's
-  // `old` text would never match what is on disk.
+  // `old` text would never match what is on disk. A GBK file still accepts an
+  // ASCII-only change, applied to its bytes without decoding anything.
   const bytes = await fs.readFile(target)
-  let text: string
+  let text: string | null = null
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
   } catch {
-    throw new Error(`文件不是 UTF-8，edit 不改写它（先转码或改用 write）：${pathArg}`)
+    text = null
+  }
+  const shown = path.relative(workDir, target) || target
+  if (text === null) {
+    // Not UTF-8. Before treating it as GBK text, rule out the two things that
+    // are not text in that sense: a UTF-16 file (which `read` shows fine) and a
+    // binary file. Editing either at byte level would corrupt it.
+    assertEditableBytes(bytes, pathArg)
+    const outcome = applyByteEdit(bytes, args)
+    await fs.writeFile(target, outcome.bytes)
+    await invalidateIndex(indexRoot(workDir, scopeRoot))
+    return outcome.what === ''
+      ? `已修改 ${shown}（原文非 UTF-8，按 ASCII 替换）`
+      : `已修改 ${shown}（原文非 UTF-8，${outcome.what}）`
   }
   assertText(text, pathArg)
-  const after = applyEdits(text, pairs)
-  await fs.writeFile(target, scriptText(target, after), 'utf8')
-  const shown = path.relative(workDir, target) || target
-  return pairs.length === 1 ? `已修改 ${shown}` : `已修改 ${shown}（${pairs.length} 处）`
+  const outcome = applyEditCall(text, args)
+  await fs.writeFile(target, scriptText(target, outcome.after), 'utf8')
+  await invalidateIndex(indexRoot(workDir, scopeRoot))
+  return outcome.what === '' ? `已修改 ${shown}` : `已修改 ${shown}（${outcome.what}）`
 }
 
 /**
@@ -670,10 +1171,87 @@ export async function moveFile(
     await fs.copyFile(from, to)
     await fs.unlink(from)
   }
+  await invalidateIndex(indexRoot(workDir, scopeRoot))
   return `已移动 ${fromArg} → ${toArg}`
 }
 
-/** `delete`: remove one file; folders are refused. */
+/**
+ * `copy`: duplicate one file, byte for byte.
+ *
+ * `write` only carries text, so until this existed there was no way to copy an
+ * icon, a font or any other asset without going through `shell`. The source is
+ * read and written by the OS, so binary content survives untouched.
+ * @param workDir - relative paths resolve from here.
+ * @param scopeRoot - writable root; null means the whole computer.
+ * @param args - `from`, `to`, and optional `overwrite`.
+ * @returns what was copied and how large it was.
+ */
+export async function copyFile(
+  workDir: string,
+  scopeRoot: ToolScope,
+  args: Record<string, unknown>
+): Promise<string> {
+  const fromArg = textArg(args, 'from')
+  const toArg = textArg(args, 'to')
+  const from = await resolveScoped(workDir, scopeRoot, fromArg)
+  const to = await resolveScoped(workDir, scopeRoot, toArg)
+  const info = await fs.stat(from).catch(() => null)
+  if (!info?.isFile()) throw new Error(`只能复制文件：${fromArg}`)
+  const existing = await fs.lstat(to).catch(() => null)
+  if (existing) {
+    // Overwriting is a separate decision: an accidental `to` that points at an
+    // existing file must not silently replace it.
+    if (args.overwrite !== true) {
+      throw new Error(`目标已存在：${toArg}（确实要覆盖请传 overwrite: true）`)
+    }
+    if (!existing.isFile()) throw new Error(`目标不是文件，不能覆盖：${toArg}`)
+  }
+  await fs.mkdir(path.dirname(to), { recursive: true })
+  await fs.copyFile(from, to)
+  await invalidateIndex(indexRoot(workDir, scopeRoot))
+  return `已复制 ${fromArg} → ${toArg}（${sizeText(info.size)}）`
+}
+
+/**
+ * `mkdir`: create one folder, parents included.
+ *
+ * `write` creates the folders a file needs, but an empty folder (a placeholder
+ * for build output, say) had no way to exist before this.
+ * @param workDir - relative paths resolve from here.
+ * @param scopeRoot - writable root; null means the whole computer.
+ * @param args - `path`.
+ * @returns whether it was created or already there.
+ */
+export async function makeDir(
+  workDir: string,
+  scopeRoot: ToolScope,
+  args: Record<string, unknown>
+): Promise<string> {
+  const pathArg = textArg(args, 'path')
+  if (pathArg.trim() === '') throw new Error('path 不能为空')
+  const target = await resolveScoped(workDir, scopeRoot, pathArg)
+  const info = await fs.stat(target).catch(() => null)
+  if (info?.isDirectory()) return `目录已存在：${pathArg}`
+  if (info) throw new Error(`这里已经有一个文件，不能建目录：${pathArg}`)
+  await fs.mkdir(target, { recursive: true })
+  const shown = path.relative(workDir, target) || target
+  return `已创建目录 ${shown}`
+}
+
+/** A byte count as something a person reads at a glance. */
+function sizeText(bytes: number): string {
+  if (bytes < 1024) return `${bytes} 字节`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+/**
+ * `delete`: remove one file, or a whole folder when `recursive` is set.
+ *
+ * A recursive delete is the one action that can lose a lot of work in a click, so
+ * it stays opt-in: without the flag a folder is refused with a message that names
+ * the files it holds, and the approval card says how many there are.
+ */
 export async function deleteFile(
   workDir: string,
   scopeRoot: ToolScope,
@@ -681,12 +1259,41 @@ export async function deleteFile(
 ): Promise<string> {
   const targetArg = textArg(args, 'path')
   const target = await resolveScoped(workDir, scopeRoot, targetArg)
+  if (args.recursive !== undefined && typeof args.recursive !== 'boolean') {
+    throw new Error('参数 recursive 不是布尔值')
+  }
   const info = await fs.lstat(target)
+  if (info.isDirectory()) {
+    if (args.recursive !== true) {
+      throw new Error(`这是一个文件夹，不能直接删除：${targetArg}（确实要连内容一起删请传 recursive: true）`)
+    }
+    const count = await countFiles(target).catch(() => 0)
+    await fs.rm(target, { recursive: true, force: false, maxRetries: 2 })
+    await invalidateIndex(indexRoot(workDir, scopeRoot))
+    return `已删除目录 ${targetArg}（${count} 个文件）`
+  }
   if (!info.isFile() && !info.isSymbolicLink()) {
-    throw new Error(`只能删除文件；文件夹请手动处理：${targetArg}`)
+    throw new Error(`只能删除文件或文件夹：${targetArg}`)
   }
   await fs.unlink(target)
+  await invalidateIndex(indexRoot(workDir, scopeRoot))
   return `已删除 ${targetArg}`
+}
+
+/** How many files a folder holds, for the approval card and the result. */
+async function countFiles(dir: string): Promise<number> {
+  let total = 0
+  const pending = [dir]
+  while (pending.length > 0 && total < MAX_RESULTS * 50) {
+    const current = pending.pop()
+    if (current === undefined) break
+    const entries = await fs.readdir(current, { withFileTypes: true }).catch(() => [])
+    for (const entry of entries) {
+      if (entry.isDirectory()) pending.push(path.join(current, entry.name))
+      else total += 1
+    }
+  }
+  return total
 }
 
 /** `list`: direct children of one folder, directories first. */
@@ -769,7 +1376,8 @@ export async function treeDir(
   workDir: string,
   scopeRoot: ToolScope,
   args: Record<string, unknown>,
-  readOnlyRoots: string[]
+  readOnlyRoots: string[],
+  skip: readonly string[] = []
 ): Promise<string> {
   const requested = typeof args.path === 'string' && args.path.trim() ? args.path : '.'
   // In workspace scope `.` means the workspace, like `glob` / `grep` do: the
@@ -787,10 +1395,19 @@ export async function treeDir(
     Math.max(intArg(args, 'limit') ?? MAX_TREE_ENTRIES, 1),
     MAX_TREE_ENTRIES
   )
-  const rules = await ignoreRulesFor(base)
+  const skipped = new Set(skip.map((name) => name.toLowerCase()))
+  const rootLayers = await baseIgnoreLayers(base)
   const lines: string[] = []
   let truncated = false
-  const visit = async (relative: string, level: number): Promise<void> => {
+  /**
+   * One folder of the map.
+   * @param relative - folder relative to `base`, `.` for the root.
+   * @param level - indentation level.
+   * @param layers - ignore rules that apply inside this folder.
+   */
+  const visit = async (relative: string, level: number, layers: IgnoreLayer[]): Promise<void> => {
+    const own =
+      relative === '.' ? layers : await deeperIgnoreLayers(base, relative, layers)
     let entries: Array<{
       name: string
       isDirectory: () => boolean
@@ -812,17 +1429,20 @@ export async function treeDir(
         return
       }
       const child = relative === '.' ? entry.name : `${relative}/${entry.name}`
-      if (isIgnored(rules, child)) continue
+      // A sibling conversation folder is only skipped where the map starts: the
+      // same name deeper down belongs to the project being mapped.
+      if (relative === '.' && skipped.has(entry.name.toLowerCase())) continue
       if (entry.isDirectory()) {
-        if (SKIPPED.has(entry.name)) continue
+        if (skippedDir(entry.name) || isIgnoredBy(own, child)) continue
         lines.push(`${'  '.repeat(level)}${entry.name}/`)
-        if (level + 1 < depth) await visit(child, level + 1)
+        if (level + 1 < depth) await visit(child, level + 1, own)
       } else if (entry.isFile()) {
+        if (isIgnoredBy(own, child)) continue
         lines.push(`${'  '.repeat(level)}${entry.name}`)
       }
     }
   }
-  await visit('.', 0)
+  await visit('.', 0, rootLayers)
   if (lines.length === 0) return '文件夹是空的'
   const shown =
     path.resolve(base) === path.resolve(workDir) ? '.' : base.replace(/\\/g, '/')

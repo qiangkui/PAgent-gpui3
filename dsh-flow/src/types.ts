@@ -8,7 +8,7 @@
  */
 
 /** Which executor owns a step. */
-export type StepKind = 'run' | 'set' | 'map' | 'ai'
+export type StepKind = 'run' | 'set' | 'map' | 'ai' | 'use'
 
 /** Settlement state of one step. */
 export type StepStatus = 'ok' | 'failed' | 'skipped'
@@ -44,6 +44,20 @@ export interface MapSpec {
 /** Where an `ai` step gets its answer. */
 export type AiBackendName = 'http' | 'cli'
 
+/**
+ * A call into another manifest.
+ *
+ * The child runs with its own declared inputs and its own folder, so its steps,
+ * fixtures and recorded decisions stay with it. Its final `vars` come back as
+ * this step's result, which is what makes `steps.<id>.json.<name>` readable.
+ */
+export interface UseSpec {
+  /** Path to the other manifest, resolved against this manifest's folder. */
+  manifest: string
+  /** Inputs for it; values may be templates and keep their type. */
+  inputs?: Record<string, unknown>
+}
+
 /** The explicit model call of an `ai` step. */
 export interface AiSpec {
   /** The question, after template rendering. */
@@ -58,6 +72,24 @@ export interface AiSpec {
   temperature?: number
   /** Upper bound on generated tokens. */
   maxTokens?: number
+  /**
+   * Images the question shows the model, as paths resolved against the
+   * manifest's folder.
+   *
+   * The `http` backend sends them as `image_url` parts, which is what vision
+   * needs (a captcha, a chart, a screenshot). The `cli` backend receives their
+   * paths instead of the bytes, so a script can open them itself.
+   */
+  images?: string[]
+  /**
+   * False to ask the model every time and never replay a recorded answer.
+   *
+   * For a judgment whose input changes on every run — reading a fresh captcha,
+   * naming a file it just downloaded — a recorded answer is not a shortcut, it
+   * is yesterday's answer. Such a step cannot run under `--level manual`
+   * either, because there is nothing to replay.
+   */
+  cache?: boolean
   /** `http` (default) or an external `cli` program. */
   backend?: AiBackendName
   /** Program plus arguments for `backend: cli`. */
@@ -68,6 +100,54 @@ export interface AiSpec {
 
 /** How much of a run may call a model. */
 export type RunLevel = 'manual' | 'assist' | 'draft'
+
+/** One file or picture a step produced for the person to look at. */
+export interface StepArtifact {
+  /** `file` for anything to open, `image` for a picture to show inline. */
+  kind: 'file' | 'image'
+  /** Name as the card shows it; defaults to the file's own name. */
+  name: string
+  /** Absolute path. */
+  path: string
+  /** Size in bytes. */
+  bytes: number
+  /** MIME type, for `kind: image`. */
+  mime?: string
+}
+
+/**
+ * The vocabulary a failure is reported in.
+ *
+ * Chosen so the window can say "what kind of thing went wrong" without reading
+ * prose: a missing credential, a selector that is not on the page, a regex that
+ * did not match, a picture the model could not read, an assertion that failed.
+ */
+export type StepErrorKind =
+  | 'credential'
+  | 'config'
+  | 'selector-miss'
+  | 'regex-miss'
+  | 'image-unreadable'
+  | 'assert'
+  | 'timeout'
+  | 'model'
+  | 'engine'
+
+/** Why a step failed, as the step itself described it. */
+export interface StepErrorInfo {
+  /** Which kind of failure this is. */
+  kind: StepErrorKind
+  /** One sentence: what happened. */
+  message: string
+  /** One sentence: what to do about it. */
+  hint?: string
+  /** Where it happened, for example `maers_site.py:export`. */
+  where?: string
+  /** What was expected, when the failure is a comparison. */
+  expected?: string
+  /** What was actually there, when the failure is a comparison. */
+  gotten?: string
+}
 
 /** One unit of work. */
 export interface Step {
@@ -102,6 +182,8 @@ export interface Step {
   map?: MapSpec
   /** Explicit model call, normalized to its object form. */
   ai?: AiSpec
+  /** Call into another manifest, normalized to its object form. */
+  use?: UseSpec
 }
 
 /** Defaults applied to every `run` step. */
@@ -160,6 +242,14 @@ export interface InputSpec {
   required?: boolean
   /** Value used when the caller supplies none. */
   default?: unknown
+  /**
+   * A value the window must not put on a command line, in a log or in a trace.
+   *
+   * Secret inputs are supplied through `--secrets-stdin` (the window sends them
+   * on the child's stdin with the endpoint credentials) or `DSH_SECRET_<NAME>`;
+   * the engine replaces every occurrence in what it records with `***`.
+   */
+  secret?: boolean
 }
 
 /** One iteration of a `map` step. */
@@ -208,6 +298,17 @@ export interface StepResult {
   truncated?: boolean
   /** Rendered command line, kept for dry runs and reports. */
   command?: string
+  /**
+   * One line saying what this step produced, for the card.
+   *
+   * A step writes it in its own JSON (`{"summary": "共 51 条"}`); `ai` steps get
+   * it from the answer. Absent when the step said nothing short enough.
+   */
+  summary?: string
+  /** Files and pictures the step handed over. */
+  artifacts?: StepArtifact[]
+  /** Structured failure, when the step reported one. */
+  errorInfo?: StepErrorInfo
 }
 
 /** Names visible to expressions and templates. */
@@ -253,4 +354,10 @@ export interface TraceRecord {
   command?: string
   /** Failure or skip reason. */
   detail?: string
+  /** One-line result of the step, for the window's card. */
+  summary?: string
+  /** Files and pictures the step produced. */
+  artifacts?: StepArtifact[]
+  /** Structured failure, for the window's error card. */
+  error?: StepErrorInfo
 }

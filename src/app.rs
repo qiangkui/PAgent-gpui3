@@ -30,7 +30,8 @@ use gpui::{
 use crate::ai::{AiEvent, AiRequest, Speaker, Turn};
 use crate::config::{AiSettings, Connection, PRESETS, Reasoning, model_versions, offered_models};
 use crate::engine::{
-    self, RunCredentials, RunMessage, RunOutcome, RunSession, StepView, WorkflowEntry,
+    self, ArtifactView, ErrorView, RunCredentials, RunMessage, RunOutcome, RunSession, StepEvent,
+    StepView, WorkflowEntry,
 };
 use crate::manifest::{InputSpec, ManifestSpec};
 use crate::markdown;
@@ -53,12 +54,20 @@ const FIELD_PADDING: f32 = 12.;
 
 /// Lines kept per run before the oldest are dropped.
 const MAX_LOG_LINES: usize = 4000;
-/// Lines drawn per frame; older ones stay in the record.
-const VISIBLE_LOG_LINES: usize = 400;
-/// Runs kept in the history list.
-const MAX_HISTORY: usize = 12;
-/// Stderr/stdout lines shown by an expanded step.
-const DETAIL_LINES: usize = 40;
+
+/// Width of one input card on the workflow page.
+pub(crate) const INPUT_CARD_WIDTH: f32 = 240.;
+/// Space between input cards in a row (`gap_3`).
+pub(crate) const INPUT_CARD_GAP: f32 = 12.;
+/// Share of the workflow page's content width taken by the run transcript;
+/// the rest belongs to the board of step cards.
+pub(crate) const FLOW_TRANSCRIPT_SHARE: f32 = 0.56;
+/// Padding the transcript adds on both sides (`px_4`).
+pub(crate) const FLOW_TRANSCRIPT_PAD: f32 = 32.;
+/// Runs kept in the history list. The engine keeps 30 snapshots per workflow;
+/// loading all of them here makes “history” show everything that still exists
+/// instead of an unexplained first page of six.
+const MAX_HISTORY: usize = 30;
 /// How many earlier turns of a conversation are sent back with a question.
 const MAX_TURNS: usize = 40;
 /// Rough token budget for the replayed turns, so a long conversation cannot
@@ -107,7 +116,7 @@ const SIDEBAR_MAX: f32 = 420.;
 const SIDEBAR_DEFAULT: f32 = 264.;
 /// Width of the drag handle between the sidebar and the pane.
 const SPLITTER_WIDTH: f32 = 6.;
-/// Radius of the right-hand panel's top-left corner.
+/// Radius of the workflow page's left edge and the board's top-left corner.
 const PANEL_RADIUS: f32 = 14.;
 /// Room left below the transcript for the floating composer, in its one-line
 /// form. The card and the status capsule under it together take this much, so
@@ -130,9 +139,36 @@ const SYSTEM_PROMPT: &str = "你是 dsh-flow 桌面应用里的助手。回答�
 需要操作步骤时给出可直接执行的命令，不要编造仓库里没有的文件。";
 
 /// Tools the assistant may call when tools are on.
-const ALL_TOOLS: [&str; 18] = [
-    "read", "write", "edit", "replace", "move", "delete", "list", "glob", "tree", "grep",
-    "symbols", "git", "shell", "task", "python", "node", "http", "mcp",
+const ALL_TOOLS: [&str; 29] = [
+    "read",
+    "write",
+    "edit",
+    "replace",
+    "move",
+    "copy",
+    "mkdir",
+    "delete",
+    "list",
+    "glob",
+    "tree",
+    "grep",
+    "symbols",
+    "git",
+    "git_write",
+    "shell",
+    "task",
+    "wait_for",
+    "run_tests",
+    "diagnostics",
+    "python",
+    "node",
+    "http",
+    "env",
+    "read_image",
+    "screenshot",
+    "browser",
+    "show",
+    "mcp",
 ];
 
 /// The engine tools a request may use after its mode removed MCP.
@@ -147,10 +183,96 @@ pub(crate) fn mode_tools(selection: &crate::config::ModeSelection) -> Vec<&'stat
         .collect()
 }
 
+/// The engine tools a request may use, minus the image tools a text-only
+/// endpoint would reject.
+///
+/// `read_image` and `screenshot` both end in an `image_url` part, and an endpoint
+/// without vision answers that with an error, so they are not offered at all —
+/// a tool the model cannot call is better than a call that fails the answer.
+pub(crate) fn mode_tools_for(
+    selection: &crate::config::ModeSelection,
+    vision: bool,
+) -> Vec<&'static str> {
+    mode_tools(selection)
+        .into_iter()
+        .filter(|name| vision || !matches!(*name, "read_image" | "screenshot"))
+        .collect()
+}
+
+/// The tool definitions a request will actually carry, taken from the last set
+/// the engine reported.
+///
+/// The engine reports its tool list once a run has started, so a request is
+/// recorded before that happens and has to borrow the previous run's list. That
+/// list can be wider than this request: an MCP server switched off, a plugin
+/// disabled, or a mode changed between two questions leaves its definitions in
+/// the cache. Keeping only what this request asks for is what the context panel
+/// and the ledger read, so the second question of a conversation does not claim
+/// the first one's tools.
+///
+/// @param cached - schemas from the previous run, as `(name, schema)`.
+/// @param tools - whether this request sends tools at all.
+/// @param allowed - built-in tool names this request allows.
+/// @param plugins - plugin ids this request loads.
+/// @param mcp_servers - MCP server ids this request opens.
+/// @param plugin_tools - plugin tools the previous run reported, `(id, tool)`.
+/// @param mcp_tools - MCP tools the previous run reported, `(id, tool)`.
+/// @returns the definitions this request sends, in the cached order.
+pub(crate) fn request_schemas(
+    cached: &[(String, String)],
+    tools: bool,
+    allowed: &[&str],
+    plugins: &[String],
+    mcp_servers: &[String],
+    plugin_tools: &[(String, String)],
+    mcp_tools: &[(String, String)],
+) -> Vec<(String, String)> {
+    if !tools {
+        return Vec::new();
+    }
+    let mut keep: std::collections::HashSet<&str> = allowed.iter().copied().collect();
+    for (plugin, tool) in plugin_tools {
+        if plugins.iter().any(|id| id == plugin) {
+            keep.insert(tool.as_str());
+        }
+    }
+    for (server, tool) in mcp_tools {
+        if mcp_servers.iter().any(|id| id == server) {
+            keep.insert(tool.as_str());
+        }
+    }
+    cached
+        .iter()
+        .filter(|(name, _)| keep.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The plugin prompts a request will actually carry, taken from the last set the
+/// engine reported.
+///
+/// The same staleness the tool schemas have: a plugin switched off between two
+/// questions must not keep injecting its prompt text into the second one's
+/// record. Built by filtering, not by trusting the cached list.
+///
+/// @param cached - prompts from the previous run, as `(plugin id, text)`.
+/// @param plugins - plugin ids this request loads.
+/// @returns the prompts this request sends, in the cached order.
+pub(crate) fn request_prompts(
+    cached: &[(String, String)],
+    plugins: &[String],
+) -> Vec<(String, String)> {
+    cached
+        .iter()
+        .filter(|(id, _)| plugins.iter().any(|enabled| enabled == id))
+        .cloned()
+        .collect()
+}
+
 /// Added whenever the assistant answers: how to work, not only what it can use.
 const WORK_PROMPT: &str = "工作方式：动手前先看清结构（list / tree / glob / grep），需要时先写一个简短计划再执行；\
 改完代码要跑相关测试或构建，并把真实结果写进回答；没有运行过的验证不要声称通过。\
-多文件里同一段文本的批量替换用 replace；同一文件多处不同改动用 edit 的批量 edits；需求不明确时先问一句再改。\
+多文件里同一段文本的批量替换用 replace；同一文件多处不同改动用 edit 的批量 edits；已经知道行号、或要整段替换 / 插入时用 startLine / endLine / insertAfter；需求不明确时先问一句再改。\
 不要读取或输出密钥类文件（.env、*.pem、凭据文件）；确实需要时只说明用途。";
 
 /// Added when the assistant may call tools: the rules a schema cannot carry.
@@ -159,16 +281,24 @@ const WORK_PROMPT: &str = "工作方式：动手前先看清结构（list / tree
 /// of every request; repeating them here would send the same text twice on
 /// every round, so this only states permissions and runtime behaviour.
 const TOOL_PROMPT: &str = "各工具的作用与参数见随请求附带的工具定义（name / description / parameters），这里只补充权限与运行时规则。\
-当前目录是这个对话自己的工作目录：默认权限下相对路径从当前目录开始，可以用 .. 但必须留在工作区内，工作区外的绝对路径会被拒绝；开启完全权限后可以操作电脑上的任意路径。\
-glob 与 grep 在默认权限下以整个工作区为根（命中以绝对路径给出），完全权限下只扫当前目录；不带 path 的 tree 在默认权限下也以工作区为根，不是这个对话自己的目录。\
+当前目录就是这个对话的可写范围：默认权限下相对路径从它开始，`..` 也不能离开它，外面的绝对路径会被拒绝；开启完全权限后可以操作电脑上的任意路径。\
+glob / grep / tree / symbols 默认就以这个对话目录为根（命中是相对路径，用 path 可只搜其中某个子目录）；它们还会搜索引擎和工作流参考目录（只读，命中以绝对路径给出），这些目录只能读、不能写入。\
 它们还会搜索引擎和工作流参考目录（只读，命中结果以绝对路径给出），这些目录只能读、不能写入。\
-write / edit / replace 在「工作区内修改」与「完全权限」下直接执行，在「仅可查看」下会先请用户确认；move / delete 与 shell / python / node 在前两档都先请用户确认，只有「完全权限」会直接执行。\
-shell 命令引用的路径必须落在工作区内（沙箱检查，完全权限不检查），cwd 也受同一套校验；需要常驻的进程（dev server 等）用 background=true，不要在前台等它超时。\
+write / edit / replace 在「工作区内修改」与「完全权限」下直接执行，在「仅可查看」下会先请用户确认；copy / mkdir / move / delete、shell / python / node / http、git_write、task（写 stdin / 关 stdin / 结束）、wait_for、run_tests 与 diagnostics 在前两档都先请用户确认，只有「完全权限」会直接执行。\
+env 只读、不需要确认，任务开始时先看它比逐个试命令省一轮；remember 写的是界面的长期记忆文件（不是工作区文件），已经记过的结论不要重复写。\
+跑测试优先用 run_tests：它把失败用例解析成清单，比 shell 的原始输出更好定位；后台任务需要继续输入时用 task action=input，别为了一句输入再起一个任务。\
+改完代码先用 diagnostics 看编译/类型问题（它把 cargo check 的 JSON 与 tsc 的输出解析成「文件:行:列」清单），再去跑测试；不要靠通读整段编译输出去找错误。\
+凭据与密钥文件（.env、*.pem、*.key、.ssh/、id_rsa 等）read / grep / read_image 会直接拒绝，这不是权限问题，别换个工具再试；需要某个值时请用户单独提供。\
+screenshot 默认只截前台窗口、长边缩到 1600px、存成 JPEG；要看整个桌面才用 region=all。上一轮看过的截图下一问会自动带上。screenshot 会在对话目录 .dsh-flow/shots 留一份副本，symbols 会把索引缓存在对话目录的 .dsh-flow/index.json；「仅可查看」下截图改存沙箱临时目录、索引只留在内存里。\
+shell 命令引用的路径必须落在当前对话目录内（沙箱检查，完全权限不检查），cwd 也受同一套校验；需要常驻的进程（dev server 等）用 background=true，不要在前台等它超时。\
 python 与 node 运行时如果目录里有 .venv 会优先用它，node_modules/.bin 与 .venv 的 bin 会加到 PATH 前面，输出只保留首尾。\
 后台任务虽然在这轮问答之后继续运行，但会随「停止」或关闭窗口一起结束，用完主动 task stop。\
 被拒绝时不要原样重试，也不要换个写法重试，先说明原因或提出更小的改动。\
 mcp 用来连接并调用 MCP 服务器：list 先看 mcpserver 目录里有什么，link 按 id 连接或直接给 command/url 现场连接并列出工具，call 调用某个服务器的工具，连接在本次提问内保持。\
-写入后不必再读回同一内容；不要读取或打印环境变量里的密钥。";
+浏览器用 browser：先 open 拿标题与正文，要操作先 snapshot 拿 [编号]（导航后编号会重新分配），点击 / 输入 / 执行脚本都会先确认；想看清界面用 screenshot，不要凭猜测描述页面。它读不到你自己浏览器的登录态；一个对话共用一个浏览器，页面与登录状态留到下一问，close 才重置。网页下载的文件落到对话目录的 .dsh-flow/downloads，结果里会给绝对路径，downloads 动作可再列一次。\
+结果文件用 show：做完事、生成了文件（报告、表格、图片、压缩包等）时，用 show 传 paths 把它们摆在对话里，用户点一下就能打开、也能定位到所在文件夹；只说「已完成」会让用户自己去工作区翻。网页下载到的文件要不要交给用户同样由你决定：该交付就用 show，不用就别打扰。\
+写入后不必再读回同一内容；不要读取或打印环境变量里的密钥。\n\
+固化工作流只走输入框 + 菜单的「固化为工作流」：用户直接打字要求固化时，提示他用该入口选一轮，不要自行开始；最终 flow.yml 写好后，在同一工作流文件夹创建空文件 .show，界面会热加载显示。";
 
 /// Sent when the reader asks the assistant to pick up a stopped answer.
 const CONTINUE_PROMPT: &str = "请从上一条回答停下的地方接着写，不要重复已经写过的内容。";
@@ -225,7 +355,7 @@ pub(crate) enum PickPurpose {
 pub(crate) enum View {
     /// Conversation with the assistant; the default.
     Chat,
-    /// One workflow: plan, run, log.
+    /// One workflow: left run transcript, right static source board.
     Flow,
     /// Integrations that are still planned.
     Plugins,
@@ -235,6 +365,15 @@ pub(crate) enum View {
     Skills,
     /// Usage over a chosen window: requests, tokens, models.
     Stats,
+}
+
+/// Which side of the run transcript is showing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowTab {
+    /// The run in flight, or the newest finished one.
+    Current,
+    /// Every saved run of this workflow, newest first.
+    History,
 }
 
 /// One combined tool permission preset, matching dsh's three levels.
@@ -294,7 +433,7 @@ impl ToolMode {
     pub(crate) fn hint(self) -> &'static str {
         match self {
             Self::ReadOnly => "读取直接可用；写入、移动、删除与命令都先询问",
-            Self::Workspace => "工作区内直接读写；移动 / 删除 / 命令先询问",
+            Self::Workspace => "对话目录内直接读写；移动 / 删除 / 命令先询问",
             Self::Full => "任意路径直接读写，命令与删除不再询问，请谨慎使用",
         }
     }
@@ -383,6 +522,15 @@ impl SettingsTab {
 /// The transcript shows it before it is saved, so it needs a slot no stored
 /// message can have.
 pub(crate) const DRAFT_MESSAGE: usize = usize::MAX;
+
+/// What the rename dialog is editing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RenameTarget {
+    /// A conversation's title.
+    Chat(usize),
+    /// A workflow card's display name, keyed by manifest name.
+    Workflow(String),
+}
 
 /// Who said one message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -592,6 +740,16 @@ pub(crate) struct ChatMessage {
     pub(crate) call: String,
     /// Path the approval card is about.
     pub(crate) path: String,
+    /// True when the approval card is about to send a credential. The card says
+    /// so, and such a call is never answered automatically.
+    pub(crate) secret: bool,
+    /// MIME type of the picture a tool row showed the model; empty otherwise.
+    pub(crate) image_mime: String,
+    /// File holding that picture, so the next question can show it again.
+    pub(crate) image_path: String,
+    /// Finished files the tool put in front of the reader, for `show`: the
+    /// transcript draws one card each, and a click opens the file itself.
+    pub(crate) files: Vec<crate::ai::ToolFile>,
     /// File contents before the change, for undo.
     pub(crate) before: String,
     /// File contents after the change, for the same reason.
@@ -634,6 +792,10 @@ impl ChatMessage {
             open: false,
             call: String::new(),
             path: String::new(),
+            image_mime: String::new(),
+            image_path: String::new(),
+            files: Vec::new(),
+            secret: false,
             before: String::new(),
             after: String::new(),
             existed: false,
@@ -782,6 +944,10 @@ pub(crate) struct Chat {
     pub(crate) details: std::collections::HashSet<(usize, usize)>,
     /// Checkbox items the reader ticked, as `(message, item)`.
     pub(crate) checks: std::collections::HashSet<(usize, usize)>,
+    /// Bumped by [`Self::touch`]; the save path writes only the conversations
+    /// whose revision changed, so a step in one chat does not re-serialize the
+    /// whole history.
+    pub(crate) revision: u64,
 }
 
 impl Chat {
@@ -813,6 +979,7 @@ impl Chat {
             allow_session: std::collections::HashSet::new(),
             details: std::collections::HashSet::new(),
             checks: std::collections::HashSet::new(),
+            revision: 0,
         };
         defaults.mode.apply(&mut chat);
         chat
@@ -829,6 +996,9 @@ impl Chat {
     /// Mark it as touched now, so the sidebar can sort it.
     pub(crate) fn touch(&mut self) {
         self.updated_ms = util::now_ms();
+        // The save path compares this with what it last wrote; the counter never
+        // wraps in practice, and a duplicate value only costs one extra write.
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 
@@ -882,6 +1052,27 @@ pub(crate) struct InputField {
     pub(crate) spec: InputSpec,
     /// The box holding its value.
     pub(crate) field: TextField,
+    /// The value this machine already holds for the input, when it was loaded
+    /// from the credential store or saved there; `None` when there is none.
+    pub(crate) stored: Option<String>,
+    /// Steps that read this input, in execution order, from the manifest.
+    pub(crate) uses: Vec<String>,
+    /// The step card this input belongs on, when a step reads it.
+    ///
+    /// The board puts the field on that card; an input no step reads lands in
+    /// the "运行前" card at the top instead of disappearing.
+    pub(crate) step: Option<String>,
+}
+
+impl InputField {
+    /// True when the box holds exactly the value the store keeps.
+    ///
+    /// Compared each frame instead of being set on every edit, so the badge
+    /// tells the truth: typing over a saved password means the box and the
+    /// store no longer hold the same thing.
+    pub(crate) fn saved(&self) -> bool {
+        !self.field.text.is_empty() && self.stored.as_deref() == Some(self.field.text.as_str())
+    }
 }
 
 /// A run in flight.
@@ -896,10 +1087,64 @@ pub(crate) struct ActiveRun {
     pub(crate) manifest_label: String,
     /// The manifest itself, for the step cards.
     pub(crate) spec: ManifestSpec,
-    /// The values it was started with, as `(name, value)`.
+    /// The values it was started with, as `(name, value)`; secrets are masked.
     pub(crate) inputs: Vec<(String, String)>,
+    /// Step states as the live event stream reports them.
+    pub(crate) steps: Vec<StepView>,
     /// Log lines so far.
     pub(crate) log: Vec<String>,
+}
+
+impl ActiveRun {
+    /// Fold one `--events` record into the live step rows.
+    ///
+    /// The summary that arrives at the end replaces all of this; meanwhile this
+    /// is what makes a card turn green or red while the run is still going.
+    /// @param event - one record from the engine's event stream.
+    pub(crate) fn apply(&mut self, event: &StepEvent) {
+        if event.kind == "run/start" {
+            self.steps.clear();
+            return;
+        }
+        if event.id.is_empty() || !event.kind.starts_with("step/") {
+            return;
+        }
+        let index = self.steps.iter().position(|view| view.id == event.id);
+        let mut view = match index {
+            Some(position) => self.steps[position].clone(),
+            None => StepView {
+                id: event.id.clone(),
+                kind: event.step_kind.clone(),
+                status: "running".to_string(),
+                duration_ms: 0,
+                detail: String::new(),
+                command: None,
+                stderr: None,
+                stdout: None,
+                text: None,
+                model: None,
+                cached: false,
+                summary: None,
+                artifacts: Vec::new(),
+                error: None,
+            },
+        };
+        if !event.status.is_empty() {
+            view.status = event.status.clone();
+        }
+        if event.kind == "step/end" {
+            view.duration_ms = event.duration_ms;
+            view.detail = event.detail.clone().unwrap_or_default();
+            view.command = event.command.clone();
+            view.summary = event.summary.clone();
+            view.artifacts = event.artifacts.clone();
+            view.error = event.error.clone();
+        }
+        match index {
+            Some(position) => self.steps[position] = view,
+            None => self.steps.push(view),
+        }
+    }
 }
 
 /// A finished run.
@@ -922,19 +1167,134 @@ pub(crate) struct RunRecord {
     pub(crate) cancelled: bool,
     /// When it finished.
     pub(crate) finished: Instant,
+    /// When it finished, in milliseconds since the Unix epoch; kept so the
+    /// record can be written to disk and put back in order after a restart.
+    pub(crate) finished_ms: u64,
 }
 
 impl RunRecord {
-    /// The status colour a card and a row use.
-    pub(crate) fn color(&self, palette: Palette) -> u32 {
-        if self.cancelled {
-            palette.skipped
-        } else if self.outcome.ok {
-            palette.ok
-        } else {
-            palette.failed
+    /// The whole record as it is written to disk.
+    ///
+    /// Everything the window knows is carried over: the steps keep their text,
+    /// stdout/stderr, artifacts and structured error, and the engine's log is
+    /// the same (already redacted) list the window showed.
+    pub(crate) fn to_stored(&self) -> crate::run_store::StoredRun {
+        crate::run_store::StoredRun {
+            workflow: self.workflow_name.clone(),
+            manifest: self.manifest_label.clone(),
+            run_id: self.outcome.run_id.clone(),
+            ok: self.outcome.ok,
+            cancelled: self.cancelled,
+            duration_ms: self.outcome.duration_ms,
+            finished_ms: self.finished_ms,
+            inputs: self.inputs.clone(),
+            steps: self.outcome.steps.clone(),
+            log: self.log.clone(),
+            error: self.outcome.error.clone(),
+            report: self.outcome.report.clone(),
+            exit_code: self.outcome.exit_code,
         }
     }
+
+    /// Put a saved snapshot back into the window.
+    ///
+    /// The discovered manifest is used when the workflow is still on disk, so
+    /// the board shows the same inputs it would for a new run; a workflow that
+    /// is gone still gets its transcript, from a spec rebuilt out of the
+    /// recorded steps.
+    pub(crate) fn from_stored(
+        stored: crate::run_store::StoredRun,
+        entry: Option<&WorkflowEntry>,
+    ) -> Self {
+        Self::from_stored_parts(
+            stored,
+            entry.map(|entry| entry.spec.clone()),
+            entry.map(|entry| entry.path.clone()),
+        )
+    }
+
+    /// Put a saved snapshot back with the pieces a borrowed entry would give.
+    pub(crate) fn from_stored_parts(
+        stored: crate::run_store::StoredRun,
+        spec: Option<ManifestSpec>,
+        manifest: Option<PathBuf>,
+    ) -> Self {
+        let spec = spec.unwrap_or_else(|| spec_from_steps(&stored.workflow, &stored.steps));
+        let outcome = RunOutcome {
+            ok: stored.ok,
+            run_id: stored.run_id,
+            duration_ms: stored.duration_ms,
+            steps: stored.steps,
+            error: stored.error,
+            report: stored.report,
+            exit_code: stored.exit_code,
+        };
+        let age = now_ms().saturating_sub(stored.finished_ms);
+        RunRecord {
+            workflow_name: stored.workflow,
+            manifest: manifest.unwrap_or_else(|| PathBuf::from(&stored.manifest)),
+            manifest_label: stored.manifest,
+            spec,
+            inputs: stored.inputs,
+            outcome,
+            log: stored.log,
+            cancelled: stored.cancelled,
+            finished: Instant::now()
+                .checked_sub(Duration::from_millis(age))
+                .unwrap_or_else(Instant::now),
+            finished_ms: stored.finished_ms,
+        }
+    }
+}
+
+/// Rebuild a plan from recorded steps, for a workflow that is no longer on disk.
+fn spec_from_steps(workflow: &str, steps: &[StepView]) -> ManifestSpec {
+    ManifestSpec {
+        name: Some(workflow.to_string()),
+        steps: steps
+            .iter()
+            .map(|step| crate::manifest::StepSpec {
+                id: step.id.clone(),
+                description: step.detail.clone(),
+                kind: match step.kind.as_str() {
+                    "run" => crate::manifest::StepKind::Run,
+                    "set" => crate::manifest::StepKind::Set,
+                    "map" => crate::manifest::StepKind::Map,
+                    "ai" => crate::manifest::StepKind::Ai,
+                    _ => crate::manifest::StepKind::Unknown,
+                },
+                summary: step
+                    .command
+                    .clone()
+                    .or_else(|| step.summary.clone())
+                    .unwrap_or_default(),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    }
+}
+
+/// How many tool names one question keeps for the ledger.
+///
+/// A runaway loop must not grow the answer's record without bound; 500 calls is
+/// far more than any real question makes.
+pub(crate) const TOOL_NAME_LOG_MAX: usize = 500;
+
+/// How long an answer may go without any event before it counts as hung.
+///
+/// The longest legitimate silence is one quiet command (the 5-minute ceiling on
+/// `shell`) plus the round trip that asked for it, so ten minutes means the engine
+/// or its provider is stuck. A card waiting for the person pauses the clock: that
+/// is not a hang.
+pub(crate) const STALL_LIMIT: Duration = Duration::from_secs(600);
+
+/// Whether an answer has gone quiet for too long.
+/// @param idle - time since the last event arrived.
+/// @param waiting - true while a card, question or plan is open for the person.
+/// @returns true when the request should be stopped.
+pub(crate) fn answer_stalled(idle: Duration, waiting: bool) -> bool {
+    !waiting && idle >= STALL_LIMIT
 }
 
 /// One question being answered.
@@ -966,6 +1326,9 @@ pub(crate) struct PendingAnswer {
     pub(crate) question: Option<String>,
     /// Provider id of a plan review being waited on.
     pub(crate) plan: Option<String>,
+    /// When the last event arrived, so a hung request can be given up on instead
+    /// of leaving the status strip spinning.
+    pub(crate) last_event: Instant,
     /// Writes approved before the decision arrived, waiting for their row.
     pub(crate) writes: Vec<ApprovedWrite>,
     /// Model answering, for the label.
@@ -977,6 +1340,10 @@ pub(crate) struct PendingAnswer {
     pub(crate) round: u32,
     /// Tool calls the loop has finished for this question.
     pub(crate) calls: u32,
+    /// Names of the tools this question called, in call order. The statistics
+    /// ledger counts calls per tool, so the names are kept until the answer is
+    /// written; the list stops growing at [`TOOL_NAME_LOG_MAX`].
+    pub(crate) tool_names: Vec<String>,
     /// Every counted piece of the request, appended to `requests.jsonl` when the
     /// answer arrives so the request can be opened again later.
     pub(crate) items: Vec<RequestItem>,
@@ -1036,6 +1403,8 @@ pub(crate) struct RetryAsk {
     pub(crate) web_search: bool,
     /// Files that went with the question, as the request carried them.
     pub(crate) attachments: Vec<crate::ai::AskAttachment>,
+    /// Sibling conversation folders the tools must not walk into.
+    pub(crate) skip_dirs: Vec<String>,
     /// Connections already tried, so a retry moves on.
     pub(crate) tried: Vec<String>,
 }
@@ -1189,6 +1558,8 @@ pub(crate) enum Field {
     ConnUrl(usize),
     /// The conversation filter.
     ChatFilter,
+    /// The built-in tools filter on the plugins page.
+    ToolFilter,
     /// The in-conversation find box.
     ChatFind,
     /// A conversation card's title while renaming.
@@ -1203,6 +1574,8 @@ pub(crate) enum Field {
     ColorHex(usize),
     /// The HTTP proxy the engine's provider calls go through.
     Proxy,
+    /// Commands the automatic review may run without a card.
+    ReviewAllow,
     /// Name of the custom mode selected in settings.
     ModeName,
 }
@@ -1220,7 +1593,9 @@ impl Field {
     pub(crate) fn chrome(self) -> FieldChrome {
         match self {
             // Fields that sit inside a frame of their own draw no frame.
-            Self::Composer | Self::ChatFilter | Self::ChatFind => FieldChrome::Plain,
+            Self::Composer | Self::ChatFilter | Self::ChatFind | Self::ToolFilter => {
+                FieldChrome::Plain
+            }
             Self::ColorHex(_) => FieldChrome::Row,
             _ => FieldChrome::Boxed,
         }
@@ -1258,20 +1633,59 @@ fn apply_write(message: &mut ChatMessage, write: Option<ApprovedWrite>) {
     message.undoable = write.undoable;
 }
 
+/// Put the picture a tool showed onto its row, so the next question can reuse it.
+fn apply_image(message: &mut ChatMessage, mime: &str, path: &str) {
+    if mime.is_empty() || path.is_empty() {
+        return;
+    }
+    message.image_mime = mime.to_string();
+    message.image_path = path.to_string();
+}
+
+/// The pictures the previous answer showed, newest last, as `(mime, path)`.
+///
+/// Only the turn that just finished is considered: a screenshot from ten
+/// questions ago is not what "把它再往右挪一点" means, and every picture that
+/// comes back costs tokens on every round of the new question.
+/// @param messages - the conversation so far, the new question excluded.
+/// @param limit - how many pictures may come back.
+/// @returns the files to attach, oldest first.
+pub(crate) fn recent_images(messages: &[ChatMessage], limit: usize) -> Vec<(String, String)> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    // The answer that just finished starts after the last question, and its tool
+    // rows sit before the assistant message itself.
+    let end = messages
+        .iter()
+        .rposition(|message| matches!(message.role, Role::Assistant))
+        .unwrap_or(messages.len());
+    let start = messages[..end]
+        .iter()
+        .rposition(|message| matches!(message.role, Role::User))
+        .map_or(0, |index| index + 1);
+    let mut found: Vec<(String, String)> = messages[start..end]
+        .iter()
+        .filter(|message| !message.image_path.is_empty() && !message.image_mime.is_empty())
+        .map(|message| (message.image_mime.clone(), message.image_path.clone()))
+        .collect();
+    if found.len() > limit {
+        found = found.split_off(found.len() - limit);
+    }
+    found
+}
+
 /// The workflow pane's view model.
+/// One workflow shown by the flow page.
 pub(crate) struct Pane<'a> {
     /// Workflow name.
     pub(crate) title: String,
     /// Its description, empty when it has none.
     pub(crate) description: String,
-    /// Manifest path relative to the scan root.
-    pub(crate) manifest_label: String,
     /// The manifest itself, for the "open" button.
     pub(crate) manifest: Option<&'a Path>,
     /// The steps, with whatever the run reported.
     pub(crate) rows: Vec<StepRow>,
-    /// Log lines.
-    pub(crate) log: &'a [String],
     /// What the engine reported, for a finished run.
     pub(crate) outcome: Option<&'a RunOutcome>,
     /// The values it ran with, as `(name, value)`.
@@ -1286,6 +1700,24 @@ pub(crate) struct Pane<'a> {
     pub(crate) elapsed_ms: u64,
 }
 
+impl Pane<'_> {
+    /// Steps still left as `skip` placeholders.
+    ///
+    /// The flow page reads the same flag the cards do, so a draft stops saying
+    /// "needs review" the moment its last placeholder is replaced.
+    /// @returns how many rows are placeholders.
+    pub(crate) fn placeholders(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|row| {
+                row.notes
+                    .iter()
+                    .any(|note| note == "skip" || note.starts_with("skip "))
+            })
+            .count()
+    }
+}
+
 /// One step of the workflow pane.
 #[derive(Default)]
 pub(crate) struct StepRow {
@@ -1293,8 +1725,20 @@ pub(crate) struct StepRow {
     pub(crate) id: String,
     /// Step type, as the manifest names it.
     pub(crate) kind: String,
+    /// `desc:` of the step, for the static board.
+    pub(crate) description: String,
     /// One-line summary.
     pub(crate) summary: String,
+    /// The plan's own summary, which a run's result never replaces.
+    pub(crate) plan_summary: String,
+    /// First source line of the step in the manifest; zero when unknown.
+    pub(crate) start_line: usize,
+    /// Last source line of the step in the manifest; zero when unknown.
+    pub(crate) end_line: usize,
+    /// Program file the step runs, relative to the manifest folder.
+    pub(crate) program: Option<String>,
+    /// Child manifest a `use` step calls, relative to the manifest folder.
+    pub(crate) child_manifest: Option<String>,
     /// Condition, when the step has one.
     pub(crate) when: Option<String>,
     /// Output key the step writes.
@@ -1305,20 +1749,16 @@ pub(crate) struct StepRow {
     pub(crate) status: String,
     /// How long it took.
     pub(crate) duration_ms: u64,
-    /// What the engine said about it.
-    pub(crate) detail: String,
-    /// The command that ran.
-    pub(crate) command: Option<String>,
     /// Its stderr.
     pub(crate) stderr: Option<String>,
     /// Its stdout.
     pub(crate) stdout: Option<String>,
     /// The text it produced.
     pub(crate) text: Option<String>,
-    /// The model it called, when it called one.
-    pub(crate) model: Option<String>,
-    /// True when the step came from a cached run.
-    pub(crate) cached: bool,
+    /// Files and pictures the step produced.
+    pub(crate) artifacts: Vec<ArtifactView>,
+    /// Structured failure, when the step reported one.
+    pub(crate) error: Option<ErrorView>,
 }
 
 /// The root view of the application.
@@ -1330,6 +1770,9 @@ pub struct DshFlowApp {
     /// Conversation whose delete button was pressed once and now waits for a
     /// second press; anything else that happens cancels it.
     confirm_delete: Option<usize>,
+    /// Workflow card whose delete action was pressed once and waits for a second
+    /// press; anything else that happens cancels it.
+    confirm_delete_workflow: Option<String>,
     /// The conversation removed last, kept in memory so the removal can be
     /// undone; a transcript is not worth losing to a stray double click.
     undo_delete: Option<DeletedChat>,
@@ -1345,6 +1788,10 @@ pub struct DshFlowApp {
     selected_flow: Option<usize>,
     /// Editable values for the selected manifest's inputs.
     inputs: Vec<InputField>,
+    /// Input whose secret value is shown while its "按住显示" button is held.
+    /// Cleared whenever the pointer is released, the fields lose focus, or
+    /// another workflow is selected, so a password is never left on screen.
+    revealed_input: Option<usize>,
     /// The run in flight, if any.
     active: Option<ActiveRun>,
     /// Finished runs, newest first.
@@ -1353,7 +1800,14 @@ pub struct DshFlowApp {
     past_runs: Vec<crate::workflow_store::RunSummary>,
     /// Index into [`Self::history`] when the pane shows a past run.
     selected_run: Option<usize>,
-    /// Step id whose content the workflow pane shows on the right.
+    /// Which tab the left column shows: the current run or the history list.
+    flow_tab: FlowTab,
+    /// The history record opened from the history list, when one is.
+    history_open: Option<usize>,
+    /// Workflows whose last run the reader sent to history with 新建运行; their
+    /// current tab stays empty until the next run starts.
+    flow_cleared: std::collections::HashSet<String>,
+    /// Step id whose source the right board shows opened.
     selected_step: Option<String>,
     /// Conversations, newest last.
     chats: Vec<Chat>,
@@ -1375,6 +1829,9 @@ pub struct DshFlowApp {
     workflow_categories: Vec<(String, String)>,
     /// Workflow cards taken out of the 工作区 list.
     hidden_workflows: Vec<String>,
+    /// Display names for workflow cards, keyed by manifest name; presentation
+    /// only, so renaming a card never rewrites the manifest.
+    workflow_labels: std::collections::HashMap<String, String>,
     /// Message being composed.
     composer: TextField,
     /// Unsent text per conversation folder: a draft follows its own conversation,
@@ -1395,6 +1852,8 @@ pub struct DshFlowApp {
     chat_offsets: std::collections::HashMap<String, f32>,
     /// Filters the conversation cards by title and message text.
     chat_filter: TextField,
+    /// The tools filter on the plugins page: name or description.
+    tool_filter: TextField,
     /// The in-conversation find field.
     chat_find: TextField,
     /// True while the find bar is open.
@@ -1440,6 +1899,15 @@ pub struct DshFlowApp {
     /// Tool schemas the engine last reported, keyed by conversation folder; only
     /// that conversation's panel shows them.
     tool_schemas: std::collections::HashMap<String, Vec<(String, String)>>,
+    /// Revision of every conversation the last successful save wrote.
+    ///
+    /// The save path compares it with [`Chat::revision`] so a step in one chat does
+    /// not re-serialize the whole history.
+    saved_revisions: std::collections::HashMap<String, u64>,
+    /// What the engine says each tool does, as `name → description`, taken from
+    /// the schemas it reports. The tools page draws this text: the engine owns the
+    /// definition the model is given, so a second copy on the page would drift.
+    tool_descriptions: std::collections::HashMap<String, String>,
     /// Plugin panels built for the last request in each conversation, keyed by
     /// the conversation folder. They describe one request and are rebuilt on the
     /// next, so only that request can show them.
@@ -1545,7 +2013,7 @@ pub struct DshFlowApp {
     /// Cards whose description is open on the plugins page.
     open_plugin_cards: Vec<String>,
     /// The conversation whose title is being edited, and the field doing it.
-    renaming: Option<(usize, TextField)>,
+    renaming: Option<(RenameTarget, TextField)>,
     /// Everything `config.json` holds.
     ai: AiSettings,
     /// Editable boxes of the model connections, one set per connection.
@@ -1566,6 +2034,8 @@ pub struct DshFlowApp {
     /// True while the budget menu is open.
     /// True while the attach menu (files / commands) is open.
     attach_menu: bool,
+    /// The attach menu's turn list for 「固化为工作流」 is expanded.
+    distill_menu: bool,
     /// Which model tab the AI block shows.
     model_tab: usize,
     /// What the last connection action said.
@@ -1576,6 +2046,8 @@ pub struct DshFlowApp {
     ai_save_pending: bool,
     /// The HTTP proxy box on the AI page.
     proxy_field: TextField,
+    /// The commands the automatic review may run without a card, on the AI page.
+    review_allow_field: TextField,
     /// The `node` found at startup, for the diagnostics page.
     node_version: Option<String>,
     /// What the last backup or export said.
@@ -1622,16 +2094,27 @@ pub struct DshFlowApp {
     /// Keyed by conversation folder, so two questions in the same conversation
     /// cannot start two summarization calls for the same span.
     compacting: std::collections::HashSet<String>,
+    /// Conversations whose chat record is being distilled, keyed by `chat.dir`;
+    /// a second click must not start a second copy.
+    distilling: std::collections::HashSet<String>,
     /// Which text box has the caret.
     focused: Option<Field>,
     /// Focus handle of the transcript, so a click can take focus from a field.
     content_focus: FocusHandle,
     /// The bar at the top of the window.
     banner: Option<Banner>,
-    /// Scroll position of the run log.
-    log_scroll: ScrollHandle,
     /// Scroll position of the step list.
     steps_scroll: ScrollHandle,
+    /// Scroll position of the workflow run transcript.
+    transcript_scroll: ScrollHandle,
+    /// `<details>` sections the run transcript has opened, by `(message, block)`.
+    /// Kept apart from the conversation's own set: a transcript row and a chat
+    /// message must not share a key.
+    transcript_details: std::collections::HashSet<(usize, usize)>,
+    /// Width the run transcript wraps its markdown to, measured each frame.
+    transcript_width: f32,
+    /// Width of the step board, measured each frame.
+    board_width: f32,
     /// Scroll position of the transcript.
     chat_scroll: ScrollHandle,
     /// Text system of the frame being built, so the composer's wrapped height
@@ -1645,6 +2128,10 @@ pub struct DshFlowApp {
     sidebar_width: f32,
     /// Width an answer is wrapped to.
     answer_width: f32,
+    /// Width the workflow page's input cards have, after the step rail and the
+    /// panel's padding are taken out. Measured every frame, so the cards are
+    /// grouped into however many rows the window actually needs.
+    flow_input_width: f32,
     /// Side padding of the transcript.
     chat_gutter: f32,
     /// True while the splitter is being dragged.
@@ -1714,9 +2201,13 @@ impl DshFlowApp {
         // handed to those children instead of touching this process' own
         // environment.
         engine::set_proxy(&ai.proxy);
+        // A previous run may have been killed with its headless browser still up;
+        // nothing can use those pages again, and they hold a profile each.
+        crate::ai::sweep_browsers_async();
         // Asked once here rather than on every repaint of the diagnostics page.
         let node_version = engine::node_version();
         let proxy_text = ai.proxy.clone();
+        let review_text = ai.review_allow.join(", ");
         let data = ai.data_dir();
         // The sidebar file decides the categories, which one is open, how wide
         // the panel was left, and which conversation was on screen.
@@ -1746,6 +2237,10 @@ impl DshFlowApp {
         let tasks_dir = ai.workspace_dir().join(&chats[active_chat].dir);
         let engine_dir = engine::locate_engine_dir();
         let engine_ready = engine::engine_ready(&engine_dir);
+        // The engine runs TypeScript directly, which needs Node 23.6 or newer; checking it
+        // here turns "the assistant never answers" into one sentence.
+        let node_problem =
+            engine::node_version_problem(engine::node_version().as_deref().unwrap_or(""));
         // The MCP folder is found once; the page rescans it when opened.
         let mcp_dir = crate::mcp::locate_dir();
         // Skills live next to the program, like plugins and MCP servers.
@@ -1760,6 +2255,23 @@ impl DshFlowApp {
             .parent()
             .map_or_else(|| ai.workspace_dir(), Path::to_path_buf);
         let workflows = engine::discover(&scan_root);
+        // A hidden name whose manifest is gone is stale: it would keep a card
+        // suppressed forever (moved drafts, deleted copies). Keep only names that
+        // still exist on disk.
+        let mut hidden_workflows = filed.hidden;
+        hidden_workflows.retain(|name| workflows.iter().any(|entry| &entry.name == name));
+        // A card finalized in the previous session may have left a `.show`
+        // marker; it must not stay hidden just because it was hidden once.
+        let show_markers = distill::apply_show_markers(&workflows, &mut hidden_workflows);
+        // Detailed snapshots from earlier sessions, newest first. The board only
+        // needs the tail of the history; the rest stay on disk for a post-mortem.
+        let saved_runs: Vec<RunRecord> = crate::run_store::load_latest(&data, MAX_HISTORY)
+            .into_iter()
+            .map(|run| {
+                let entry = workflows.iter().find(|entry| entry.name == run.workflow);
+                RunRecord::from_stored(run, entry)
+            })
+            .collect();
         let theme = ThemeKind::from_name(&ai.theme);
         let palette = crate::theme::themed(theme, &ai.colors);
         let colors_text: Vec<String> = crate::theme::COLOR_ROLES
@@ -1772,6 +2284,7 @@ impl DshFlowApp {
             engine_dir,
             engine_ready,
             confirm_delete: None,
+            confirm_delete_workflow: None,
             undo_delete: None,
             scan_root,
             workflows,
@@ -1779,10 +2292,14 @@ impl DshFlowApp {
             theme,
             selected_flow: None,
             inputs: Vec::new(),
+            revealed_input: None,
             active: None,
-            history: Vec::new(),
+            history: saved_runs,
             past_runs: filed.runs,
             selected_run: None,
+            flow_tab: FlowTab::Current,
+            history_open: None,
+            flow_cleared: saved.cleared.into_iter().collect(),
             selected_step: None,
             chats,
             active_chat,
@@ -1793,7 +2310,8 @@ impl DshFlowApp {
             category_menu: None,
             card_menu: None,
             workflow_categories: filed.categories,
-            hidden_workflows: filed.hidden,
+            hidden_workflows,
+            workflow_labels: saved.labels,
             composer: TextField::new(cx),
             chat_drafts,
             attachment_drafts,
@@ -1803,6 +2321,7 @@ impl DshFlowApp {
             chat_from: std::collections::HashMap::new(),
             chat_offsets: std::collections::HashMap::new(),
             chat_filter: TextField::new(cx),
+            tool_filter: TextField::new(cx),
             chat_find: TextField::new(cx),
             chat_find_open: false,
             shortcuts_open: false,
@@ -1825,6 +2344,8 @@ impl DshFlowApp {
             tables: RefCell::new(std::collections::HashMap::new()),
             table_drag: None,
             tool_schemas: std::collections::HashMap::new(),
+            saved_revisions: std::collections::HashMap::new(),
+            tool_descriptions: std::collections::HashMap::new(),
             plugin_panels: std::collections::HashMap::new(),
             plugin_prompts: Vec::new(),
             plugin_tools: Vec::new(),
@@ -1871,6 +2392,7 @@ impl DshFlowApp {
             model_menu: false,
             tools_menu: false,
             attach_menu: false,
+            distill_menu: false,
             model_tab: 0,
             ai_status: None,
             ai_save_generation: 0,
@@ -1878,6 +2400,11 @@ impl DshFlowApp {
             proxy_field: {
                 let mut field = TextField::new(cx);
                 field.set_text(proxy_text);
+                field
+            },
+            review_allow_field: {
+                let mut field = TextField::new(cx);
+                field.set_text(review_text);
                 field
             },
             node_version,
@@ -1908,19 +2435,24 @@ impl DshFlowApp {
             testing: None,
             pending: Vec::new(),
             compacting: std::collections::HashSet::new(),
+            distilling: std::collections::HashSet::new(),
             focused: None,
             content_focus: cx.focus_handle(),
             banner: None,
-            log_scroll: ScrollHandle::new(),
             steps_scroll: ScrollHandle::new(),
+            transcript_scroll: ScrollHandle::new(),
+            transcript_details: std::collections::HashSet::new(),
+            transcript_width: 0.,
+            board_width: 0.,
             chat_scroll: ScrollHandle::new(),
-        window_text: None,
+            window_text: None,
             block_scroll: RefCell::new(std::collections::HashMap::new()),
             parsed: RefCell::new(std::collections::HashMap::new()),
             sidebar_width: sidebar_width(saved.width),
             answer_width: answer_text_width(px(INITIAL_WINDOW_WIDTH
                 - sidebar_width(saved.width)
                 - SPLITTER_WIDTH)),
+            flow_input_width: 0.,
             chat_gutter: transcript_pad(px(INITIAL_WINDOW_WIDTH
                 - sidebar_width(saved.width)
                 - SPLITTER_WIDTH)),
@@ -1952,6 +2484,10 @@ impl DshFlowApp {
                 "找不到引擎：{}\n设置 DSH_FLOW_HOME 指向 dsh-flow 目录后重启界面。",
                 app.engine_dir.join("src").join("cli.ts").display()
             )));
+        } else if let Some(problem) = node_problem {
+            // The engine is there but its runtime is not usable: say which version
+            // is needed instead of letting the first question fail with a trace.
+            app.banner = Some(Banner::error(problem));
         }
         // Import the old per-conversation request history once. After this point
         // the statistics page reads only the permanent ledger, so deleting a
@@ -1966,6 +2502,11 @@ impl DshFlowApp {
         // The task panel is fed by files on disk, so it polls instead of
         // listening to a tool result.
         app.spawn_tasks_pump(cx);
+        // A `.show` marker removed a hidden flag; persist it now, otherwise the
+        // next start would hide the card again after the marker is gone.
+        if show_markers {
+            app.save_categories();
+        }
         app
     }
 
@@ -2040,8 +2581,10 @@ mod composer;
 mod context_view;
 mod conversations;
 mod datatable;
+mod distill;
 mod fields;
 mod flow;
+mod flow_board;
 mod input;
 mod instructions;
 mod mcp;
@@ -2050,6 +2593,7 @@ mod metrics;
 mod modes;
 mod plugins;
 mod render;
+pub(crate) mod run_error;
 mod run_actions;
 mod settings;
 mod settings_window;
@@ -2059,6 +2603,8 @@ mod skills;
 mod stats;
 mod steps;
 mod tasks;
+mod tool_catalog;
+mod transcript;
 mod util;
 mod widgets;
 
@@ -2067,9 +2613,10 @@ mod widgets;
 #[allow(unused_imports)]
 pub(crate) use {
     ai_actions::*, ai_settings::*, chat::*, chat_actions::*, compact::*, composer::*,
-    context_view::*, conversations::*, datatable::*, fields::*, flow::*, input::*, instructions::*,
-    mcp::*, message::*, metrics::*, modes::*, plugins::*, render::*, run_actions::*, settings::*,
-    settings_window::*, sidebar::*, skills::*, stats::*, steps::*, tasks::*, util::*, widgets::*,
+    context_view::*, conversations::*, datatable::*, fields::*, flow::*, flow_board::*, input::*,
+    instructions::*, mcp::*, message::*, metrics::*, modes::*, plugins::*, render::*,
+    run_actions::*, settings::*, settings_window::*, sidebar::*, skills::*, stats::*, steps::*,
+    tasks::*, tool_catalog::*, transcript::*, util::*, widgets::*,
 };
 
 #[cfg(test)]

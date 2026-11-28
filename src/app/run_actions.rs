@@ -1,6 +1,7 @@
 //! Starting, pumping, and stopping a workflow run, plus the status-bar summary.
 
 use super::*;
+use super::run_error::RunErrorKind;
 
 impl DshFlowApp {
     /// Start the selected workflow on a background process.
@@ -9,18 +10,60 @@ impl DshFlowApp {
             return;
         }
         let Some(entry) = self.selected_entry().cloned() else {
-            self.banner = Some(Banner::error(
+            self.banner = Some(Banner::error(RunErrorKind::Workflow.prefixed(
                 "还没有选中工作流：在左侧选择一张工作流卡片，或把 DSH_FLOW_WORKFLOWS 指向工作流目录。",
-            ));
+            )));
             cx.notify();
             return;
         };
-        let inputs: Vec<(String, String)> = self
+        // A run always shows on the current tab, whatever the reader was looking at.
+        self.flow_tab = FlowTab::Current;
+        self.history_open = None;
+        self.selected_run = None;
+
+        // A local format check first: an empty required input can only end as a
+        // failure inside the engine, a few seconds later. Blocking it here keeps
+        // the window from starting a process it already knows must fail; the
+        // engine stays the authority for everything else (defaults, types,
+        // secrets, paths).
+        let missing: Vec<String> = self
             .inputs
             .iter()
-            .map(|input| (input.spec.name.clone(), input.field.text.trim().to_string()))
-            .filter(|(_, value)| !value.is_empty())
+            .filter(|input| input.spec.required && input.field.text.trim().is_empty())
+            .map(|input| input.spec.name.clone())
             .collect();
+        if !missing.is_empty() {
+            self.banner = Some(Banner::error(RunErrorKind::Input.prefixed(&format!(
+                "缺少必填输入：{}。在右侧输入卡里填好后再运行。",
+                missing.join("、")
+            ))));
+            cx.notify();
+            return;
+        }
+        // A value revealed with "按住显示" goes back behind dots the moment the
+        // run starts.
+        self.revealed_input = None;
+
+        // A secret input never becomes `--input`: it would land on the command
+        // line, in the process list, and in the log pane's first line. It travels
+        // on the child's stdin with the endpoint credentials, and the pane shows
+        // `***`.
+        let mut inputs: Vec<(String, String)> = Vec::new();
+        let mut secrets: Vec<(String, String)> = Vec::new();
+        let mut shown: Vec<(String, String)> = Vec::new();
+        for input in &self.inputs {
+            let value = input.field.text.trim().to_string();
+            if value.is_empty() {
+                continue;
+            }
+            if input.spec.secret {
+                secrets.push((input.spec.name.clone(), value));
+                shown.push((input.spec.name.clone(), "***".to_string()));
+                continue;
+            }
+            inputs.push((input.spec.name.clone(), value.clone()));
+            shown.push((input.spec.name.clone(), value));
+        }
 
         // `ai` steps ask the same verified endpoint the chat uses; the key goes
         // to the child on stdin so it never reaches argv or the log pane.
@@ -34,28 +77,53 @@ impl DshFlowApp {
                 model: connection.model.clone(),
             });
 
-        match RunSession::start(&self.engine_dir, &entry.path, &inputs, credentials.as_ref()) {
+        match RunSession::start(
+            &self.engine_dir,
+            &entry.path,
+            &inputs,
+            credentials.as_ref(),
+            &secrets,
+        ) {
             Ok(session) => {
                 let mut log = vec![command_line(&entry, &inputs, &self.scan_root)];
                 log.push("正在启动引擎".to_string());
+                if credentials.is_none()
+                    && entry
+                        .spec
+                        .steps
+                        .iter()
+                        .any(|step| step.kind == crate::manifest::StepKind::Ai)
+                {
+                    log.push(
+                        RunErrorKind::Credential.prefixed(
+                            "接入点没有可用 API Key，需要验证码/ai 的步骤会失败；\
+                             已在对话里登录时，把 workspace 指向对话目录可跳过。",
+                        ),
+                    );
+                }
                 self.active = Some(ActiveRun {
                     session: Arc::new(session),
                     workflow_name: entry.name.clone(),
                     manifest: entry.path.clone(),
                     manifest_label: entry.label(&self.scan_root),
                     spec: entry.spec.clone(),
-                    inputs,
+                    inputs: shown,
+                    steps: Vec::new(),
                     log,
                 });
                 self.banner = None;
                 self.selected_run = None;
                 self.selected_step = None;
-                self.log_scroll.scroll_to_bottom();
+                // The transcript starts at the run's header, not wherever the
+                // previous run was left scrolled to.
+                self.transcript_scroll.set_offset(point(px(0.), px(0.)));
                 self.spawn_run_pump(cx);
             }
             Err(error) => {
                 self.active = None;
-                self.banner = Some(Banner::error(error));
+                self.banner = Some(Banner::error(
+                    RunErrorKind::from_message(&error).prefixed(&error),
+                ));
             }
         }
         cx.notify();
@@ -92,7 +160,6 @@ impl DshFlowApp {
         if messages.is_empty() {
             return;
         }
-        let follow = self.log_at_bottom();
         for message in messages {
             match message {
                 RunMessage::Line(line) => {
@@ -105,20 +172,17 @@ impl DshFlowApp {
                         push_log(&mut record.log, line);
                     }
                 }
+                RunMessage::Event(event) => {
+                    // Live step states: a card turns green or red while the run
+                    // is still going, instead of only when the summary lands.
+                    if let Some(active) = self.active.as_mut() {
+                        active.apply(&event);
+                    }
+                }
                 RunMessage::Done(outcome) => self.finish(*outcome),
                 RunMessage::Failed(error) => self.fail(error),
             }
         }
-        if follow {
-            self.log_scroll.scroll_to_bottom();
-        }
-    }
-
-    /// True when the log pane is scrolled to its end.
-    pub(crate) fn log_at_bottom(&self) -> bool {
-        let offset = self.log_scroll.offset();
-        let max = self.log_scroll.max_offset();
-        max.y + offset.y <= px(24.)
     }
 
     /// Stop the run in flight.
@@ -155,6 +219,7 @@ impl DshFlowApp {
             return;
         };
         let cancelled = active.session.is_cancelled();
+        let finished = Instant::now();
         self.push_record(RunRecord {
             workflow_name: active.workflow_name,
             manifest: active.manifest,
@@ -164,7 +229,8 @@ impl DshFlowApp {
             outcome,
             log: active.log,
             cancelled,
-            finished: Instant::now(),
+            finished,
+            finished_ms: epoch_ms(finished),
         });
     }
 
@@ -179,7 +245,8 @@ impl DshFlowApp {
             push_log(&mut log, "已取消".to_string());
             "已取消".to_string()
         } else {
-            push_log(&mut log, format!("错误：{error}"));
+            let classified = RunErrorKind::from_message(&error).prefixed(&error);
+            push_log(&mut log, format!("错误：{classified}"));
             error
         };
         let outcome = RunOutcome {
@@ -201,17 +268,63 @@ impl DshFlowApp {
             log,
             cancelled,
             finished: Instant::now(),
+            finished_ms: now_ms(),
         });
+    }
+
+    /// Send the shown run to history and clear the current transcript.
+    ///
+    /// The record was already saved when the run finished; this only forgets the
+    /// selection, so the left column goes back to "not run yet" and the right
+    /// inputs become editable again. Until this is pressed, the current tab keeps
+    /// showing that finished run.
+    pub(crate) fn new_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active.is_some() {
+            return;
+        }
+        let name = self
+            .selected_entry()
+            .map(|entry| entry.name.clone())
+            .or_else(|| {
+                self.selected_record()
+                    .map(|record| record.workflow_name.clone())
+            });
+        if let Some(name) = name {
+            self.flow_cleared.insert(name);
+            self.save_categories();
+        }
+        self.flow_tab = FlowTab::Current;
+        self.history_open = None;
+        self.selected_run = None;
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
+        self.leave_fields(window, cx);
+        cx.notify();
     }
 
     /// Store a finished run and show it.
     pub(crate) fn push_record(&mut self, record: RunRecord) {
+        let workflow = record.workflow_name.clone();
+        // The snapshot is what a later post-mortem reads; a failed write costs
+        // that record, never the run itself.
+        if let Err(error) = crate::run_store::save(&self.ai.data_dir(), &record.to_stored()) {
+            crate::logging::error(&format!("保存运行快照失败：{error}"));
+        }
         self.history.insert(0, record);
         self.history.truncate(MAX_HISTORY);
+        self.flow_cleared.remove(&workflow);
         self.remember_run();
-        self.selected_run = Some(0);
-        self.selected_step = None;
-        self.log_scroll.scroll_to_bottom();
+        if self.flow_tab == FlowTab::History {
+            // A new run arrives at the top; an open record moves down one slot.
+            if let Some(index) = self.history_open {
+                self.history_open = Some(index + 1);
+                self.selected_run = Some(index + 1);
+            }
+        } else {
+            self.selected_run = Some(0);
+        }
+        // The static board keeps whatever card the reader opened; a run does not
+        // move its selection.
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
     }
 
     /// Add the newest run to the saved history, so the card keeps its status
@@ -248,77 +361,22 @@ impl DshFlowApp {
         self.save_categories();
     }
 
-    /// Drop the log of whatever pane is visible.
-    pub(crate) fn clear_log(&mut self) {
-        if let Some(active) = self.active.as_mut() {
-            active.log.clear();
-            return;
-        }
-        if let Some(record) = self
-            .selected_run
-            .and_then(|index| self.history.get_mut(index))
-        {
-            record.log.clear();
-        }
-    }
-
-    /// Open a report the engine wrote, without going through a shell.
-    ///
-    /// The address comes from the engine's own output, so it is treated as
-    /// untrusted: an `http(s)` link goes to the browser through the checked
-    /// opener, and a local path is only opened when it really is a file.
-    pub(crate) fn open_report(
-        &mut self,
-        path: &str,
-        manifest: Option<&Path>,
-        cx: &mut Context<Self>,
-    ) {
-        let report = path.trim();
-        if report.starts_with("http://") || report.starts_with("https://") {
-            if let Err(error) = open_url(report) {
-                self.banner = Some(Banner::error(format!("无法打开报告：{error}")));
-            }
-            cx.notify();
-            return;
-        }
-        let report = PathBuf::from(report);
-        let candidate = if report.is_absolute() {
-            report
-        } else {
-            let from_engine = self.engine_dir.join(&report);
-            let from_manifest = manifest
-                .and_then(Path::parent)
-                .map(|folder| folder.join(&report))
-                .filter(|candidate| candidate.exists());
-            if from_engine.exists() {
-                from_engine
-            } else if let Some(from_manifest) = from_manifest {
-                from_manifest
-            } else {
-                report
-            }
-        };
-        if !candidate.is_file() {
-            self.banner = Some(Banner::error(format!("找不到报告 {}", candidate.display())));
-            cx.notify();
-            return;
-        }
-        if let Err(error) = open_path(&candidate) {
-            self.banner = Some(Banner::error(format!("无法打开报告：{error}")));
-        }
-        cx.notify();
-    }
-
     /// Gather the workflow pane's view model.
     pub(crate) fn pane(&self) -> Option<Pane<'_>> {
+        // A record opened from the history tab wins over a run in flight: the
+        // reader asked for that one explicitly.
+        if self.flow_tab == FlowTab::History
+            && self.history_open.is_some()
+            && let Some(record) = self.selected_record()
+        {
+            return Some(self.record_pane(record));
+        }
         if let Some(active) = &self.active {
             return Some(Pane {
                 title: active.workflow_name.clone(),
                 description: active.spec.description.clone().unwrap_or_default(),
-                manifest_label: active.manifest_label.clone(),
                 manifest: Some(&active.manifest),
-                rows: build_rows(&active.spec, &[]),
-                log: &active.log,
+                rows: build_rows(&active.spec, &active.steps),
                 outcome: None,
                 inputs: active.inputs.clone(),
                 running: true,
@@ -328,28 +386,13 @@ impl DshFlowApp {
             });
         }
         if let Some(record) = self.selected_record() {
-            return Some(Pane {
-                title: record.workflow_name.clone(),
-                description: record.spec.description.clone().unwrap_or_default(),
-                manifest_label: record.manifest_label.clone(),
-                manifest: Some(&record.manifest),
-                rows: build_rows(&record.spec, &record.outcome.steps),
-                log: &record.log,
-                outcome: Some(&record.outcome),
-                inputs: record.inputs.clone(),
-                running: false,
-                cancelled: record.cancelled,
-                history: true,
-                elapsed_ms: record.outcome.duration_ms,
-            });
+            return Some(self.record_pane(record));
         }
         self.selected_entry().map(|entry| Pane {
             title: entry.name.clone(),
             description: entry.description.clone(),
-            manifest_label: entry.label(&self.scan_root),
             manifest: Some(&entry.path),
             rows: build_rows(&entry.spec, &[]),
-            log: &[],
             outcome: None,
             inputs: Vec::new(),
             running: false,
@@ -358,28 +401,22 @@ impl DshFlowApp {
             elapsed_ms: 0,
         })
     }
-}
 
-/// Colour a log line by what it seems to say.
-pub(crate) fn log_color(line: &str, palette: Palette) -> u32 {
-    let lower = line.to_lowercase();
-    if line.starts_with('$') {
-        return palette.accent;
+    /// The view model of one finished run.
+    fn record_pane<'a>(&'a self, record: &'a RunRecord) -> Pane<'a> {
+        Pane {
+            title: record.workflow_name.clone(),
+            description: record.spec.description.clone().unwrap_or_default(),
+            manifest: Some(&record.manifest),
+            rows: build_rows(&record.spec, &record.outcome.steps),
+            outcome: Some(&record.outcome),
+            inputs: record.inputs.clone(),
+            running: false,
+            cancelled: record.cancelled,
+            history: true,
+            elapsed_ms: record.outcome.duration_ms,
+        }
     }
-    if lower.contains("error")
-        || lower.contains("错误")
-        || lower.contains("失败")
-        || lower.contains("failed")
-    {
-        return palette.failed;
-    }
-    if lower.contains("warn") || lower.contains("cancel") || lower.contains("取消") {
-        return palette.warn;
-    }
-    if lower.contains("done") || lower.contains("完成") || lower.contains(" ok") {
-        return palette.ok;
-    }
-    palette.muted
 }
 
 /// Append a log line, dropping the oldest when the buffer is full.

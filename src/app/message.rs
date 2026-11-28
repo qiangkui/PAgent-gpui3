@@ -2,110 +2,34 @@
 
 use super::*;
 
-impl DshFlowApp {
-    /// What a blank conversation shows: hints and example questions.
-    pub(crate) fn render_chat_empty(&self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
-        let examples = [
-            "引擎和示例目录里大概有多少文件？",
-            "在这个对话目录里写一个 hello.txt，再读回来确认内容",
-            "照 repo-health 的结构，在对话目录写一个统计行数的工作流草稿",
-            "解释一下 repo-health 这个流程做了什么",
-        ];
-        let mut chips: Vec<AnyElement> = Vec::new();
-        for example in examples {
-            chips.push(
-                div()
-                    .id(example)
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(palette.border))
-                    .bg(rgb(palette.panel))
-                    .text_xs()
-                    .text_color(rgb(palette.muted))
-                    .cursor_pointer()
-                    .hover(move |style| {
-                        style
-                            .bg(rgb(palette.panel_soft))
-                            .text_color(rgb(palette.text))
-                    })
-                    .on_click(cx.listener(move |view, _, window, cx| {
-                        view.composer.set_text(example);
-                        view.composer_recall = None;
-                        view.focused = Some(Field::Composer);
-                        window.focus(&view.composer.focus_handle().clone(), cx);
-                        cx.notify();
-                    }))
-                    .child(example)
-                    .into_any_element(),
-            );
-        }
+mod math;
+use math::*;
 
+impl DshFlowApp {
+    /// What a blank conversation shows: the product mark and one line.
+    pub(crate) fn render_chat_empty(&self, palette: Palette) -> AnyElement {
         div()
             .flex()
             .flex_col()
-            .items_start()
-            .gap_3()
-            .child(div().text_xl().text_color(rgb(palette.text)).child("开始和助手对话"))
+            .flex_1()
+            .w_full()
+            .min_h(px(0.))
+            .items_center()
+            .justify_center()
+            .gap_4()
             .child(
-                div()
-                    .text_sm()
-                    .text_color(rgb(palette.muted))
-                    .whitespace_normal()
-                    .child("助手会通过 dsh-flow 引擎回答问题；左侧的工作流卡片可以直接运行，结果回到这里。"),
+                svg()
+                    .path("icons/logo.svg")
+                    .w(px(56.))
+                    .h(px(56.))
+                    .text_color(rgb(palette.accent)),
             )
             .child(
                 div()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .whitespace_normal()
-                    .child("助手可以直接读写工作区里的文件并保留撤销；「仅可查看」下每次写入先询问。「仅可查看」与「工作区内修改」下命令、移动 / 删除都先询问；「完全权限」可以读写整台电脑，也不再询问、不检查命令路径。前两档写入不会碰工作区以外的文件，命令引用的路径也必须在工作区内，否则直接拒绝。常驻进程（dev server 等）可以作为后台任务运行，用完用 task 工具结束。"),
+                    .text_lg()
+                    .text_color(rgb(palette.text))
+                    .child("请使用PAgent开始你的工作。"),
             )
-            // Without a tested connection nothing can answer, so the first thing
-            // the empty state does is point at where to fix that.
-            .when(!self.ai.usable(), |this| {
-                this.child(
-                    div()
-                        .id("empty-open-settings")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(palette.panel))
-                        .border_1()
-                        .border_color(rgb(palette.failed))
-                        .text_xs()
-                        .text_color(rgb(palette.failed))
-                        .cursor_pointer()
-                        .hover(move |style| style.bg(rgb(palette.panel_soft)))
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            view.open_settings(cx);
-                        }))
-                        .child("还没有可用的模型：到「设置 → AI」填好 Key 并点「测试」")
-                        .child("→"),
-                )
-            })
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .whitespace_normal()
-                    .child(format!(
-                        "这个对话的工作目录：{}",
-                        self.chat_dir(self.active_chat).display()
-                    )),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(palette.faint))
-                    .child("Enter 发送 · Shift+Enter 换行 · 拖入文本文件作为附件 · 回答里的文字可以直接拖选复制"),
-            )
-            .child(div().flex().flex_col().gap_2().children(chips))
             .into_any_element()
     }
 
@@ -804,6 +728,9 @@ impl DshFlowApp {
                                 .child(self.render_tool_bar(index, palette, &vertical, cx)),
                         )
                     })
+                    .when(!message.files.is_empty(), |this| {
+                        this.child(self.render_file_cards(index, &message.files, palette, cx))
+                    })
                     .into_any_element()
             }
             Role::Approval => {
@@ -988,7 +915,11 @@ impl DshFlowApp {
                                                 .child("拒绝"),
                                         )
                                         .when(
-                                            allow_session_button(&message.tool, &message.input),
+                                            allow_session_button(&message.tool, &message.input)
+                                                || allow_file_session_button(
+                                                    &message.tool,
+                                                    &message.path,
+                                                ),
                                             |this| {
                                                 this.child(
                                                     div()
@@ -1017,6 +948,20 @@ impl DshFlowApp {
                                                 .text_color(rgb(palette.faint))
                                                 .child(approval_hint(&message.tool)),
                                         )
+                                        // A credential leaving the machine is worth a
+                                        // second look even when everything else runs
+                                        // without asking.
+                                        .when(message.secret, |this| {
+                                            this.child(
+                                                div()
+                                                    .text_xs()
+                                                    .whitespace_normal()
+                                                    .text_color(rgb(palette.warn))
+                                                    .child(
+                                                        "这次会发送凭据（取自环境变量，值不显示）；这类请求永远需要你确认。",
+                                                    ),
+                                            )
+                                        })
                                     })
                                     .when(!live, |this| {
                                         this.child(
@@ -1680,6 +1625,29 @@ pub(crate) fn tool_detail_widths(answer_width: f32) -> (f32, f32) {
     (width, text)
 }
 
+/// The word a file card shows before the name.
+///
+/// An extension is the cheapest label a reader recognises: `PDF`, `XLSX`, `ZIP`.
+/// A name without one, or with something too long to be one, says「文件」rather than
+/// a meaningless fragment.
+/// @param name - the file's name.
+/// @returns the badge text.
+pub(crate) fn file_badge(name: &str) -> String {
+    let extension = match name.rsplit_once('.') {
+        Some((stem, tail)) if !stem.is_empty() => tail,
+        _ => "",
+    };
+    if extension.is_empty()
+        || extension.len() > 4
+        || !extension
+            .chars()
+            .all(|letter| letter.is_ascii_alphanumeric())
+    {
+        return "文件".to_string();
+    }
+    extension.to_uppercase()
+}
+
 /// Room a tool row's one-line summary gets, after its badge and the chip at the
 /// end of the row.
 pub(crate) fn tool_row_text_width(answer_width: f32) -> f32 {
@@ -1692,6 +1660,123 @@ pub(crate) fn tool_row_text_width(answer_width: f32) -> f32 {
 pub(crate) const DETAIL_MARGIN: f32 = 40.;
 
 impl DshFlowApp {
+    /// The finished files a `show` call handed over, one card each.
+    ///
+    /// A click opens the file with the system handler, which is the whole point:
+    /// the answer can say「做好了」and the reader still has the file in front of
+    /// them. The small「所在文件夹」 chip selects it in Explorer for the reader who
+    /// wants to move or send it, and it stops its click from opening the file too.
+    fn render_file_cards(
+        &self,
+        index: usize,
+        files: &[crate::ai::ToolFile],
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut cards: Vec<AnyElement> = Vec::new();
+        for (order, file) in files.iter().enumerate() {
+            let open_target = file.path.clone();
+            let reveal_target = file.path.clone();
+            let name = if file.name.trim().is_empty() {
+                file.path
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("文件")
+                    .to_string()
+            } else {
+                file.name.clone()
+            };
+            let badge = file_badge(&name);
+            let size = if file.bytes == 0 {
+                String::new()
+            } else {
+                short_bytes(file.bytes)
+            };
+            cards.push(
+                div()
+                    .id(("file-card", index * 32 + order))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .pl_2()
+                    .pr_1()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(palette.panel))
+                    .border_1()
+                    .border_color(rgb(palette.border))
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if let Err(error) = open_path(std::path::Path::new(&open_target)) {
+                            view.show_toast(format!("打不开这个文件：{error}"), true, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(rgb(palette.panel_soft))
+                            .text_xs()
+                            .text_color(rgb(palette.sky))
+                            .child(badge),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(240.))
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(palette.text))
+                            .child(name),
+                    )
+                    .when(!size.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .text_color(rgb(palette.faint))
+                                .child(size),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(("file-reveal", index * 32 + order))
+                            .flex_shrink_0()
+                            .px_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(palette.muted))
+                            .cursor_pointer()
+                            .hover(move |style| style.text_color(rgb(palette.text)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if let Err(error) =
+                                    reveal_path(std::path::Path::new(&reveal_target))
+                                {
+                                    view.show_toast(format!("打不开所在文件夹：{error}"), true, cx);
+                                }
+                            }))
+                            .child("所在文件夹"),
+                    )
+                    .into_any_element(),
+            );
+        }
+        div()
+            .id(("file-cards", index))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap_1()
+            .w(px(self.answer_width))
+            .children(cards)
+            .into_any_element()
+    }
+
     /// The scrollbar of one expanded tool detail.
     ///
     /// A real column beside the text rather than an overlay, and sized from the
@@ -2027,387 +2112,6 @@ pub(crate) fn transcript_pad(pane: Pixels) -> f32 {
     ((f32::from(pane) - ANSWER_MAX_WIDTH) / 2.)
         .max(TRANSCRIPT_PAD)
         .round()
-}
-
-/// A formula's pieces side by side, centred on the line.
-///
-/// A display formula may write its rows on separate lines with `\\`: each row is
-/// laid out on its own, one under the other, instead of running together.
-fn math_sequence(
-    nodes: &[markdown::MathNode],
-    palette: Palette,
-    tone: u32,
-    size: f32,
-) -> AnyElement {
-    let mut rows: Vec<Vec<&markdown::MathNode>> = vec![Vec::new()];
-    for node in nodes {
-        if matches!(node, markdown::MathNode::Break) {
-            rows.push(Vec::new());
-        } else if let Some(row) = rows.last_mut() {
-            row.push(node);
-        }
-    }
-    let row = |pieces: &[&markdown::MathNode]| {
-        // An operator with its limits stands taller than the rest of the line;
-        // aligning baselines would hang everything from its upper limit, so a
-        // row holding one is centred instead.
-        let limits = pieces.iter().any(|node| big_operator(node).is_some());
-        let laid_out = div().flex().flex_row().children(
-            pieces
-                .iter()
-                .map(|node| math_piece(node, palette, tone, size)),
-        );
-        if limits {
-            laid_out.items_center().into_any_element()
-        } else {
-            laid_out.items_baseline().into_any_element()
-        }
-    };
-    if rows.len() == 1 {
-        return row(&rows[0]);
-    }
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .children(rows.iter().map(|pieces| row(pieces)))
-        .into_any_element()
-}
-
-/// One piece of a formula: text, a stack of two, a raised or lowered script, or a
-/// root with its bar.
-fn math_piece(node: &markdown::MathNode, palette: Palette, tone: u32, size: f32) -> AnyElement {
-    let script = size * MATH_SCRIPT;
-    match node {
-        markdown::MathNode::Text(text) => div()
-            .font_family(MONO_FONT)
-            .text_size(px(size))
-            .text_color(rgb(tone))
-            .child(text.clone())
-            .into_any_element(),
-        markdown::MathNode::Row(pieces) => {
-            let limits = pieces.iter().any(|node| big_operator(node).is_some());
-            let laid_out = div().flex().flex_row().children(
-                pieces
-                    .iter()
-                    .map(|piece| math_piece(piece, palette, tone, size)),
-            );
-            if limits {
-                laid_out.items_center().into_any_element()
-            } else {
-                laid_out.items_baseline().into_any_element()
-            }
-        }
-        markdown::MathNode::Frac(first, second) => {
-            // The bar needs a definite width: a percentage of an auto-width column
-            // resolves to nothing, which leaves fractions with no line at all.
-            let width = math_width(first, size).max(math_width(second, size)) + size * 0.4;
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .w(px(width))
-                .child(math_piece(first, palette, tone, size))
-                .child(div().w_full().h(px(1.)).my(px(1.)).bg(rgb(palette.muted)))
-                .child(math_piece(second, palette, tone, size))
-                .into_any_element()
-        }
-        // A script sits beside its base and is nudged up or down: `relative()`
-        // moves it without asking the line to grow. A sum's limits go above and
-        // below it instead, the way a display formula writes them.
-        markdown::MathNode::Sup(base, power) | markdown::MathNode::Sub(base, power) => {
-            if let Some((operator, lower, upper)) = big_operator(node) {
-                return math_limits(operator, lower, upper, palette, tone, size);
-            }
-            let offset = if matches!(node, markdown::MathNode::Sup(..)) {
-                -size * 0.35
-            } else {
-                size * 0.25
-            };
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .child(math_piece(base, palette, tone, size))
-                .child(
-                    div()
-                        .relative()
-                        .top(px(offset))
-                        .child(math_piece(power, palette, tone, script)),
-                )
-                .into_any_element()
-        }
-        markdown::MathNode::Sqrt(index, body) => {
-            let body_width = math_width(body, size) + size * 0.2;
-            div()
-                .flex()
-                .flex_row()
-                .items_baseline()
-                .children(
-                    index
-                        .as_ref()
-                        .map(|index| math_piece(index, palette, tone, script)),
-                )
-                .child(
-                    div()
-                        .font_family(MONO_FONT)
-                        .text_size(px(size * 1.15))
-                        .text_color(rgb(tone))
-                        .child("√"),
-                )
-                // The bar over the radicand is a hairline above it, as wide as the
-                // radicand in the mono font's advance.
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .w(px(body_width))
-                        .child(div().w_full().h(px(1.)).bg(rgb(palette.muted)))
-                        .child(math_piece(body, palette, tone, size)),
-                )
-                .into_any_element()
-        }
-        // `\binom{n}{k}`: the two parts stacked inside brackets, with no bar.
-        markdown::MathNode::Binom(top, bottom) => {
-            let glyph = |text: &'static str| {
-                div()
-                    .font_family(MONO_FONT)
-                    .text_size(px(size * 1.7))
-                    .text_color(rgb(tone))
-                    .child(text)
-            };
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .child(glyph("("))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .px(px(size * 0.15))
-                        .child(math_piece(top, palette, tone, size))
-                        .child(math_piece(bottom, palette, tone, size)),
-                )
-                .child(glyph(")"))
-                .into_any_element()
-        }
-        // `\overline{x}` / `\underline{x}`: a hairline above or below the piece.
-        markdown::MathNode::Overline(body, above) => {
-            let rule = || div().w_full().h(px(1.)).bg(rgb(palette.muted));
-            let width = math_width(body, size) + size * 0.2;
-            let piece = math_piece(body, palette, tone, size);
-            div()
-                .flex()
-                .flex_col()
-                .items_center()
-                .w(px(width))
-                .when(*above, |this| this.child(rule()))
-                .child(piece)
-                .when(!*above, |this| this.child(rule()))
-                .into_any_element()
-        }
-        // A matrix: rows of cells in a grid, inside the bracket its environment
-        // names. Every column is as wide as its widest cell, so `aligned` lines
-        // up its `&` marks instead of each row drifting on its own.
-        markdown::MathNode::Matrix(rows, bracket) => {
-            let (left, right) = match bracket {
-                Some(markdown::Bracket::Paren) => ("(", ")"),
-                Some(markdown::Bracket::Square) => ("[", "]"),
-                Some(markdown::Bracket::Bar) => ("|", "|"),
-                Some(markdown::Bracket::Brace) => ("{", "}"),
-                None => ("", ""),
-            };
-            let glyph = |text: &'static str| {
-                div()
-                    .font_family(MONO_FONT)
-                    .text_size(px(size * 1.7))
-                    .text_color(rgb(tone))
-                    .child(text)
-            };
-            let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-            let widths: Vec<f32> = (0..columns)
-                .map(|column| {
-                    rows.iter()
-                        .filter_map(|row| row.get(column))
-                        .map(|cell| math_nodes_width(cell, size))
-                        .fold(0., f32::max)
-                })
-                .collect();
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .when(!left.is_empty(), |this| this.child(glyph(left)))
-                .child(div().flex().flex_col().gap_1().px(px(size * 0.3)).children(
-                    rows.iter().map(|row| {
-                        div().flex().flex_row().items_center().gap_2().children(
-                            row.iter().enumerate().map(|(column, cell)| {
-                                div()
-                                    .w(px(widths.get(column).copied().unwrap_or(0.)))
-                                    .child(math_sequence(cell, palette, tone, size))
-                            }),
-                        )
-                    }),
-                ))
-                .when(!right.is_empty(), |this| this.child(glyph(right)))
-                .into_any_element()
-        }
-        // `\boxed{x}`: a frame drawn round the piece.
-        markdown::MathNode::Framed(body) => div()
-            .border_1()
-            .border_color(rgb(tone))
-            .px(px(size * 0.25))
-            .py(px(1.))
-            .child(math_piece(body, palette, tone, size))
-            .into_any_element(),
-        // Rows are split before a piece is drawn; a stray break draws nothing.
-        markdown::MathNode::Break => div().into_any_element(),
-    }
-}
-
-/// The drawn width of a piece, in pixels.
-///
-/// Pieces are drawn in the mono font, whose advance is about 0.62 em, and a stack
-/// is as wide as its wider side. Rules are given this definite width because a
-/// percentage inside a column that is sized by its content comes out as nothing.
-fn math_width(node: &markdown::MathNode, size: f32) -> f32 {
-    match node {
-        markdown::MathNode::Text(text) => {
-            text.chars()
-                .map(|character| {
-                    // A CJK glyph is about twice as wide as a mono ASCII one.
-                    if character.is_ascii() { 0.62 } else { 1.0 }
-                })
-                .sum::<f32>()
-                * size
-        }
-        markdown::MathNode::Break => 0.,
-        markdown::MathNode::Row(pieces) => math_nodes_width(pieces, size),
-        markdown::MathNode::Frac(first, second) => {
-            math_width(first, size).max(math_width(second, size)) + size * 0.4
-        }
-        markdown::MathNode::Sup(base, power) | markdown::MathNode::Sub(base, power) => {
-            math_width(base, size) + math_width(power, size * MATH_SCRIPT)
-        }
-        markdown::MathNode::Sqrt(index, body) => {
-            index
-                .as_ref()
-                .map(|index| math_width(index, size * MATH_SCRIPT))
-                .unwrap_or(0.)
-                + size * 1.0
-                + math_width(body, size)
-        }
-        markdown::MathNode::Binom(top, bottom) => {
-            math_width(top, size).max(math_width(bottom, size)) + size * 1.4
-        }
-        markdown::MathNode::Overline(body, _) => math_width(body, size) + size * 0.2,
-        markdown::MathNode::Framed(body) => math_width(body, size) + size * 0.8,
-        markdown::MathNode::Matrix(rows, bracket) => {
-            let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-            let mut total = 0.;
-            for column in 0..columns {
-                total += rows
-                    .iter()
-                    .filter_map(|row| row.get(column))
-                    .map(|cell| math_nodes_width(cell, size))
-                    .fold(0., f32::max);
-            }
-            total
-                + columns.saturating_sub(1) as f32 * 8.
-                + if bracket.is_some() { size * 2.4 } else { 0. }
-        }
-    }
-}
-
-/// The drawn width of a run of pieces.
-fn math_nodes_width(nodes: &[markdown::MathNode], size: f32) -> f32 {
-    nodes.iter().map(|node| math_width(node, size)).sum()
-}
-
-/// A big operator with its limits, when `node` reads as one.
-///
-/// `\sum_{i=1}^{n}` parses as `Sup(Sub(Text("∑"), i=1), n)`, and a sum with only a
-/// subscript as `Sub(Text("∑"), i=1)`.
-fn big_operator(
-    node: &markdown::MathNode,
-) -> Option<(
-    &'static str,
-    Option<&markdown::MathNode>,
-    Option<&markdown::MathNode>,
-)> {
-    match node {
-        markdown::MathNode::Sup(base, power) => {
-            if let Some(operator) = operator_of(base) {
-                return Some((operator, None, Some(power)));
-            }
-            if let markdown::MathNode::Sub(inner, lower) = base.as_ref()
-                && let Some(operator) = operator_of(inner)
-            {
-                return Some((operator, Some(lower), Some(power)));
-            }
-            None
-        }
-        markdown::MathNode::Sub(base, power) => {
-            operator_of(base).map(|operator| (operator, Some(power.as_ref()), None))
-        }
-        _ => None,
-    }
-}
-
-/// The big operator a node stands for, if it is one.
-fn operator_of(node: &markdown::MathNode) -> Option<&'static str> {
-    let markdown::MathNode::Text(text) = node else {
-        return None;
-    };
-    Some(match text.as_str() {
-        "∑" => "∑",
-        "∏" => "∏",
-        "∫" => "∫",
-        "∮" => "∮",
-        "⋃" => "⋃",
-        "⋂" => "⋂",
-        // Names whose limit sits under the word itself.
-        "lim" => "lim",
-        "limsup" => "lim sup",
-        "liminf" => "lim inf",
-        "argmax" => "argmax",
-        "argmin" => "argmin",
-        "max" => "max",
-        "min" => "min",
-        "sup" => "sup",
-        "inf" => "inf",
-        "det" => "det",
-        "gcd" => "gcd",
-        "Pr" => "Pr",
-        _ => return None,
-    })
-}
-
-/// An operator with its limits above and below, one size up.
-fn math_limits(
-    operator: &str,
-    lower: Option<&markdown::MathNode>,
-    upper: Option<&markdown::MathNode>,
-    palette: Palette,
-    tone: u32,
-    size: f32,
-) -> AnyElement {
-    div()
-        .flex()
-        .flex_col()
-        .items_center()
-        .children(upper.map(|node| math_piece(node, palette, tone, size * MATH_SCRIPT)))
-        .child(
-            div()
-                .font_family(MONO_FONT)
-                .text_size(px(size * 1.2))
-                .text_color(rgb(tone))
-                .child(operator.to_string()),
-        )
-        .children(lower.map(|node| math_piece(node, palette, tone, size * MATH_SCRIPT)))
-        .into_any_element()
 }
 
 /// The name a code block shows for its fence's info string.

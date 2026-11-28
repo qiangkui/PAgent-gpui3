@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod answer;
+mod approval;
+pub(crate) use approval::should_fallback;
+
 impl DshFlowApp {
     /// Drop the caret from any text field and give the content area the keyboard.
     ///
@@ -10,24 +14,67 @@ impl DshFlowApp {
     pub(crate) fn leave_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.commit_category_rename();
         self.commit_new_category();
+        // A revealed password goes back behind dots the moment the fields lose
+        // the keyboard; holding the button is the only way to see it.
+        self.revealed_input = None;
         self.focused = None;
         window.focus(&self.content_focus, cx);
     }
 
     /// Rebuild the input fields from the selected manifest.
+    ///
+    /// A secret this machine saved earlier comes back filled in, so
+    /// "保存到本机" still means something after a restart. Everything else
+    /// starts at the manifest's default.
     pub(crate) fn rebuild_inputs(&mut self, cx: &mut Context<Self>) {
-        let specs: Vec<InputSpec> = self
+        let Some((workflow, spec)) = self
             .selected_entry()
-            .map(|entry| entry.spec.inputs.clone())
-            .unwrap_or_default();
-        self.inputs = specs
-            .into_iter()
-            .map(|spec| {
+            .map(|entry| (entry.name.clone(), entry.spec.clone()))
+        else {
+            self.inputs.clear();
+            self.revealed_input = None;
+            return;
+        };
+        let active_workspace = self.chat_dir(self.active_chat).display().to_string();
+        self.inputs = spec
+            .inputs
+            .iter()
+            .map(|input_spec| {
                 let mut field = TextField::new(cx);
-                field.set_text(spec.initial_value());
-                InputField { spec, field }
+                let stored = input_spec
+                    .secret
+                    .then(|| crate::secrets::read_input(&workflow, &input_spec.name))
+                    .flatten();
+                field.set_text(match &stored {
+                    Some(value) => value.clone(),
+                    // A secret never starts from a manifest default, even when a
+                    // malformed manifest has one: the engine rejects that file,
+                    // and the window must not put a password on screen anyway.
+                    None if input_spec.secret => String::new(),
+                    None => {
+                        let default = input_spec.initial_value();
+                        // Running a workflow from this window should reuse the
+                        // conversation's browser by default: a login already done
+                        // in chat then skips the captcha/ai branch entirely.
+                        if matches!(input_spec.name.as_str(), "workspace" | "browserDir")
+                            && matches!(default.trim(), "" | ".")
+                        {
+                            active_workspace.clone()
+                        } else {
+                            default
+                        }
+                    }
+                });
+                InputField {
+                    uses: spec.consumers(&input_spec.name),
+                    step: spec.owner(&input_spec.name),
+                    spec: input_spec.clone(),
+                    field,
+                    stored,
+                }
             })
             .collect();
+        self.revealed_input = None;
     }
 
     /// Add files dropped onto the conversation to the composer.
@@ -281,6 +328,15 @@ impl DshFlowApp {
         if text.is_empty() {
             text = "请看附件。".to_string();
         }
+        let workflow_command = text.trim() == super::distill::WORKFLOW_COMMAND;
+        if workflow_command && !self.ai.active().is_some_and(|entry| entry.verified) {
+            self.show_toast(
+                "没有可用模型：先在「设置 → AI」接好模型，再发送这条指令",
+                true,
+                cx,
+            );
+            return;
+        }
         self.composer.clear();
         self.composer_recall = None;
 
@@ -308,6 +364,19 @@ impl DshFlowApp {
         }
         // The history is taken before this question goes in: the prompt carries
         // it, and sending it twice would repeat the question.
+        if workflow_command {
+            // The transcript keeps `/固化为工作流`; the model gets the paths and
+            // the Skill rules. Nothing is distiled by the window itself.
+            let prompt = self.workflow_command_prompt();
+            self.ask_text_with_display(
+                prompt,
+                super::distill::WORKFLOW_COMMAND.to_string(),
+                filed,
+                cx,
+            );
+            self.save_chats();
+            return;
+        }
         self.ask_text(text, filed, cx);
     }
 
@@ -317,6 +386,23 @@ impl DshFlowApp {
     /// instruction without touching what the composer holds. `filed` holds the
     /// binary attachments, whose bytes travel with this request only.
     fn ask_text(&mut self, text: String, filed: Vec<Attachment>, cx: &mut Context<Self>) {
+        let display = text.clone();
+        self.ask_text_with_display(text, display, filed, cx);
+    }
+
+    /// Ask the assistant `text`, showing `display` in the transcript.
+    ///
+    /// The two differ only for the workflow command: the reader sees the short
+    /// command, while the model receives the paths and the Skill rules. The
+    /// request and its record use `text`; the transcript and a fresh title use
+    /// `display`.
+    fn ask_text_with_display(
+        &mut self,
+        text: String,
+        display: String,
+        filed: Vec<Attachment>,
+        cx: &mut Context<Self>,
+    ) {
         // Sending starts the transcript again, even if the reader had left the
         // task or context tab open on an empty conversation.
         self.chat_tab = ChatTab::Chat;
@@ -349,14 +435,38 @@ impl DshFlowApp {
             .as_ref()
             .map_or_else(|| self.chat_model(), |entry| entry.model.clone());
         let blocks = self.prompt_blocks(chat_index, &model);
+        // What this request carries, resolved before the record is written: the
+        // engine's last tool list can name servers or plugins that are switched
+        // off now, and the record must not claim tools this request does not send.
+        let selection = self.ai.mode_selection(&mode);
+        let plugins = selection.plugins.clone();
+        let mcp_servers = crate::mcp::enabled_for(&self.ai, &selection.mcp_servers);
+        let mcp_ids: Vec<String> = mcp_servers.iter().map(|server| server.id.clone()).collect();
+        // A text-only endpoint is not offered the two image tools: sending one
+        // would turn a valid call into a rejected request.
+        let allowed_list = mode_tools_for(
+            &selection,
+            connection.as_ref().is_none_or(|entry| entry.vision),
+        );
         // Only this conversation's schemas: another answer running beside it must
         // not change what this request is recorded as carrying.
-        let schemas = self.tool_schemas.get(&dir).cloned().unwrap_or_default();
+        let schemas = request_schemas(
+            self.tool_schemas.get(&dir).map_or(&[][..], Vec::as_slice),
+            tools,
+            &allowed_list,
+            &plugins,
+            &mcp_ids,
+            &self.plugin_tools,
+            &self.mcp_tools,
+        );
         // Recorded with the answer, so the request can be looked at again later
         // even though only one total token figure comes back from the endpoint.
         // The question itself is not in `history` yet, so it is passed in here:
         // without it the person's own words would be missing from the record.
-        let items = request_items(&blocks, &schemas, &self.plugin_prompts, &history, &text);
+        // The plugin prompts get the same treatment as the schemas: a plugin
+        // switched off since the last answer keeps none of its text here.
+        let prompts = request_prompts(&self.plugin_prompts, &plugins);
+        let items = request_items(&blocks, &schemas, &prompts, &history, &text);
         if let Some(chat) = self.chats.get_mut(chat_index) {
             if dropped > 0 {
                 // Say it where the answer will be read: a cut-down context is
@@ -367,9 +477,9 @@ impl DshFlowApp {
                 ));
             }
             if chat.messages.is_empty() {
-                chat.title = title_from(&text);
+                chat.title = title_from(&display);
             }
-            chat.messages.push(ChatMessage::user(text.clone()));
+            chat.messages.push(ChatMessage::user(display.clone()));
             chat.touch();
         }
 
@@ -414,13 +524,19 @@ impl DshFlowApp {
             return;
         }
 
-        let selection = self.ai.mode_selection(&mode);
-        let allowed_list = mode_tools(&selection);
         let allowed = if tools { Some(&allowed_list[..]) } else { None };
         let system = joined_prompt(&blocks);
+        // The conversation folder is the writable scope, the same folder the OS
+        // sandbox jails commands to: a sibling conversation's files are then
+        // unreachable from both sides. Full access drops both limits.
+        let scope_root = if full_access {
+            None
+        } else {
+            Some(workspace.clone())
+        };
         // Images and PDFs travel as bytes with this request; their text is
         // already in the history above, so a retry can send the same files.
-        let files: Vec<crate::ai::AskAttachment> = filed
+        let mut files: Vec<crate::ai::AskAttachment> = filed
             .iter()
             .filter(|attachment| attachment.kind != AttachmentKind::Text)
             .map(|attachment| {
@@ -432,18 +548,44 @@ impl DshFlowApp {
                 )
             })
             .collect();
-        // The workspace is the default scope; full access drops the jail.
-        let scope_root = if full_access {
-            None
-        } else {
-            Some(self.ai.workspace_dir())
-        };
+        // A picture the previous answer showed comes back with this question:
+        // "把它再往右挪一点" has no subject otherwise. The person's own
+        // attachment wins when there is one.
+        let mut carried = 0usize;
+        // A text-only endpoint would reject the picture, so the follow-up does not
+        // carry last answer's screenshot there.
+        if files.is_empty() && !read_only && connection.vision {
+            files = self.recent_image_attachments(chat_index, &workspace, scope_root.as_deref());
+            carried = files.len();
+        }
+        if carried > 0
+            && let Some(chat) = self.chats.get_mut(chat_index)
+        {
+            chat.messages.push(ChatMessage::note(
+                format!("已把上一轮的 {carried} 张截图一并带上，这一问仍能看到它们。"),
+                false,
+            ));
+            chat.touch();
+        }
         let read_only_roots = vec![self.scan_root.clone()];
         // The command sandbox allows the workspace only; there is no extra
         // allowlist any more.
         let plugin_dir = crate::config::AiSettings::plugin_dir();
-        let plugins = selection.plugins.clone();
-        let mcp_servers = crate::mcp::enabled_for(&self.ai, &selection.mcp_servers);
+        // Searching the workspace must not walk into another conversation's
+        // folder: those are siblings under the workspace root, and they hold the
+        // files that conversation's assistant wrote. The current one stays, of
+        // course — it is where this conversation's own files are.
+        let own_dir = self
+            .chats
+            .get(chat_index)
+            .map(|chat| chat.dir.clone())
+            .unwrap_or_default();
+        let skip_dirs: Vec<String> = self
+            .chats
+            .iter()
+            .map(|chat| chat.dir.clone())
+            .filter(|dir| *dir != own_dir)
+            .collect();
 
         match AiRequest::ask(
             &self.engine_dir,
@@ -460,12 +602,14 @@ impl DshFlowApp {
             max_rounds,
             max_calls,
             plan,
+            tools,
             web_search,
             &files,
             plugin_dir.as_deref(),
             &plugins,
             &mcp_servers,
             Some(&self.mcp_dir),
+            &skip_dirs,
         ) {
             Ok(request) => {
                 let request = Arc::new(request);
@@ -487,6 +631,7 @@ impl DshFlowApp {
                     approval: None,
                     question: None,
                     plan: None,
+                    last_event: Instant::now(),
                     writes: Vec::new(),
                     model: connection.model.clone(),
                     acted: false,
@@ -494,6 +639,7 @@ impl DshFlowApp {
                     calls: 0,
                     items,
                     schemas: Vec::new(),
+                    tool_names: Vec::new(),
                     retry: RetryAsk {
                         prompt: text.clone(),
                         work_dir: workspace.clone(),
@@ -509,6 +655,7 @@ impl DshFlowApp {
                         plan,
                         web_search,
                         attachments: files.clone(),
+                        skip_dirs: skip_dirs.clone(),
                         tried: vec![connection_key(&connection)],
                     },
                 });
@@ -577,6 +724,10 @@ impl DshFlowApp {
                 let keep_going = this
                     .update(cx, |view, cx| {
                         view.pump_chat(&request, cx);
+                        // A request that has gone quiet is stopped here rather than
+                        // left spinning: the pump loop is the only timer that runs
+                        // while an answer is in flight.
+                        view.abandon_stalled(&request);
                         cx.notify();
                         view.pending
                             .iter()
@@ -591,12 +742,61 @@ impl DshFlowApp {
         .detach();
     }
 
+    /// Stop an answer that has produced nothing for a long time.
+    ///
+    /// A hung engine process, a provider connection that never closes, or a tool
+    /// that never returns would otherwise leave 「正在思考」 running until the person
+    /// presses stop. A card waiting for a decision pauses the clock: that is the
+    /// engine waiting for a person, not a hang.
+    /// @param request - the answer to check.
+    /// @returns true when it was stopped.
+    pub(crate) fn abandon_stalled(&mut self, request: &Arc<AiRequest>) -> bool {
+        let Some(slot) = self
+            .pending
+            .iter()
+            .position(|pending| Arc::ptr_eq(&pending.request, request))
+        else {
+            return false;
+        };
+        let idle = self.pending[slot].last_event.elapsed();
+        let waiting = self.pending[slot].approval.is_some()
+            || self.pending[slot].question.is_some()
+            || self.pending[slot].plan.is_some();
+        if !answer_stalled(idle, waiting) {
+            return false;
+        }
+        let dir = self.pending[slot].dir.clone();
+        let minutes = STALL_LIMIT.as_secs() / 60;
+        self.pending.remove(slot);
+        request.cancel();
+        if let Some(chat) = self.chats.iter_mut().find(|chat| chat.dir == dir) {
+            chat.messages.push(ChatMessage::note(
+                format!(
+                    "这次回答已经 {minutes} 分钟没有任何进展，已停止。可以重试，或把问题拆小一点。"
+                ),
+                true,
+            ));
+            chat.touch();
+        }
+        self.banner = Some(Banner::error(format!(
+            "助手 {minutes} 分钟没有响应，已停止这次请求"
+        )));
+        self.save_chats();
+        true
+    }
+
     /// Move whatever the assistant produced into the conversation.
     pub(crate) fn pump_chat(&mut self, request: &Arc<AiRequest>, cx: &mut Context<Self>) {
         let events = request.poll();
         if events.is_empty() {
             return;
         }
+        // Any event counts as progress: the stall watchdog reads this instead of
+        // guessing from the transcript.
+        self.pending
+            .iter_mut()
+            .filter(|pending| Arc::ptr_eq(&pending.request, request))
+            .for_each(|pending| pending.last_event = Instant::now());
         // The request identifies its slot: several conversations may be waiting.
         let Some(slot) = self
             .pending
@@ -772,6 +972,14 @@ impl DshFlowApp {
                     // This run needs its own copy: the first question of a
                     // conversation was recorded before any schema arrived.
                     self.pending[slot].schemas = items.clone();
+                    // The tools page draws the engine's own description of each
+                    // tool, so it is read out of the schema once per run here
+                    // instead of parsed again on every frame.
+                    for (name, schema) in &items {
+                        if let Some(text) = super::tool_catalog::engine_description(schema) {
+                            self.tool_descriptions.insert(name.clone(), text);
+                        }
+                    }
                     self.tool_schemas.insert(dir.clone(), items);
                     self.plugin_prompts = prompts;
                     self.plugin_errors = errors;
@@ -788,12 +996,22 @@ impl DshFlowApp {
                     input,
                     output,
                     call,
+                    image_mime,
+                    image_path,
+                    files,
                 } => {
                     // The model wrote something and then went for a tool: that
                     // text belongs to the round, not to the answer.
                     self.pending[slot].approval = None;
                     self.pending[slot].draft.clear();
                     self.pending[slot].acted = true;
+                    // The statistics ledger counts calls per tool, not only the
+                    // total, so the name is kept as the step finishes.
+                    if !tool.is_empty()
+                        && self.pending[slot].tool_names.len() < super::TOOL_NAME_LOG_MAX
+                    {
+                        self.pending[slot].tool_names.push(tool.clone());
+                    }
                     // The thinking that led here is complete; a later fragment
                     // starts a row of its own.
                     self.pending[slot].thinking_row = None;
@@ -818,12 +1036,16 @@ impl DshFlowApp {
                             message.failed = !ok;
                             message.input = input;
                             message.output = output;
+                            apply_image(message, &image_mime, &image_path);
+                            message.files = files;
                             apply_write(message, write);
                         } else {
                             let mut message = ChatMessage::tool(text, !ok);
                             message.input = input;
                             message.output = output;
                             message.call = call.clone();
+                            apply_image(&mut message, &image_mime, &image_path);
+                            message.files = files;
                             apply_write(&mut message, write);
                             chat.messages.push(message);
                         }
@@ -837,100 +1059,8 @@ impl DshFlowApp {
                         }
                     }
                 }
-                AiEvent::Approval {
-                    call,
-                    tool,
-                    target,
-                    path,
-                    diff,
-                    before,
-                    after,
-                    existed,
-                    undoable,
-                    auto,
-                    command,
-                } => {
-                    // Round prose is not the answer; the decision card is.
-                    self.pending[slot].draft.clear();
-                    self.pending[slot].approval = None;
-                    self.pending[slot].acted = true;
-                    // "本次会话都允许" and the conversation's Trust level are
-                    // checked before the card is drawn: the call is answered
-                    // here, so the model keeps working and no button nobody
-                    // needs ever appears.
-                    let trusted = !auto
-                        && self
-                            .chats
-                            .get(chat_index)
-                            .is_some_and(|chat| chat.auto_actions);
-                    // A command line and a code snippet are both identified by
-                    // the text the card shows, so one rule covers both.
-                    let remembered = if command.is_empty() {
-                        command_from_approval(&diff)
-                    } else {
-                        command.clone()
-                    };
-                    let allowed_before = !auto
-                        && !remembered.is_empty()
-                        && matches!(tool.as_str(), "shell" | "python" | "node")
-                        && self.chats.get(chat_index).is_some_and(|chat| {
-                            chat.allow_session
-                                .contains(&session_key(&tool, &remembered))
-                        });
-                    // Auto review: a conservative rule grants low-risk writes
-                    // and read-only commands, and everything else still asks.
-                    let reviewed = !auto
-                        && !trusted
-                        && !allowed_before
-                        && self.chats.get(chat_index).is_some_and(|chat| {
-                            chat.auto_review
-                                && !chat.read_only
-                                && auto_review_allows(&tool, &command, &path, &diff)
-                        });
-                    let go_ahead = trusted || allowed_before || reviewed;
-                    if !auto && !go_ahead {
-                        self.pending[slot].approval = Some(call.clone());
-                    }
-                    if auto || go_ahead {
-                        // Decided already: the call is recorded by its tool row,
-                        // so no approval card is drawn at all. A write still has
-                        // to hand its undo pair to that row.
-                        if matches!(tool.as_str(), "write" | "edit") && undoable && !path.is_empty()
-                        {
-                            self.pending[slot].writes.push(ApprovedWrite {
-                                call: call.clone(),
-                                path,
-                                before,
-                                after,
-                                existed,
-                                undoable,
-                            });
-                        }
-                        self.pending[slot].request.respond(&call, true);
-                        self.save_chats();
-                        continue;
-                    }
-                    if let Some(chat) = self.chats.get_mut(chat_index) {
-                        let text = if target.is_empty() {
-                            tool.clone()
-                        } else {
-                            format!("{tool} · {target}")
-                        };
-                        let mut message = ChatMessage::approval(
-                            call.clone(),
-                            path,
-                            text,
-                            diff,
-                            before,
-                            after,
-                            existed,
-                            undoable,
-                        );
-                        message.tool = tool;
-                        chat.messages.push(message);
-                        chat.touch();
-                    }
-                    self.save_chats();
+                event @ AiEvent::Approval { .. } => {
+                    self.handle_approval(slot, chat_index, event);
                 }
                 AiEvent::Question {
                     call,
@@ -1006,257 +1136,20 @@ impl DshFlowApp {
                     }
                     self.save_chats();
                 }
-                AiEvent::Done {
-                    text,
-                    usage,
-                    context,
-                    cache_hits,
-                    rounds,
-                    round_tokens,
-                    round_reasoning,
-                    compaction,
-                    model_ms,
-                    tool_ms,
-                    reasoning,
-                    web_searches,
-                    web_fetches,
-                    server_tool_calls,
-                } => {
-                    // Say what the engine's compaction did, above the answer, so
-                    // a suddenly shorter context is explained rather than
-                    // mysterious. An empty note means nothing happened.
-                    let note = compaction
-                        .as_ref()
-                        .map(|report| report.note())
-                        .unwrap_or_default();
-                    // The same fact, kept as data: the panel flags and the step
-                    // brief read these fields instead of matching the note's
-                    // prose, so a wording change cannot lose the event.
-                    let compaction_layer = compaction
-                        .as_ref()
-                        .map(|report| report.layer.clone())
-                        .unwrap_or_default();
-                    let compaction_saved = compaction
-                        .as_ref()
-                        .map(|report| report.before.saturating_sub(report.after))
-                        .unwrap_or(0);
-                    if !note.is_empty()
-                        && let Some(chat) = self.chats.get_mut(chat_index)
-                    {
-                        chat.messages.push(ChatMessage::note(note, false));
-                    }
-                    let pending = &self.pending[slot];
-                    let model = pending.model.clone();
-                    let elapsed = pending.request.elapsed_ms();
-                    let mut items = pending.items.clone();
-                    let schemas = pending.schemas.clone();
-                    // The provider may report the whole thinking only with the
-                    // answer (no live fragments). No row means no readable
-                    // record, so one is written here in the same shape.
-                    let thinking_text = if reasoning.trim().is_empty() {
-                        pending.reasoning.clone()
-                    } else {
-                        reasoning.clone()
-                    };
-                    // The number the panel counts requests by: this answer's
-                    // place among the answers of this conversation. The same
-                    // figures feed the request line and the statistics ledger,
-                    // so they are gathered once, when the answer is built.
-                    struct Answered {
-                        turn: u64,
-                        tokens: u64,
-                        context: u64,
-                        calls: u64,
-                        cache_hits: u64,
-                        prompt_tokens: u64,
-                        model_ms: u64,
-                        tool_ms: u64,
-                        reasoning: String,
-                        reasoning_tokens: u32,
-                        web_searches: u32,
-                        web_fetches: u32,
-                    }
-                    let mut done: Option<Answered> = None;
-                    if let Some(chat) = self.chats.get_mut(chat_index) {
-                        // A provider that reports the thinking only with the
-                        // answer sends no live fragments; without this the text
-                        // would have no row to live in.
-                        if self.pending[slot].thinking_rows == 0 && !thinking_text.trim().is_empty()
-                        {
-                            chat.messages
-                                .push(ChatMessage::thinking(thinking_text.clone(), rounds.max(1)));
+                AiEvent::Memory { text } => {
+                    // The engine only reports the entry; the file belongs to the
+                    // window. A failure is shown, because a memory the model
+                    // believes it kept would otherwise be lost silently.
+                    if let Err(error) = crate::memory::append(&self.ai.data_dir(), &text) {
+                        if let Some(chat) = self.chats.get_mut(chat_index) {
+                            chat.messages.push(ChatMessage::note(error, true));
+                            chat.touch();
                         }
-                        // What the tools returned during this question is
-                        // replayed into its next round, so it belongs to what
-                        // this question cost — and `chat.json` only kept the
-                        // totals, so it has to come from the transcript.
-                        items.extend(posted_tool_items(&chat.messages));
-                        // The engine reports its tool schemas only once a run has
-                        // started, so a conversation's first question recorded
-                        // none of them: add what this run actually sent.
-                        add_missing_tool_schemas(&mut items, &schemas);
-                        // The text this request finally wrote: no later prompt
-                        // replays it, so the request's own record has to keep it
-                        // or the panel would never show the answer.
-                        if let Some(item) = output_item(&text) {
-                            items.push(item);
-                        }
-                        // Every round sends the whole prompt again, so the
-                        // request's figures are the sum of its rounds, not the
-                        // pieces counted once.
-                        let round_parts = round_estimates(&items, &round_tokens, rounds);
-                        let (composition, tools_tokens) = if round_parts.is_empty() {
-                            let composition = composition_of(&items);
-                            let tools_tokens: usize = items
-                                .iter()
-                                .filter(|item| item.kind == ContextKind::ToolResults)
-                                .map(|item| item.tokens)
-                                .sum();
-                            (composition, tools_tokens)
-                        } else {
-                            let totals = summed_rounds(&round_parts);
-                            let tool_index = ContextKind::ALL
-                                .iter()
-                                .position(|kind| *kind == ContextKind::ToolResults)
-                                .unwrap_or(0);
-                            (
-                                composition_counts(&totals),
-                                totals.get(tool_index).copied().unwrap_or(0),
-                            )
-                        };
-                        // Thinking tokens are output the bill includes, so they
-                        // join the request's make-up under their own category
-                        // instead of disappearing into the answer.
-                        let reasoning_total: u32 = round_reasoning
-                            .iter()
-                            .fold(0u32, |sum, tokens| sum.saturating_add(*tokens));
-                        let mut composition = composition;
-                        if reasoning_total > 0
-                            && let Some(slot) = ContextKind::ALL
-                                .iter()
-                                .position(|kind| *kind == ContextKind::Reasoning)
-                            && let Some(cell) = composition.get_mut(slot)
-                        {
-                            *cell = cell.saturating_add(reasoning_total);
-                        }
-                        let turn = chat
-                            .messages
-                            .iter()
-                            .filter(|message| message.role == Role::Assistant)
-                            .count() as u64
-                            + 1;
-                        // The per-round list counts the tool calls the question
-                        // made; the statistics page needs that total without
-                        // opening every stored item.
-                        let calls: u64 = round_tokens
-                            .iter()
-                            .map(|(_, _, calls)| u64::from(*calls))
-                            .sum();
-                        let mut message = ChatMessage::assistant(text);
-                        message.model = model.clone();
-                        message.elapsed_ms = elapsed;
-                        message.model_ms = model_ms;
-                        message.tool_ms = tool_ms;
-                        message.tokens = usage.map_or(0, |usage| usage.total());
-                        message.context = context;
-                        message.cache_hits = cache_hits;
-                        message.rounds = rounds;
-                        message.round_tokens = round_tokens;
-                        message.round_reasoning = round_reasoning;
-                        message.server_tool_calls = server_tool_calls;
-                        message.composition = composition;
-                        message.tools_tokens = tools_tokens.min(u32::MAX as usize) as u32;
-                        message.compaction_layer = compaction_layer;
-                        message.compaction_saved = compaction_saved;
-                        // Thinking is written as its own rows; the answer keeps only what it said.
-                        // Prompt tokens the question sent, summed over its
-                        // rounds: the denominator of its cache rate, and the
-                        // figure the ledger needs to report one later.
-                        let prompt_tokens: u64 = message
-                            .round_tokens
-                            .iter()
-                            .map(|(prompt, _, _)| *prompt)
-                            .sum();
-                        done = Some(Answered {
-                            turn,
-                            tokens: message.tokens,
-                            context: message.context,
-                            calls,
-                            cache_hits: message.cache_hits,
-                            prompt_tokens,
-                            model_ms: message.model_ms,
-                            tool_ms: message.tool_ms,
-                            reasoning: thinking_text.clone(),
-                            reasoning_tokens: reasoning_total,
-                            web_searches,
-                            web_fetches,
-                        });
-                        chat.messages.push(message);
-                        settle_interactions(chat, "已失效");
-                        chat.touch();
+                        self.save_chats();
                     }
-                    self.pending.remove(slot);
-                    if let (Some(answered), Some((folder, title))) = (
-                        done,
-                        self.chats
-                            .get(chat_index)
-                            .map(|chat| (chat.dir.clone(), chat.title.clone())),
-                    ) {
-                        let at_ms = now_ms();
-                        // A line per request: the transcript keeps the totals and
-                        // the full text lives here, so the request can be opened
-                        // again later without bloating `chat.json`.
-                        let request = crate::chats::StoredRequest {
-                            turn: answered.turn,
-                            at_ms,
-                            model,
-                            tokens: answered.tokens,
-                            context: answered.context,
-                            calls: answered.calls,
-                            cache_hits: answered.cache_hits,
-                            prompt_tokens: answered.prompt_tokens,
-                            model_ms: answered.model_ms,
-                            tool_ms: answered.tool_ms,
-                            reasoning: answered.reasoning,
-                            reasoning_tokens: answered.reasoning_tokens,
-                            web_searches: answered.web_searches,
-                            web_fetches: answered.web_fetches,
-                            items: items
-                                .iter()
-                                .map(|item| crate::chats::StoredRequestItem {
-                                    kind: item.kind.key().to_string(),
-                                    label: item.label.clone(),
-                                    text: item.text.clone(),
-                                    tokens: item.tokens as u64,
-                                })
-                                .collect(),
-                        };
-                        if let Err(error) =
-                            crate::chats::append_request(&self.ai.data_dir(), &folder, &request)
-                        {
-                            self.banner = Some(Banner::error(error));
-                        }
-                        // The statistics page reads this independent ledger, so a
-                        // conversation deleted later no longer removes its figures.
-                        let record = super::stats::ledger_record(&folder, &title, &request);
-                        if let Err(error) =
-                            crate::stats_store::append(&crate::stats_store::ledger_dir(), &record)
-                        {
-                            self.banner = Some(Banner::error(error));
-                        } else {
-                            self.stats_generation = self.stats_generation.saturating_add(1);
-                        }
-                    }
-                    self.save_chats();
-                    // A connection made during this question writes its skill
-                    // files; refresh the page if it is the one on screen.
-                    if self.view == View::Mcp {
-                        self.refresh_mcp(cx);
-                    }
-                    // The turns this question pushed past the window are what
-                    // the last compaction layer condenses; it runs on a worker
-                    // thread, so the reader's next question is not held up.
-                    let _ = self.compact_history(chat_index, cx);
+                }
+                event @ AiEvent::Done { .. } => {
+                    self.finish_answer(slot, chat_index, event, cx);
                     break;
                 }
                 AiEvent::Failed(error) => {
@@ -1289,7 +1182,7 @@ impl DshFlowApp {
                             let request = {
                                 let retry = &self.pending[slot].retry;
                                 let selection = self.ai.mode_selection(&retry.mode);
-                                let allowed_list = mode_tools(&selection);
+                                let allowed_list = mode_tools_for(&selection, connection.vision);
                                 let plugins = selection.plugins.clone();
                                 let mcp_servers =
                                     crate::mcp::enabled_for(&self.ai, &selection.mcp_servers);
@@ -1313,12 +1206,14 @@ impl DshFlowApp {
                                     retry.max_rounds,
                                     retry.max_calls,
                                     retry.plan,
+                                    retry.tools,
                                     retry.web_search,
                                     &retry.attachments,
                                     plugin_dir.as_deref(),
                                     &plugins,
                                     &mcp_servers,
                                     Some(&self.mcp_dir),
+                                    &retry.skip_dirs,
                                 )
                             };
                             match request {
@@ -1401,6 +1296,59 @@ impl DshFlowApp {
                 }
             }
         }
+    }
+
+    /// Pictures the previous answer showed, ready to send with this question.
+    ///
+    /// Only files that a tool saved are considered, only files still inside the
+    /// conversation's own scope are read, and the total is capped: the same
+    /// picture rides on every round of the question, so two large files would
+    /// cost more than the context they are worth.
+    /// @param chat_index - the conversation being asked.
+    /// @param work_dir - its folder, which relative paths resolve from.
+    /// @param scope - the writable root, or `None` in full access.
+    /// @returns the attachments to send, newest last.
+    fn recent_image_attachments(
+        &self,
+        chat_index: usize,
+        work_dir: &Path,
+        scope: Option<&Path>,
+    ) -> Vec<crate::ai::AskAttachment> {
+        /// Most pictures carried into the next question.
+        const MAX_IMAGES: usize = 2;
+        /// Largest single file that is read.
+        const MAX_FILE: u64 = 3 * 1024 * 1024;
+        /// Total bytes the carried pictures may add up to.
+        const MAX_TOTAL: usize = 4 * 1024 * 1024;
+        let Some(chat) = self.chats.get(chat_index) else {
+            return Vec::new();
+        };
+        let mut out: Vec<crate::ai::AskAttachment> = Vec::new();
+        let mut total = 0usize;
+        for (mime, path) in recent_images(&chat.messages, MAX_IMAGES) {
+            let Some(target) = resolve_scoped(work_dir, scope, &path) else {
+                continue;
+            };
+            let Ok(info) = std::fs::metadata(&target) else {
+                continue;
+            };
+            if !info.is_file() || info.len() == 0 || info.len() > MAX_FILE {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&target) else {
+                continue;
+            };
+            if total + bytes.len() > MAX_TOTAL {
+                continue;
+            }
+            total += bytes.len();
+            let name = target
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "screenshot".to_string());
+            out.push(crate::ai::AskAttachment::new(&name, &mime, "image", &bytes));
+        }
+        out
     }
 
     /// Stop the answer to the conversation on screen.
@@ -1546,269 +1494,6 @@ impl DshFlowApp {
         self.save_chats();
         cx.notify();
     }
-
-    /// Allow or refuse the write whose card sits at `index`.
-    pub(crate) fn answer_approval(&mut self, index: usize, allow: bool, cx: &mut Context<Self>) {
-        let Some(dir) = self
-            .chats
-            .get(self.active_chat)
-            .map(|chat| chat.dir.clone())
-        else {
-            return;
-        };
-        let Some(message) = self
-            .chats
-            .get(self.active_chat)
-            .and_then(|chat| chat.messages.get(index))
-        else {
-            return;
-        };
-        if !matches!(message.role, Role::Approval) || !message.output.is_empty() {
-            return;
-        }
-        let call = message.call.clone();
-        if call.is_empty() {
-            return;
-        }
-        let Some(slot) = self.pending.iter().position(|pending| pending.dir == dir) else {
-            return;
-        };
-        if self.pending[slot].approval.as_deref() != Some(call.as_str()) {
-            return;
-        }
-        let delivered = self.pending[slot].request.respond(&call, allow);
-        self.pending[slot].approval = None;
-        if let Some(message) = self
-            .chats
-            .get_mut(self.active_chat)
-            .and_then(|chat| chat.messages.get_mut(index))
-        {
-            // A request that already ended cannot take the decision; claiming it
-            // was allowed would be a lie the engine never heard.
-            message.output = match (delivered, allow) {
-                (true, true) => "已允许",
-                (true, false) => "已拒绝",
-                (false, _) => "已失效",
-            }
-            .to_string();
-            // The decision folds the diff; the header brings it back.
-            message.open = false;
-        }
-        self.save_chats();
-        cx.notify();
-    }
-
-    /// Allow this command or snippet for the rest of the app run, then run it now.
-    ///
-    /// Only the exact text is remembered: a near miss (`npm test` vs
-    /// `npm test -- --watch`, or a one-character code change) still asks,
-    /// because the rule is meant to remove repetition, not to become a blanket
-    /// permission.
-    pub(crate) fn allow_session_call(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(message) = self
-            .chats
-            .get(self.active_chat)
-            .and_then(|chat| chat.messages.get(index))
-        else {
-            return;
-        };
-        if !matches!(message.role, Role::Approval)
-            || !allow_session_button(&message.tool, &message.input)
-        {
-            return;
-        }
-        let tool = message.tool.clone();
-        let command = command_from_approval(&message.input);
-        if command.is_empty() {
-            return;
-        }
-        if let Some(chat) = self.chats.get_mut(self.active_chat) {
-            chat.allow_session.insert(session_key(&tool, &command));
-        }
-        let note = if tool == "shell" {
-            format!("本次会话内将自动允许：{command}")
-        } else {
-            format!("本次会话内将自动允许这段 {tool} 代码")
-        };
-        self.show_toast(note, false, cx);
-        self.answer_approval(index, true, cx);
-    }
-
-    /// Roll back every undoable write made while answering `answer`.
-    ///
-    /// Newest first, because two writes to the same file must undo in reverse:
-    /// the first restore only matches while the file still holds the second
-    /// write's result. A file changed by someone else is left alone and named
-    /// in the note, exactly like a single-write undo.
-    pub(crate) fn undo_turn_writes(&mut self, answer: usize, cx: &mut Context<Self>) {
-        let work_dir = self.chat_dir(self.active_chat);
-        let scope = if self.chat().full_access {
-            None
-        } else {
-            Some(self.ai.workspace_dir())
-        };
-        let Some(chat) = self.chats.get_mut(self.active_chat) else {
-            return;
-        };
-        let writes = turn_writes(&chat.messages, answer);
-        if writes.is_empty() {
-            return;
-        }
-        let mut restored = 0usize;
-        let mut failed: Vec<String> = Vec::new();
-        for index in writes.into_iter().rev() {
-            let Some(message) = chat.messages.get(index) else {
-                continue;
-            };
-            let path = message.path.clone();
-            let before = message.before.clone();
-            let after = message.after.clone();
-            let existed = message.existed;
-            let Some(target) = resolve_scoped(&work_dir, scope.as_deref(), &path) else {
-                failed.push(format!("{path}：路径不合法"));
-                continue;
-            };
-            match restore_file(&target, &after, &before, existed) {
-                Ok(()) => {
-                    if let Some(message) = chat.messages.get_mut(index) {
-                        message.output = "已撤销".to_string();
-                        message.before.clear();
-                        message.after.clear();
-                        message.undoable = false;
-                    }
-                    restored += 1;
-                }
-                Err(error) => failed.push(format!("{path}：{error}")),
-            }
-        }
-        if restored > 0 {
-            chat.messages.push(ChatMessage::note(
-                format!("已撤销本轮 {restored} 次写入"),
-                false,
-            ));
-        }
-        if !failed.is_empty() {
-            chat.messages.push(ChatMessage::note(
-                format!("有 {} 个文件没有撤销：{}", failed.len(), failed.join("；")),
-                true,
-            ));
-        }
-        chat.touch();
-        self.save_chats();
-        cx.notify();
-    }
-
-    /// The next verified connection this question has not tried yet.
-    fn next_fallback(&self, slot: usize) -> Option<usize> {
-        let tried = &self.pending.get(slot)?.retry.tried;
-        self.ai.connections.iter().position(|connection| {
-            connection.verified && !tried.contains(&connection_key(connection))
-        })
-    }
-
-    /// Open one file an answer changed, inside the conversation's own scope.
-    ///
-    /// The path comes from the transcript, so it goes through the same scope
-    /// check an undo does: a saved write must not become a way to open anything.
-    pub(crate) fn open_changed_file(&mut self, path: &str, cx: &mut Context<Self>) {
-        let work_dir = self.chat_dir(self.active_chat);
-        let scope = if self.chat().full_access {
-            None
-        } else {
-            Some(self.ai.workspace_dir())
-        };
-        let Some(target) = resolve_scoped(&work_dir, scope.as_deref(), path) else {
-            self.banner = Some(Banner::error(format!("路径不合法：{path}")));
-            cx.notify();
-            return;
-        };
-        if let Err(error) = open_path(&target) {
-            self.banner = Some(Banner::error(format!(
-                "无法打开 {}：{error}",
-                target.display()
-            )));
-        }
-        cx.notify();
-    }
-
-    /// Put back the file a just-approved write replaced.
-    ///
-    /// Undo is refused when the file no longer holds what that write produced:
-    /// overwriting a later change would be worse than leaving the write in
-    /// place.
-    pub(crate) fn undo_write(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some((path, before, after, existed, undoable, state)) = self
-            .chats
-            .get(self.active_chat)
-            .and_then(|chat| chat.messages.get(index))
-            .map(|message| {
-                (
-                    message.path.clone(),
-                    message.before.clone(),
-                    message.after.clone(),
-                    message.existed,
-                    message.undoable,
-                    message.output.clone(),
-                )
-            })
-        else {
-            return;
-        };
-        if state != "已写入" || !undoable || path.is_empty() {
-            return;
-        }
-        let work_dir = self.chat_dir(self.active_chat);
-        let scope = if self.chat().full_access {
-            None
-        } else {
-            Some(self.ai.workspace_dir())
-        };
-        let Some(target) = resolve_scoped(&work_dir, scope.as_deref(), &path) else {
-            self.finish_undo(index, "无法撤销：路径不合法".to_string(), false, cx);
-            return;
-        };
-        match restore_file(&target, &after, &before, existed) {
-            Ok(()) => self.finish_undo(index, "已撤销".to_string(), true, cx),
-            Err(error) => self.finish_undo(index, error, false, cx),
-        }
-    }
-
-    /// Record how an undo ended, and leave a note when the file changed.
-    fn finish_undo(&mut self, index: usize, state: String, restored: bool, cx: &mut Context<Self>) {
-        let mut path = String::new();
-        if let Some(message) = self
-            .chats
-            .get_mut(self.active_chat)
-            .and_then(|chat| chat.messages.get_mut(index))
-        {
-            path = message.path.clone();
-            message.output = state;
-            if restored {
-                // Undo data is no longer needed and can be large.
-                message.before.clear();
-                message.after.clear();
-                message.undoable = false;
-            }
-        }
-        if restored && !path.is_empty() {
-            // The model is not told; the note is for the person reading.
-            if let Some(chat) = self.chats.get_mut(self.active_chat) {
-                chat.messages
-                    .push(ChatMessage::note(format!("已撤销 {path} 的写入"), false));
-            }
-        }
-        self.save_chats();
-        cx.notify();
-    }
-}
-
-/// Whether a failed turn may be replayed on another connection.
-///
-/// A turn that already streamed text or touched a tool is never replayed: the
-/// second attempt would duplicate what the reader already has, or run the same
-/// writes again.
-pub(crate) fn should_fallback(draft: &str, acted: bool, waiting: bool) -> bool {
-    draft.trim().is_empty() && !acted && !waiting
 }
 
 /// A stable identity for a connection, so one question never retries it twice.

@@ -23,10 +23,12 @@ mod engine;
 mod folder;
 mod foreground;
 mod json;
+mod logging;
 mod manifest;
 mod markdown;
 mod mcp;
-mod logging;
+mod memory;
+mod run_store;
 mod secrets;
 mod select_text;
 mod sidebar_store;
@@ -41,8 +43,7 @@ mod workflow_store;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Pixels, Size, TitlebarOptions, WindowBounds, WindowOptions, point,
-    px, size,
+    App, Bounds, Pixels, Size, TitlebarOptions, WindowBounds, WindowOptions, point, px, size,
 };
 
 /// The size the window asks for when the screen has room.
@@ -134,4 +135,7 @@ fn main() {
         });
     // The window is gone; no engine process should outlive it.
     ai::kill_children();
+    // The browser tool leaves its Chromium running so a page survives into the
+    // next question; that also means the window has to end it on the way out.
+    ai::kill_browsers();
 }

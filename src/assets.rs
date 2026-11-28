@@ -22,6 +22,8 @@ const PLUGINS: &[u8] = include_bytes!("../assets/icons/plugins.svg");
 const THEME: &[u8] = include_bytes!("../assets/icons/theme.svg");
 /// The product mark: a robot head, drawn at the left of the title bar.
 const APP: &[u8] = include_bytes!("../assets/icons/app.svg");
+/// The empty conversation's mark: a P in a soft frame.
+const LOGO: &[u8] = include_bytes!("../assets/icons/logo.svg");
 /// Stats: a list with a pen, the ledger the page reads.
 const STATS: &[u8] = include_bytes!("../assets/icons/stats.svg");
 /// MCP: a chain link, one half of a connection.
@@ -81,6 +83,7 @@ impl AssetSource for Assets {
             "icons/plugins.svg" => Some(Cow::Borrowed(PLUGINS)),
             "icons/theme.svg" => Some(Cow::Borrowed(THEME)),
             "icons/app.svg" => Some(Cow::Borrowed(APP)),
+            "icons/logo.svg" => Some(Cow::Borrowed(LOGO)),
             "icons/stats.svg" => Some(Cow::Borrowed(STATS)),
             "icons/mcp.svg" => Some(Cow::Borrowed(MCP)),
             "icons/skill.svg" => Some(Cow::Borrowed(SKILL)),
@@ -126,6 +129,7 @@ mod tests {
             "icons/plugins.svg",
             "icons/theme.svg",
             "icons/app.svg",
+            "icons/logo.svg",
             "icons/stats.svg",
             "icons/mcp.svg",
             "icons/skill.svg",

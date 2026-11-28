@@ -6,12 +6,13 @@ import type { ToolScope } from './types.ts'
 import { MAX_RESULTS, MAX_WALK_FILES } from './limits.ts'
 import { intArg } from './paths.ts'
 import { walk } from './walk.ts'
+import { isSensitivePath } from './secrets.ts'
 
 /** Where the index is cached, relative to the indexed root. */
 const CACHE_DIR = '.dsh-flow'
 const CACHE_FILE = 'index.json'
 /** Bump when the extraction rules or the shape below change. */
-const CACHE_VERSION = 3
+const CACHE_VERSION = 4
 /** How long a cache is trusted before it is rebuilt. */
 const CACHE_TTL_MS = 10 * 60_000
 /** Files larger than this are skipped: declarations in them are rare. */
@@ -41,6 +42,8 @@ interface IndexCache {
   root: string
   files: number
   truncated: boolean
+  /** Top-level folders the walk left out, so a different set rebuilds. */
+  skip: string[]
   /** Every indexed file, so reference search scans exactly the same set. */
   paths: string[]
   symbols: SymbolEntry[]
@@ -73,7 +76,8 @@ const LANGUAGES = new Map<string, 'rust' | 'ts' | 'py' | 'go'>([
 export async function indexSymbols(
   workDir: string,
   scopeRoot: ToolScope,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  skip: readonly string[] = []
 ): Promise<string> {
   const root = scopeRoot === null ? workDir : path.resolve(scopeRoot)
   const query = typeof args.query === 'string' ? args.query.trim() : ''
@@ -98,9 +102,11 @@ export async function indexSymbols(
   const refresh = args.refresh === true
   const limit = Math.min(Math.max(intArg(args, 'limit') ?? MAX_RESULTS, 1), MAX_RESULTS)
 
-  const loaded = refresh ? null : await loadCache(root)
-  const cache = loaded ?? (await buildIndex(root))
-  if (loaded === null) {
+  const loaded = refresh ? null : await loadCache(root, skip)
+  const cache = loaded ?? (await buildIndex(root, skip))
+  // A read-only sandbox cannot write the cache; the index still works for this
+  // call, and the next one rebuilds instead of breaking the tool.
+  if (loaded === null && process.env.DSH_SANDBOX_READONLY !== '1') {
     await saveCache(root, cache)
   }
 
@@ -173,6 +179,8 @@ async function findReferences(
   for (const relative of cache.paths) {
     if (total >= budget) break
     if (prefix !== '' && relative !== prefix && !relative.startsWith(`${prefix}/`)) continue
+    // A reference hit on a key file would print the secret just like `read`.
+    if (isSensitivePath(relative)) continue
     const text = await fs.readFile(path.join(root, relative), 'utf8').catch(() => null)
     if (text === null || text.includes('\u0000')) continue
     scanned += 1
@@ -218,13 +226,19 @@ function escapeRegExp(text: string): string {
 
 
 /** Read the cache when it is current for this root. */
-async function loadCache(root: string): Promise<IndexCache | null> {
+async function loadCache(root: string, skip: readonly string[] = []): Promise<IndexCache | null> {
   try {
     const file = path.join(root, CACHE_DIR, CACHE_FILE)
     const raw = await fs.readFile(file, 'utf8')
     const parsed = JSON.parse(raw) as IndexCache
     if (parsed.version !== CACHE_VERSION || parsed.root !== root) return null
     if (!Array.isArray(parsed.symbols) || !Array.isArray(parsed.paths)) return null
+    // A different sibling-folder list means a different set of files: the cached
+    // index would list another conversation's sources, so rebuild it.
+    const kept = Array.isArray(parsed.skip) ? parsed.skip : []
+    if (kept.length !== skip.length || kept.some((name, index) => name !== skip[index])) {
+      return null
+    }
     if (Date.now() - parsed.builtMs > CACHE_TTL_MS) return null
     return parsed
   } catch {
@@ -233,13 +247,15 @@ async function loadCache(root: string): Promise<IndexCache | null> {
 }
 
 /** Walk the root and extract every declaration the supported languages declare. */
-async function buildIndex(root: string): Promise<IndexCache> {
-  const found = await walk(root)
+async function buildIndex(root: string, skip: readonly string[] = []): Promise<IndexCache> {
+  const found = await walk(root, { skip })
   const symbols: SymbolEntry[] = []
   const paths: string[] = []
   let files = 0
   for (const relative of found.files) {
     if (symbols.length >= MAX_SYMBOLS) break
+    // Credentials are not source: indexing them would only risk echoing a value.
+    if (isSensitivePath(relative)) continue
     const language = LANGUAGES.get(path.extname(relative).toLowerCase())
     if (language === undefined) continue
     const target = path.join(root, relative)
@@ -257,9 +273,22 @@ async function buildIndex(root: string): Promise<IndexCache> {
     root,
     files,
     truncated: found.truncated,
+    skip: [...skip],
     paths,
     symbols: symbols.slice(0, MAX_SYMBOLS)
   }
+}
+
+/**
+ * Forget a cached index after a file the index covers has changed.
+ *
+ * The index is trusted for ten minutes, so without this a model that edits a
+ * file and asks `symbols` again would be handed the line numbers from before its
+ * own edit. Best effort: a read-only workspace simply rebuilds next time.
+ * @param root - the folder the index belongs to.
+ */
+export async function invalidateIndex(root: string): Promise<void> {
+  await fs.unlink(path.join(root, CACHE_DIR, CACHE_FILE)).catch(() => undefined)
 }
 
 /** Write the cache atomically; a read-only workspace just skips it. */
@@ -268,7 +297,10 @@ async function saveCache(root: string, cache: IndexCache): Promise<void> {
     const dir = path.join(root, CACHE_DIR)
     await fs.mkdir(dir, { recursive: true })
     const file = path.join(dir, CACHE_FILE)
-    const tmp = `${file}.tmp`
+    // A unique temporary name: two questions can build the index at the same
+    // time, and a shared `.tmp` would let one rename the other's half-written
+    // file into place.
+    const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
     await fs.writeFile(tmp, JSON.stringify(cache), 'utf8')
     await fs.rename(tmp, file)
   } catch {

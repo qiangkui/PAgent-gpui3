@@ -151,6 +151,9 @@ pub struct StoredRequest {
     pub reasoning: String,
     /// Estimated thinking tokens the question produced, summed over rounds.
     pub reasoning_tokens: u32,
+    /// Names of the tools the question called, in call order; empty for lines
+    /// written before the names were kept.
+    pub tool_names: Vec<String>,
     /// Every counted piece of the request, in the order it was sent.
     pub items: Vec<StoredRequestItem>,
 }
@@ -222,7 +225,10 @@ fn compact_requests(file: &Path) -> Result<(), String> {
             // A line that cannot be read back is not worth keeping.
             continue;
         };
-        let turn = value.get("turn").and_then(|turn| turn.as_u64()).unwrap_or(0);
+        let turn = value
+            .get("turn")
+            .and_then(|turn| turn.as_u64())
+            .unwrap_or(0);
         if turn > 0 {
             by_turn.insert(turn, value);
         }
@@ -244,8 +250,7 @@ fn compact_requests(file: &Path) -> Result<(), String> {
         kept.push_str(&value.to_string());
         kept.push('\n');
     }
-    crate::store::write_atomic(file, &kept)
-        .map_err(|error| format!("无法压缩请求明细：{error}"))
+    crate::store::write_atomic(file, &kept).map_err(|error| format!("无法压缩请求明细：{error}"))
 }
 
 /// Shorten the pieces of one older request, keeping what the panel sums.
@@ -344,6 +349,7 @@ fn request_value(request: &StoredRequest) -> serde_json::Value {
         "webFetches": request.web_fetches,
         "reasoning": request.reasoning,
         "reasoningTokens": request.reasoning_tokens,
+        "toolNames": request.tool_names,
         "items": request
             .items
             .iter()
@@ -406,10 +412,7 @@ fn stored_request(value: &serde_json::Value) -> StoredRequest {
             .get("promptTokens")
             .and_then(|tokens| tokens.as_u64())
             .unwrap_or(0),
-        model_ms: value
-            .get("modelMs")
-            .and_then(|ms| ms.as_u64())
-            .unwrap_or(0),
+        model_ms: value.get("modelMs").and_then(|ms| ms.as_u64()).unwrap_or(0),
         tool_ms: value.get("toolMs").and_then(|ms| ms.as_u64()).unwrap_or(0),
         web_searches: value
             .get("webSearches")
@@ -427,6 +430,19 @@ fn stored_request(value: &serde_json::Value) -> StoredRequest {
             .and_then(|tokens| tokens.as_u64())
             .unwrap_or(0)
             .min(u64::from(u32::MAX)) as u32,
+        // Names keep their call order, duplicates included: the ledger counts
+        // how often each tool was called, not which tools appeared.
+        tool_names: value
+            .get("toolNames")
+            .and_then(|names| names.as_array())
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(|name| name.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
         items,
     }
 }
@@ -505,6 +521,12 @@ pub struct StoredMessage {
     pub existed: bool,
     /// True when the saved pair can be restored.
     pub undoable: bool,
+    /// MIME type of the picture a tool row showed the model; empty otherwise.
+    pub image_mime: String,
+    /// File holding that picture, so the next question can show it again.
+    pub image_path: String,
+    /// Finished files a `show` row put in front of the reader; empty otherwise.
+    pub files: Vec<crate::ai::ToolFile>,
 }
 
 /// Treat the conversation folders already in `dir` as known.
@@ -561,12 +583,54 @@ pub fn load(dir: &Path) -> Vec<StoredChat> {
     saved
 }
 
+/// Longest tool argument or output kept inside `chat.json`.
+///
+/// The whole text still lives in `requests.jsonl`, which compacts itself; the
+/// transcript only needs enough for the expanded row to stay useful. Without a
+/// cap, a question full of big tool results made every load and save pay for text
+/// nobody re-reads.
+pub const STORED_TOOL_TEXT: usize = 8_000;
+
+/**
+ * Clip one stored tool text to {@link STORED_TOOL_TEXT}, saying it was cut.
+ *
+ * Counted in characters, not bytes: a Chinese tool result is three bytes a
+ * character, and cutting by bytes would leave a broken glyph in the file.
+ * @param text - the text the transcript was showing.
+ * @returns the text, or its head with a note naming the original length.
+ */
+pub fn clip_stored_text(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= STORED_TOOL_TEXT {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(STORED_TOOL_TEXT).collect();
+    format!("{kept}\n…（已截断，原文 {total} 字符；完整内容见请求明细）")
+}
+
 /// Write the conversations into a data directory, one folder each.
 ///
 /// Transcripts that did not change since the last write are left alone, and a
 /// folder whose conversation is gone is removed, so deleting a card also
 /// deletes its record.
 pub fn save(dir: &Path, chats: &[StoredChat]) -> Result<(), String> {
+    save_changed(dir, chats, None)
+}
+
+/// Write only the conversations named in `changed`, or all of them.
+///
+/// The window saves after every step of an answer, and serializing a long history
+/// for a step that touched one conversation is what made the interface stall. The
+/// caller tracks which conversations changed; the folder names still come from the
+/// whole list, because two conversations may resolve to the same folder name.
+/// @param dir - data directory holding `chats/`.
+/// @param chats - every conversation, in sidebar order.
+/// @param changed - directories to write, or `None` for all of them.
+pub fn save_changed(
+    dir: &Path,
+    chats: &[StoredChat],
+    changed: Option<&std::collections::BTreeSet<String>>,
+) -> Result<(), String> {
     let root = dir.join(FOLDER);
     std::fs::create_dir_all(&root)
         .map_err(|error| format!("无法创建 {}：{error}", root.display()))?;
@@ -577,8 +641,14 @@ pub fn save(dir: &Path, chats: &[StoredChat]) -> Result<(), String> {
         let folder = root.join(&name);
         std::fs::create_dir_all(&folder)
             .map_err(|error| format!("无法创建 {}：{error}", folder.display()))?;
-        let body = chat_value(chat).to_string();
-        store::write_if_changed(&folder.join(TRANSCRIPT), &body)?;
+        let wanted = match changed {
+            None => true,
+            Some(set) => set.contains(&chat.dir),
+        };
+        if wanted {
+            let body = chat_value(chat).to_string();
+            store::write_if_changed(&folder.join(TRANSCRIPT), &body)?;
+        }
         names.push(name);
     }
     let index = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string());
@@ -748,9 +818,7 @@ fn read_chat(value: &serde_json::Value) -> Option<StoredChat> {
                 mode
             }
         },
-        web_search: value
-            .get("webSearch")
-            .and_then(|flag| flag.as_bool()),
+        web_search: value.get("webSearch").and_then(|flag| flag.as_bool()),
         plan: value
             .get("plan")
             .and_then(|flag| flag.as_bool())
@@ -888,9 +956,7 @@ fn read_message(value: &serde_json::Value) -> Option<StoredMessage> {
             .map(|items| {
                 items
                     .iter()
-                    .map(|count| {
-                        count.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32
-                    })
+                    .map(|count| count.as_u64().unwrap_or(0).min(u64::from(u32::MAX)) as u32)
                     .collect()
             })
             .unwrap_or_default(),
@@ -947,6 +1013,13 @@ fn read_message(value: &serde_json::Value) -> Option<StoredMessage> {
             .get("undoable")
             .and_then(|flag| flag.as_bool())
             .unwrap_or(false),
+        image_mime: text_of(value.get("imageMime")),
+        image_path: text_of(value.get("imagePath")),
+        files: value
+            .get("files")
+            .and_then(|files| files.as_array())
+            .map(|items| items.iter().filter_map(crate::ai::step_file).collect())
+            .unwrap_or_default(),
     })
 }
 
@@ -1004,6 +1077,17 @@ fn chat_value(chat: &StoredChat) -> serde_json::Value {
                 "open": message.open,
                 "call": message.call,
                 "path": message.path,
+                "imageMime": message.image_mime,
+                "imagePath": message.image_path,
+                "files": message
+                    .files
+                    .iter()
+                    .map(|file| serde_json::json!({
+                        "name": file.name,
+                        "path": file.path,
+                        "bytes": file.bytes,
+                    }))
+                    .collect::<Vec<_>>(),
                 "before": message.before,
                 "after": message.after,
                 "existed": message.existed,
@@ -1128,6 +1212,9 @@ mod tests {
             after: String::new(),
             existed: false,
             undoable: false,
+            image_mime: String::new(),
+            image_path: String::new(),
+            files: Vec::new(),
         }
     }
 
@@ -1153,8 +1240,8 @@ mod tests {
             max_calls: crate::config::MAX_CALLS_CHOICE,
             mode: crate::config::MODE_FULL.to_string(),
             web_search: None,
-        plan: false,
-        todos: Vec::new(),
+            plan: false,
+            todos: Vec::new(),
         }
     }
 
@@ -1165,6 +1252,7 @@ mod tests {
         };
         let dir = temp_dir("requests");
         let first = StoredRequest {
+            tool_names: Vec::new(),
             turn: 1,
             at_ms: 1_760_000_000_000,
             model: "deepseek-chat".to_string(),
@@ -1218,6 +1306,7 @@ mod tests {
 
         // A second request appends a line instead of rewriting the first.
         let mut second = StoredRequest {
+            tool_names: Vec::new(),
             turn: 2,
             at_ms: 1_760_000_100_000,
             model: "deepseek-chat".to_string(),
@@ -1273,6 +1362,7 @@ mod tests {
         let mut lines = String::new();
         for turn in 1..=(MAX_REQUEST_TURNS as u64 + 20) {
             let request = StoredRequest {
+                tool_names: Vec::new(),
                 turn,
                 at_ms: 1_760_000_000_000 + turn,
                 model: "m".to_string(),
@@ -1393,6 +1483,13 @@ mod tests {
                     tool.after = "new".to_string();
                     tool.existed = true;
                     tool.undoable = true;
+                    tool.image_mime = "image/png".to_string();
+                    tool.image_path = "C:\\shots\\a.png".to_string();
+                    tool.files = vec![crate::ai::ToolFile {
+                        name: "报告.docx".to_string(),
+                        path: "C:\\work\\报告.docx".to_string(),
+                        bytes: 24_576,
+                    }];
                     tool
                 },
                 answer,
@@ -1491,6 +1588,20 @@ mod tests {
         assert!(restored.messages[1].open);
         assert_eq!(restored.messages[1].call, "call-1");
         assert_eq!(restored.messages[1].path, "a.txt");
+        // The picture a tool showed travels with the row, which is what lets a
+        // follow-up put the same screenshot in front of the model again.
+        assert_eq!(restored.messages[1].image_mime, "image/png");
+        assert_eq!(restored.messages[1].image_path, "C:\\shots\\a.png");
+        // The files a `show` row handed over come back too: a reopened conversation
+        // still opens them, which is what the cards are for.
+        assert_eq!(
+            restored.messages[1].files,
+            vec![crate::ai::ToolFile {
+                name: "报告.docx".to_string(),
+                path: "C:\\work\\报告.docx".to_string(),
+                bytes: 24_576,
+            }]
+        );
         assert_eq!(restored.messages[1].before, "old");
         assert_eq!(restored.messages[1].after, "new");
         assert!(restored.messages[1].existed);
@@ -1591,8 +1702,8 @@ mod tests {
             max_calls: crate::config::MAX_CALLS_CHOICE,
             mode: crate::config::MODE_FULL.to_string(),
             web_search: None,
-        plan: false,
-        todos: Vec::new(),
+            plan: false,
+            todos: Vec::new(),
         };
         save_to(&file, std::slice::from_ref(&chat)).unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
@@ -1745,7 +1856,10 @@ mod tests {
         let broken_known = store::known(&broken.join(TRANSCRIPT));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(good_known, "a readable transcript counts as known");
-        assert!(!broken_known, "a broken one must not be treated as an orphan");
+        assert!(
+            !broken_known,
+            "a broken one must not be treated as an orphan"
+        );
     }
 
     #[test]
@@ -1773,6 +1887,44 @@ mod tests {
         assert_eq!(loaded[0].todos.len(), 2);
         assert_eq!(loaded[0].todos[1].text, "改实现");
         assert_eq!(loaded[0].todos[1].status, "in_progress");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tool_text_is_clipped_before_it_reaches_the_transcript() {
+        assert_eq!(clip_stored_text("short"), "short");
+        let long = "字".repeat(STORED_TOOL_TEXT + 5);
+        let clipped = clip_stored_text(&long);
+        assert!(clipped.starts_with(&"字".repeat(STORED_TOOL_TEXT)));
+        assert!(clipped.ends_with("完整内容见请求明细）"), "{clipped}");
+        assert!(clipped.contains(&format!("原文 {}", STORED_TOOL_TEXT + 5)));
+        assert!(
+            clipped.chars().count() < STORED_TOOL_TEXT + 80,
+            "the note stays short: {}",
+            clipped.chars().count()
+        );
+    }
+
+    #[test]
+    fn only_the_changed_conversations_are_written() {
+        let dir = temp_dir("changed");
+        save(&dir, &[named("chat-1", "一"), named("chat-2", "二")]).unwrap();
+
+        // Both conversations have a new title in memory; only chat-1 is written.
+        let first = named("chat-1", "新标题");
+        let second = named("chat-2", "不该写进去");
+        let changed: std::collections::BTreeSet<String> =
+            ["chat-1".to_string()].into_iter().collect();
+        save_changed(&dir, &[first, second], Some(&changed)).unwrap();
+
+        let loaded = load(&dir);
+        let titles: Vec<&str> = loaded.iter().map(|chat| chat.title.as_str()).collect();
+        assert!(titles.contains(&"新标题"), "{titles:?}");
+        assert!(
+            titles.contains(&"二"),
+            "the unchanged chat kept its file: {titles:?}"
+        );
+        assert!(!titles.contains(&"不该写进去"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

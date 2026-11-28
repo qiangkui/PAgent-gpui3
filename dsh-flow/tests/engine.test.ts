@@ -41,6 +41,95 @@ async function run(manifest: string, inputs: Record<string, string> = {}): Promi
   return runWorkflow({ loaded: loadWorkflow(`${dir}/flow.yml`), inputs, log: () => {} })
 }
 
+test('runs another manifest as a sub-flow and reads its vars', async () => {
+  const child = `name: child
+description: d
+version: 1
+inputs:
+  who:
+    required: true
+  times:
+    default: 2
+vars:
+  greeting: hello
+steps:
+  - id: line
+    set:
+      line: "{{ inputs.who }} x {{ inputs.times }}"
+`
+  const parent = `name: parent
+description: d
+version: 1
+inputs:
+  who:
+    default: world
+steps:
+  - id: sub
+    use:
+      manifest: child.yml
+      inputs:
+        who: "{{ inputs.who }}"
+    save: sub
+  - id: after
+    set:
+      line: "{{ vars.sub.greeting }} / {{ vars.sub.line }}"
+`
+  const dir = makeProject({ 'flow.yml': parent, 'child.yml': child })
+  const summary = await runWorkflow({
+    loaded: loadWorkflow(`${dir}/flow.yml`),
+    inputs: { who: 'world' },
+    log: () => {}
+  })
+  assert.equal(summary.status, 'ok', summary.error)
+  assert.equal(summary.steps.sub?.kind, 'use')
+  assert.deepEqual(summary.steps.sub?.json, { greeting: 'hello', line: 'world x 2' })
+  assert.equal(summary.vars.line, 'hello / world x 2')
+})
+
+test('fails the parent when the sub-flow fails', async () => {
+  const child = `name: child
+description: d
+version: 1
+steps:
+  - id: boom
+    run: [node, -e, "process.exit(3)"]
+`
+  const parent = `name: parent
+description: d
+version: 1
+steps:
+  - id: sub
+    use: child.yml
+`
+  const dir = makeProject({ 'flow.yml': parent, 'child.yml': child })
+  const summary = await runWorkflow({
+    loaded: loadWorkflow(`${dir}/flow.yml`),
+    inputs: {},
+    log: () => {}
+  })
+  assert.equal(summary.status, 'failed')
+  assert.equal(summary.steps.sub?.kind, 'use')
+  assert.match(String(summary.steps.sub?.error), /sub-flow child failed/)
+})
+
+test('refuses a sub-flow that calls itself', async () => {
+  const loop = `name: loop
+description: d
+version: 1
+steps:
+  - id: again
+    use: flow.yml
+`
+  const dir = makeProject({ 'flow.yml': loop })
+  const summary = await runWorkflow({
+    loaded: loadWorkflow(`${dir}/flow.yml`),
+    inputs: {},
+    log: () => {}
+  })
+  assert.equal(summary.status, 'failed')
+  assert.match(String(summary.error), /sub-flow cycle/)
+})
+
 test('passes context on stdin and saves the JSON reply into vars', async () => {
   const summary = await run(`name: t
 description: d

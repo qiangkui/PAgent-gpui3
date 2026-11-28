@@ -29,7 +29,39 @@ test('rejects a step without exactly one executor', () => {
   const dir = makeProject({
     'flow.yml': 'name: t\ndescription: d\nsteps:\n  - id: a\n    run: [node, -e, "0"]\n    set:\n      x: 1\n',
   })
-  assert.throws(() => loadWorkflow(`${dir}/flow.yml`), /may only use one of "run", "set", "map", or "ai"/)
+  assert.throws(() => loadWorkflow(`${dir}/flow.yml`), /may only use one of/)
+})
+
+test('accepts a sub-flow as a path or as a mapping', () => {
+  const dir = makeProject({
+    'child.yml': 'name: c\ndescription: d\nsteps:\n  - id: a\n    set:\n      x: 1\n',
+    'short.yml':
+      'name: p\ndescription: d\nsteps:\n  - id: a\n    use: child.yml\n',
+    'full.yml':
+      'name: p\ndescription: d\nsteps:\n  - id: a\n    use:\n      manifest: child.yml\n      inputs:\n        who: "{{ inputs.who }}"\n',
+  })
+  const short = loadWorkflow(`${dir}/short.yml`)
+  assert.equal(short.workflow.steps[0]?.use?.manifest, 'child.yml')
+  const full = loadWorkflow(`${dir}/full.yml`)
+  assert.deepEqual(full.workflow.steps[0]?.use?.inputs, { who: '{{ inputs.who }}' })
+})
+
+test('rejects a sub-flow that is not on disk', () => {
+  const dir = makeProject({
+    'flow.yml': 'name: p\ndescription: d\nsteps:\n  - id: a\n    use: missing.yml\n',
+  })
+  assert.throws(() => loadWorkflow(`${dir}/flow.yml`), /does not exist/)
+})
+
+test('rejects a "use" without a manifest and a mixed executor', () => {
+  const dir = makeProject({
+    'child.yml': 'name: c\ndescription: d\nsteps:\n  - id: a\n    set:\n      x: 1\n',
+    'empty.yml': 'name: p\ndescription: d\nsteps:\n  - id: a\n    use:\n      inputs:\n        x: 1\n',
+    'mixed.yml':
+      'name: p\ndescription: d\nsteps:\n  - id: a\n    use: child.yml\n    run: [node, -e, "0"]\n',
+  })
+  assert.throws(() => loadWorkflow(`${dir}/empty.yml`), /use.manifest. is required/)
+  assert.throws(() => loadWorkflow(`${dir}/mixed.yml`), /may only use one of/)
 })
 
 test('rejects an unsupported version', () => {

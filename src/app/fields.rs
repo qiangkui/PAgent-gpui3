@@ -179,22 +179,49 @@ impl DshFlowApp {
     /// What the caret painter needs: the text as drawn, the caret offset in it, and
     /// the colour of the bar.
     ///
-    /// A key field draws dots, so the offset is measured in that string instead.
+    /// A hidden value draws one dot per character, so the offset is measured in
+    /// that string instead. The dot is wider than most characters, which is why
+    /// the caret maths must never see the plaintext.
     pub(crate) fn field_caret(&self, slot: Field) -> Option<(String, usize, Hsla)> {
         let field = self.field(slot)?;
-        let masked = matches!(slot, Field::ConnKey(_)) && !field.text.is_empty();
+        let masked = self.field_masked(slot);
         let text = if masked {
-            "\u{2022}".repeat(field.text.chars().count())
+            masked_text(&field.text)
         } else {
             field.text.clone()
         };
         let caret = if masked {
-            text.len()
+            masked_caret(&field.text, field.caret_byte())
         } else {
             field.caret_byte().min(text.len())
         };
         let colour: Hsla = rgb(self.palette().accent).into();
         Some((text, caret, colour))
+    }
+
+    /// True when a field's value is drawn as dots at this moment.
+    ///
+    /// Endpoint keys are always hidden once they hold something; a workflow's
+    /// secret inputs are hidden too, except while their "按住显示" button is
+    /// held. Nothing else in the window is masked: a path or a region has to be
+    /// readable to be checked.
+    pub(crate) fn field_masked(&self, slot: Field) -> bool {
+        let Some(field) = self.field(slot) else {
+            return false;
+        };
+        if field.text.is_empty() {
+            return false;
+        }
+        match slot {
+            Field::ConnKey(_) => true,
+            Field::Input(index) => {
+                self.inputs
+                    .get(index)
+                    .is_some_and(|input| input.spec.secret)
+                    && self.revealed_input != Some(index)
+            }
+            _ => false,
+        }
     }
 
     /// The text field for a slot, for reading.
@@ -206,6 +233,7 @@ impl DshFlowApp {
             Field::ConnKey(index) => self.conn_fields.get(index).map(|fields| &fields.api_key),
             Field::ConnUrl(index) => self.conn_fields.get(index).map(|fields| &fields.base_url),
             Field::ChatFilter => Some(&self.chat_filter),
+            Field::ToolFilter => Some(&self.tool_filter),
             Field::ChatFind => Some(&self.chat_find),
             Field::ChatTitle => self.renaming.as_ref().map(|(_, field)| field),
             Field::NewCategory => self.new_category.as_ref(),
@@ -213,6 +241,7 @@ impl DshFlowApp {
             Field::ChatInstructions => Some(&self.instructions),
             Field::ColorHex(index) => self.color_fields.get(index),
             Field::Proxy => Some(&self.proxy_field),
+            Field::ReviewAllow => Some(&self.review_allow_field),
             Field::ModeName => Some(&self.mode_name),
         }
     }
@@ -235,6 +264,7 @@ impl DshFlowApp {
                 .get_mut(index)
                 .map(|fields| &mut fields.base_url),
             Field::ChatFilter => Some(&mut self.chat_filter),
+            Field::ToolFilter => Some(&mut self.tool_filter),
             Field::ChatFind => Some(&mut self.chat_find),
             Field::ChatTitle => self.renaming.as_mut().map(|(_, field)| field),
             Field::NewCategory => self.new_category.as_mut(),
@@ -242,6 +272,7 @@ impl DshFlowApp {
             Field::ChatInstructions => Some(&mut self.instructions),
             Field::ColorHex(index) => self.color_fields.get_mut(index),
             Field::Proxy => Some(&mut self.proxy_field),
+            Field::ReviewAllow => Some(&mut self.review_allow_field),
             Field::ModeName => Some(&mut self.mode_name),
         }
     }
@@ -268,6 +299,11 @@ impl DshFlowApp {
         cx: &mut Context<Self>,
     ) {
         self.caret_on = true;
+        // Typing into a secret field means the reader is editing, not just
+        // holding the "显示" button; the value goes back behind dots.
+        if matches!(slot, Field::Input(_)) {
+            self.revealed_input = None;
+        }
         // An empty composer turns the arrows into history: everything else
         // (typing, deleting, Enter) ends a recall, so the next arrow moves the
         // caret again instead of replacing typed text.
@@ -281,6 +317,18 @@ impl DshFlowApp {
             }
             if plain && event.keystroke.key == "down" && self.recall_question(false, cx) {
                 cx.stop_propagation();
+                return;
+            }
+            // `/固化为工作流` is one token: Backspace at its end removes the
+            // whole command instead of eating one character.
+            if plain
+                && event.keystroke.key == "backspace"
+                && self.composer.text.trim() == super::distill::WORKFLOW_COMMAND
+            {
+                self.composer.clear();
+                self.composer_recall = None;
+                cx.stop_propagation();
+                cx.notify();
                 return;
             }
             self.composer_recall = None;
@@ -365,6 +413,8 @@ impl DshFlowApp {
                 // brings the whole list back; in a title it drops the edit.
                 if slot == Field::ChatFilter {
                     self.chat_filter.clear();
+                } else if slot == Field::ToolFilter {
+                    self.tool_filter.clear();
                 } else if slot == Field::ChatFind {
                     self.chat_find.clear();
                     self.chat_find_open = false;
@@ -416,13 +466,6 @@ impl DshFlowApp {
                 if self.view == View::Flow {
                     self.start_run(cx);
                     cx.stop_propagation();
-                }
-            }
-            "l" if control => {
-                if self.view == View::Flow {
-                    self.clear_log();
-                    cx.stop_propagation();
-                    cx.notify();
                 }
             }
             "pageup" => {
@@ -564,6 +607,9 @@ impl DshFlowApp {
                 MouseButton::Left,
                 cx.listener(move |view, event: &gpui::MouseDownEvent, window, cx| {
                     view.focused = Some(slot);
+                    // Any press on a field is a new interaction; a value revealed
+                    // by holding the other button goes back behind dots.
+                    view.revealed_input = None;
                     if let Some(field) = view.field(slot) {
                         window.focus(&field.focus_handle().clone(), cx);
                     }
@@ -635,14 +681,16 @@ impl DshFlowApp {
                 view.handle_field_key(slot, event, window, cx);
             }));
 
-        if matches!(slot, Field::ConnKey(_)) && !field.text.is_empty() {
-            // The key is drawn as dots: the caret position is not shown, but the
-            // field still edits like any other.
+        if self.field_masked(slot) {
+            // A secret value is drawn as dots: one per character, so a long
+            // password does not give away its length only to reveal nothing.
+            // The field still edits like any other; the caret is painted over
+            // this line from the masked string (see `field_caret`).
             row = row.child(
                 div()
                     .text_sm()
                     .text_color(rgb(palette.text))
-                    .child("•".repeat(field.text.chars().count())),
+                    .child(masked_text(&field.text)),
             );
         } else if field.text.is_empty() {
             // The search row's hint doubles as its own label: it is drawn in the
@@ -650,7 +698,8 @@ impl DshFlowApp {
             // focused, empty search shows only the caret). Other rows — naming a
             // new category, for one — keep their hint while focused.
             let row_chrome = chrome == FieldChrome::Row;
-            let hint_hidden = row_chrome && focused && slot == Field::ChatFilter;
+            let hint_hidden =
+                row_chrome && focused && matches!(slot, Field::ChatFilter | Field::ToolFilter);
             if !hint_hidden {
                 row = row.child(
                     div()
@@ -916,9 +965,17 @@ impl DshFlowApp {
             .map(|(_, bounds)| *bounds)?;
         let field = self.field(slot)?;
 
+        // A hidden value is measured as the dots actually on screen, then the
+        // index is mapped back to the character it stands for.
+        let masked = self.field_masked(slot);
+        let shown = if masked {
+            masked_text(&field.text)
+        } else {
+            field.text.clone()
+        };
         let wraps = field_wraps(slot);
         let width = (bounds.size.width - slot.pad() * 2.).max(px(0.));
-        let rows = field_rows(window.text_system(), &field.text, width, wraps);
+        let rows = field_rows(window.text_system(), &shown, width, wraps);
         let offset = f32::from(position.y - bounds.top());
         let row = field_row_at(
             offset,
@@ -927,7 +984,7 @@ impl DshFlowApp {
             field_multiline(slot),
         );
         let range = rows.get(row).cloned().unwrap_or(0..0);
-        let line = &field.text[range.clone()];
+        let line = &shown[range.clone()];
 
         let shaped = window.text_system().shape_line(
             line.to_string().into(),
@@ -939,7 +996,12 @@ impl DshFlowApp {
         // be scrolled left to keep a long line's caret in view.
         let scroll = if wraps { 0. } else { field.scroll() };
         let x = (position.x - bounds.left() - slot.pad() + px(scroll)).max(px(0.));
-        Some(range.start + shaped.closest_index_for_x(x))
+        let index = range.start + shaped.closest_index_for_x(x);
+        Some(if masked {
+            masked_index(&field.text, index)
+        } else {
+            index
+        })
     }
 }
 
@@ -1062,8 +1124,7 @@ impl Element for FieldElement {
                 let text_top = field_text_top(top, rows.len(), field_multiline(self.slot));
                 let origin = point(
                     bounds.left() + pad + x,
-                    bounds.top()
-                        + px(text_top + COMPOSER_LINE_HEIGHT * row as f32 + CARET_INSET_Y),
+                    bounds.top() + px(text_top + COMPOSER_LINE_HEIGHT * row as f32 + CARET_INSET_Y),
                 );
                 window.paint_quad(PaintQuad {
                     bounds: Bounds::new(origin, size(px(1.), px(14.))),
@@ -1083,6 +1144,32 @@ impl Element for FieldElement {
     }
 }
 
+/// The dots a hidden value is drawn as: one per character.
+///
+/// Counting characters rather than bytes keeps a password's on-screen length
+/// tied to what was typed, and a CJK or emoji password does not show up as a
+/// longer row than it is.
+pub(crate) fn masked_text(text: &str) -> String {
+    "\u{2022}".repeat(text.chars().count())
+}
+
+/// Where the caret sits in [`masked_text`], from its offset in the real text.
+pub(crate) fn masked_caret(text: &str, caret: usize) -> usize {
+    let characters = text[..caret.min(text.len())].chars().count();
+    characters * '\u{2022}'.len_utf8()
+}
+
+/// The real byte offset a caret position in [`masked_text`] stands for.
+///
+/// The masked string is measured on screen, so a click lands on a dot; this
+/// turns that dot back into the character it hides.
+pub(crate) fn masked_index(text: &str, masked: usize) -> usize {
+    let characters = masked / '\u{2022}'.len_utf8();
+    text.char_indices()
+        .nth(characters)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
 /// The text caret.
 /// Stable element id per field slot.
 ///
@@ -1096,6 +1183,7 @@ pub(crate) fn field_slot(slot: Field) -> usize {
         Field::ConnKey(index) => 2001 + index * 3,
         Field::ConnUrl(index) => 2002 + index * 3,
         Field::ChatFilter => 3000,
+        Field::ToolFilter => 3002,
         Field::ChatFind => 3001,
         Field::ChatTitle => 4000,
         Field::NewCategory => 5000,
@@ -1103,6 +1191,7 @@ pub(crate) fn field_slot(slot: Field) -> usize {
         Field::ChatInstructions => 6000,
         Field::ColorHex(index) => 7000 + index,
         Field::Proxy => 8000,
+        Field::ReviewAllow => 8002,
         Field::ModeName => 8001,
     }
 }

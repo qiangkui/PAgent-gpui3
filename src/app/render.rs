@@ -54,6 +54,17 @@ impl Render for DshFlowApp {
         let pane = px(f32::from(viewport.width) - self.sidebar_width - SPLITTER_WIDTH);
         self.answer_width = answer_text_width(pane);
         self.chat_gutter = transcript_pad(pane);
+        // The workflow page divides its content between the run transcript and the
+        // board of step cards. Both widths are measured here, every frame, so
+        // markdown wrapping and the number of input fields per row follow the
+        // window instead of a fixed guess.
+        let content = f32::from(pane);
+        let transcript = (content * FLOW_TRANSCRIPT_SHARE).max(0.);
+        self.transcript_width = (transcript - FLOW_TRANSCRIPT_PAD).max(0.);
+        self.board_width = (content - transcript).max(0.);
+        // What is left inside one board card: the board's `px_4` on both sides,
+        // the card's `px_3` on both sides and its 1px border.
+        self.flow_input_width = (self.board_width - 32. - 26.).max(0.);
         let mut root = div()
             .relative()
             .flex()
@@ -96,6 +107,11 @@ impl Render for DshFlowApp {
                 MouseButton::Left,
                 cx.listener(|view, _, window, cx| {
                     let mut changed = false;
+                    // A secret shown by holding its button is only shown for that
+                    // press; anything that reaches the background ends it.
+                    if view.revealed_input.take().is_some() {
+                        changed = true;
+                    }
                     if view.focused.is_some() {
                         view.leave_fields(window, cx);
                         changed = true;

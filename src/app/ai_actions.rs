@@ -81,6 +81,22 @@ impl DshFlowApp {
         cx.notify();
     }
 
+    /// Say whether this endpoint accepts images.
+    ///
+    /// A text-only model rejects an `image_url` part outright, so turning this off
+    /// keeps `read_image` / `screenshot` out of the request instead of letting a
+    /// call turn into a failed answer. It rides along like the other per-connection
+    /// settings, so it does not invalidate the proven endpoint.
+    pub(crate) fn set_connection_vision(&mut self, index: usize, on: bool, cx: &mut Context<Self>) {
+        if let Some(connection) = self.ai.connections.get_mut(index) {
+            connection.vision = on;
+        }
+        if let Err(error) = self.ai.save() {
+            self.banner = Some(Banner::error(error));
+        }
+        cx.notify();
+    }
+
     /// Editing a field invalidates an earlier test: the model has to be proven
     /// again before it shows up in the picker.
     pub(crate) fn sync_connections(&mut self) {
@@ -103,6 +119,7 @@ impl DshFlowApp {
                 reasoning: connection.reasoning,
                 max_tokens: connection.max_tokens,
                 window: connection.window,
+                vision: connection.vision,
             }
             .normalized();
             if edited.model != connection.model
@@ -293,6 +310,30 @@ impl DshFlowApp {
             }
             return;
         }
+        if slot == Field::ReviewAllow {
+            // One line of text, one entry per comma (either width) or semicolon.
+            let raw = self.review_allow_field.text.clone();
+            let mut entries: Vec<String> = Vec::new();
+            for piece in raw.split([';', ',', '；', '，']) {
+                let Some(prefix) = crate::config::review_prefix(piece) else {
+                    continue;
+                };
+                if entries.iter().any(|seen| seen == &prefix) {
+                    continue;
+                }
+                entries.push(prefix);
+                if entries.len() >= crate::config::MAX_REVIEW_PREFIXES {
+                    break;
+                }
+            }
+            if entries != self.ai.review_allow {
+                self.ai.review_allow = entries;
+                self.ai_status = Some(("正在保存…".to_string(), false));
+                self.schedule_settings_save(cx);
+                cx.notify();
+            }
+            return;
+        }
         if !matches!(
             slot,
             Field::ConnModel(_) | Field::ConnKey(_) | Field::ConnUrl(_)
@@ -418,6 +459,7 @@ impl DshFlowApp {
             crate::config::DEFAULT_MAX_ROUNDS,
             crate::config::DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             // A connectivity test never carries plugins: it is about the key.
@@ -425,6 +467,8 @@ impl DshFlowApp {
             &[],
             &[],
             None,
+            // A connectivity test searches nothing, so there is nothing to skip.
+            &[],
         ) {
             Ok(request) => {
                 status(self, format!("测试中 · {}", connection.model), false);
@@ -501,7 +545,8 @@ impl DshFlowApp {
                 | AiEvent::Approval { .. }
                 | AiEvent::Question { .. }
                 | AiEvent::Plan { .. }
-                | AiEvent::Todo { .. } => continue,
+                | AiEvent::Todo { .. }
+                | AiEvent::Memory { .. } => continue,
                 // Fragments only matter while an answer is being written; a
                 // test keeps the finished text from `Done`.
                 AiEvent::Delta(_) => continue,

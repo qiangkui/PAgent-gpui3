@@ -161,6 +161,38 @@ impl DshFlowApp {
                                     cx,
                                 )),
                             ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(palette.text))
+                                            .child("自动审查允许的命令"),
+                                    )
+                                    .child(help_icon(
+                                        "help-review-allow",
+                                        "自动审查下，这些命令不必逐次确认。按前缀匹配整行（「npm test」也允许「npm test --watch」），含 && / | / > 等串联的仍然会问。只填你信任其全部参数的命令，例如「npm test, pytest」；留空只用内置规则。",
+                                        palette,
+                                    )),
+                            )
+                            .child(
+                                div().w(px(340.)).child(self.render_field(
+                                    Field::ReviewAllow,
+                                    "npm test, npm run build（留空只用内置规则）",
+                                    palette,
+                                    cx,
+                                )),
+                            ),
                     ),
             )
     }
@@ -348,6 +380,41 @@ impl DshFlowApp {
                                     .child(connection.provider_label()),
                             )
                             .child(status_chip(badge, badge_color, palette))
+                            .child(
+                                div()
+                                    .id(("conn-vision", index))
+                                    .px_2()
+                                    .py(px(1.))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(rgb(if connection.vision {
+                                        palette.border
+                                    } else {
+                                        palette.warn
+                                    }))
+                                    .text_xs()
+                                    .text_color(rgb(if connection.vision {
+                                        palette.muted
+                                    } else {
+                                        palette.warn
+                                    }))
+                                    .cursor_pointer()
+                                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        let on = !view
+                                            .ai
+                                            .connections
+                                            .get(index)
+                                            .is_some_and(|entry| entry.vision);
+                                        view.set_connection_vision(index, on, cx);
+                                    }))
+                                    .child(if connection.vision { "图片：开" } else { "图片：关" }),
+                            )
+                            .child(help_icon(
+                                "help-vision",
+                                "这个接入点是否接受图片。关掉后请求里不再声明 read_image / screenshot（纯文本模型收到图片会被拒绝）；默认开启。",
+                                palette,
+                            ))
                             .when(selected, |this| {
                                 this.child(status_chip("使用中", palette.accent, palette))
                             }),

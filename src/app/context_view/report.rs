@@ -276,22 +276,54 @@ pub(crate) fn output_item(text: &str) -> Option<RequestItem> {
     })
 }
 
-/// Add the tool schemas a run actually sent, when the request was recorded
-/// before the engine reported them.
+/// Replace the tool definitions a request recorded with the set its run sent.
 ///
-/// The engine sends `{"type":"tools"}` only once a run has started, so a
-/// conversation's first question recorded none of them; they are added when the
-/// answer arrives, so the panel still shows what that request carried.
-pub(crate) fn add_missing_tool_schemas(items: &mut Vec<RequestItem>, schemas: &[(String, String)]) {
-    if schemas.is_empty() || items.iter().any(|item| item.kind == ContextKind::Tools) {
+/// A request is recorded before the engine starts, so it can only borrow the
+/// previous run's list — which may name MCP servers or plugins switched off since
+/// then. The engine's report is the truth: it settles the second question of a
+/// conversation as well as the first, which recorded none at all.
+///
+/// An empty report means the run used no tools (or never got that far), so the
+/// record keeps whatever was written for it.
+pub(crate) fn set_tool_schemas(items: &mut Vec<RequestItem>, schemas: &[(String, String)]) {
+    if schemas.is_empty() {
         return;
     }
-    items.extend(schemas.iter().map(|(name, schema)| RequestItem {
-        kind: ContextKind::Tools,
-        label: name.clone(),
-        text: schema.clone(),
-        tokens: estimate_tokens(schema),
-    }));
+    let fresh: Vec<RequestItem> = schemas
+        .iter()
+        .map(|(name, schema)| RequestItem {
+            kind: ContextKind::Tools,
+            label: name.clone(),
+            text: schema.clone(),
+            tokens: estimate_tokens(schema),
+        })
+        .collect();
+    if let Some(start) = items
+        .iter()
+        .position(|item| item.kind == ContextKind::Tools)
+    {
+        let end = items
+            .iter()
+            .rposition(|item| item.kind == ContextKind::Tools)
+            .map_or(start, |last| last + 1);
+        items.splice(start..end, fresh);
+        return;
+    }
+    // No tool row yet: put the definitions right after the prompt blocks, the
+    // position `request_items` gives them.
+    let at = items
+        .iter()
+        .position(|item| !is_prompt_block(item.kind))
+        .unwrap_or(items.len());
+    items.splice(at..at, fresh);
+}
+
+/// Whether a recorded item is prompt text that goes ahead of the tool schemas.
+fn is_prompt_block(kind: ContextKind) -> bool {
+    matches!(
+        kind,
+        ContextKind::System | ContextKind::Injected | ContextKind::Skills
+    )
 }
 
 /// Whether a tool row is one the provider ran on its own servers.

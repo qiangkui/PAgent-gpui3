@@ -79,6 +79,17 @@ impl DshFlowApp {
             sep: "\n\n",
             text: project_rules(&self.ai.workspace_dir(), &workspace),
         });
+        // Long-term memory is cross-conversation: the model's `remember` tool
+        // appends to this file, and every question reads it back.
+        let memory = crate::memory::prompt_text(&self.ai.data_dir());
+        if !memory.is_empty() {
+            blocks.push(PromptBlock {
+                kind: PromptKind::Injected,
+                label: "长期记忆",
+                sep: "\n\n",
+                text: memory,
+            });
+        }
         // Enabled skills are prompt text, so the window can add them without a
         // round-trip to the engine. The conversation's mode narrows which of the
         // globally enabled skills this request carries; a broken folder is

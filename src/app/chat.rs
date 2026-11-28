@@ -25,7 +25,7 @@ impl DshFlowApp {
             .as_ref()
             .and_then(|_| self.current_find_message());
         if chat.messages.is_empty() {
-            rows.push(self.render_chat_empty(palette, cx));
+            rows.push(self.render_chat_empty(palette));
         } else {
             if from > 0 {
                 rows.push(self.render_earlier_chip(from, chat.messages.len(), palette, cx));
@@ -1301,6 +1301,24 @@ impl DshFlowApp {
         text: &str,
     ) -> Rc<Vec<crate::markdown::Rich>> {
         cached_parse(&mut self.parsed.borrow_mut(), message, text)
+    }
+
+    /// The `<details>` sections the run transcript has opened.
+    pub(crate) fn transcript_details(&self) -> &std::collections::HashSet<(usize, usize)> {
+        &self.transcript_details
+    }
+
+    /// Open or close one section of the run transcript.
+    pub(crate) fn toggle_transcript_details(
+        &mut self,
+        message: usize,
+        block: usize,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.transcript_details.remove(&(message, block)) {
+            self.transcript_details.insert((message, block));
+        }
+        cx.notify();
     }
 
     /// Open or close a `<details>` section of an answer.

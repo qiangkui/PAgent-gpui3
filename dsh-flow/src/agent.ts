@@ -20,15 +20,20 @@ import { serverToolDeclarations, webEventRow, webReport, webSteps } from './web.
 import type { WebSearchReport } from './web.ts'
 import {
   MAX_CODE_CHARS,
+  MAX_IMAGE_BASE64,
+  MAX_IMAGES_PER_QUESTION,
+  MAX_MEMORY_ENTRY,
   MAX_SHELL_COMMAND,
   TOOLS,
   previewToolScoped,
   runToolScoped,
   safeEnd
 } from './tools.ts'
-import type { Sandbox, ToolDefinition } from './tools.ts'
+import type { Sandbox, ToolDefinition, ToolFile, ToolImage, ToolResult } from './tools.ts'
 import { outsidePaths, resolveCommandDir, sandboxRefusal } from './tools/sandbox.ts'
 import { httpSummary } from './tools/http.ts'
+import { browserNeedsCard, browserSummary } from './tools/browser.ts'
+import { INTERACTION_NAMES, INTERACTION_TOOLS } from './tools/interaction.ts'
 import { streamCompletion } from './stream.ts'
 import { cacheHitSize, contextSize } from './stream.ts'
 import { collectPanels, runPluginTool } from './plugins.ts'
@@ -63,7 +68,21 @@ export const TOOL_TIMEOUT_MS = 60_000
  * Tools that only read. Several of these in one round can run at once; a write
  * or a command stays serial so its approval cannot race another call.
  */
-const READ_ONLY_TOOLS = new Set(['read', 'list', 'glob', 'grep', 'tree', 'symbols', 'git'])
+const READ_ONLY_TOOLS = new Set([
+  'read',
+  'list',
+  'glob',
+  'grep',
+  'tree',
+  'symbols',
+  'git',
+  'env',
+  'read_image',
+  'screenshot',
+  // `show` only lists files that already exist: it writes nothing, so several
+  // shows in one round can run together like the other readers.
+  'show'
+])
 
 /**
  * Tools whose side effect has to be observed through.
@@ -72,7 +91,7 @@ const READ_ONLY_TOOLS = new Set(['read', 'list', 'glob', 'grep', 'tree', 'symbol
  * against the tool timer would report a timeout while the change still lands,
  * leaving the model wrong and the window's undo record behind the disk.
  */
-const MUTATING_TOOLS = new Set(['write', 'edit', 'replace', 'move', 'delete'])
+const MUTATING_TOOLS = new Set(['write', 'edit', 'replace', 'move', 'delete', 'copy', 'mkdir'])
 
 /** Guidance added while the conversation is in plan mode. */
 const PLAN_GUIDE = [
@@ -80,6 +99,37 @@ const PLAN_GUIDE = [
   '把要做的事整理成一份完整计划（以 # 标题开头的 markdown），然后调用 exit_plan_mode 提交。',
   '用户批准后才能开始执行；用户要求修改时，按反馈修订计划再提交。'
 ].join('\n')
+
+/**
+ * Sent once when an answer described an action but called no tool.
+ *
+ * Small models do this: they write「我先打开这个页面看看」and end the turn, and the
+ * person sees a conversation that looks like it died. The reminder names the
+ * mistake and says where the tool list really lives, because the same replies
+ * often claim a tool is missing while it is right there in the request's `tools`.
+ */
+const PROMISE_NUDGE =
+  '（系统提醒）你上一条只说了要做什么，却没有调用任何工具，所以这一轮什么也没有发生。' +
+  '如果还需要操作，请现在直接调用对应的工具——工具清单以随请求附带的 tools 为准，不要凭记忆判断某个工具不存在；' +
+  '如果不需要工具或已经完成，请直接给出最终回答。'
+
+/**
+ * Whether an answer only *promises* to act.
+ *
+ * Only short replies that carry no code are considered: a real explanation that
+ * happens to contain「我先…」should not be interrupted by a reminder.
+ * @param text - the answer text.
+ * @returns true when one reminder round is worth it.
+ */
+export function unfulfilledPromise(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed === '' || trimmed.length > 240 || trimmed.includes('```')) return false
+  const chinese =
+    /(我先|让我|我这就|现在我|接下来我|我来)[^。！？\n]{0,12}(打开|看看|看一下|看下|读取|读一下|运行|执行|检查|搜索|搜一下|查一下|点开|点击|输入|登录|下载|抓取|分析)/
+  const english =
+    /^(let me|i'?ll|i will|first,?\s+i)\b[^\n]{0,60}\b(open|check|look at|read|run|search|fetch|navigate|click)\b/i
+  return chinese.test(trimmed) || english.test(trimmed)
+}
 
 /** One todo item as the model writes it. */
 export interface TodoUpdate {
@@ -109,81 +159,8 @@ export interface PlanReviewRequest {
   plan: string
 }
 
-/** The models the window can act on besides files and commands. */
-const INTERACTION_TOOLS: ToolDefinition[] = [
-  {
-    type: 'function',
-    function: {
-      name: 'ask_user_question',
-      description:
-        '向用户提一个带选项的问题并等待回答。需要用户在几个方案中选择、或确认一个关键前提时使用；不要在能自己判断时滥用。',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: '要问用户的问题' },
-          options: {
-            type: 'array',
-            description: '2–6 个选项，按推荐顺序排列',
-            items: { type: 'string' }
-          },
-          allowCustom: {
-            type: 'boolean',
-            description: '是否允许用户自己输入（可选）'
-          }
-        },
-        required: ['question', 'options']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'todo_write',
-      description:
-        '写入或替换本次对话的待办列表。开始多步任务时列出计划，之后每次完成一步就更新状态；只保留当前列表，不要追加旧项。',
-      parameters: {
-        type: 'object',
-        properties: {
-          items: {
-            type: 'array',
-            description: '完整的新列表，按执行顺序',
-            items: {
-              type: 'object',
-              properties: {
-                text: { type: 'string', description: '要做的事' },
-                status: {
-                  type: 'string',
-                  enum: ['pending', 'in_progress', 'completed'],
-                  description: '待办 / 进行中 / 完成'
-                }
-              },
-              required: ['text', 'status']
-            }
-          }
-        },
-        required: ['items']
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'exit_plan_mode',
-      description:
-        '提交一份完整计划，等待用户批准后再执行。只有在计划模式下、并且计划已经写成以 # 标题开头的 markdown 时才能调用。',
-      parameters: {
-        type: 'object',
-        properties: {
-          plan: { type: 'string', description: '完整计划，markdown，以 # 标题开头' }
-        },
-        required: ['plan']
-      }
-    }
-  }
-]
-
-/** Names the interaction tools, so an allow-list cannot hide them. */
-const INTERACTION_NAMES = new Set(INTERACTION_TOOLS.map((tool) => tool.function.name))
+// `ask_user_question`, `todo_write`, `exit_plan_mode` and `remember` live in
+// `tools/interaction.ts`, so the plugin registry can reserve the same names.
 
 /** Longest tool argument text kept for the transcript's expanded row. */
 export const MAX_STEP_INPUT = 2_000
@@ -224,6 +201,51 @@ export const DROPPED_TOOL_RESULT =
   '（较早的工具结果已省略，以免占满上下文；需要时请重新调用工具。）'
 
 /**
+ * What replaces a dropped result when its call is known.
+ *
+ * The model can read `read big.txt` and decide whether that result is still
+ * worth re-running; the old generic note left it guessing which one went away.
+ * @param label - tool name and target, as the step row shows them.
+ * @returns the note that stands in for the dropped text.
+ */
+export function droppedToolResult(label: string): string {
+  const shown = label.trim()
+  return shown === ''
+    ? DROPPED_TOOL_RESULT
+    : `（较早的 ${shown} 结果已省略，以免占满上下文；需要时请重新调用。）`
+}
+
+/** How much tool text one result may keep, and how much the whole question may. */
+export interface ToolBudgets {
+  /** Characters kept from one result, head and tail. */
+  message: number
+  /** Characters kept across every result of the question. */
+  context: number
+}
+
+/**
+ * Tool-text budgets for one window.
+ *
+ * The old figures were written for a 128k window and applied to every model, so a
+ * 1M model dropped the same results a 128k one did. The fractions below are
+ * character counts: roughly two characters per token for code and Chinese, so
+ * `message` is about 2% of the window in tokens and `context` about 15%. They
+ * never go below the old constants, which keeps a small window at exactly the
+ * behaviour it had.
+ * @param windowTokens - the model's context window; 0 or absent means the default.
+ * @returns the per-result and per-question character budgets.
+ */
+export function toolBudgets(windowTokens: number): ToolBudgets {
+  const window =
+    Number.isFinite(windowTokens) && windowTokens > 0 ? windowTokens : DEFAULT_WINDOW_TOKENS
+  const message = Math.min(Math.max(Math.round(window * 0.04), MAX_TOOL_MESSAGE), 100_000)
+  const context = Math.min(Math.max(Math.round(window * 0.3), MAX_TOOL_CONTEXT), 400_000)
+  // Two results at the per-result cap have to fit, or one big read would be
+  // dropped the moment it arrived.
+  return { message, context: Math.max(context, message * 2) }
+}
+
+/**
  * Context window assumed when the caller names none.
  *
  * The window's own table answers the same figure for an unknown model, so the
@@ -247,6 +269,22 @@ export interface AgentStep {
   output: string
   /** Provider id of the call; links a step to its approval card. */
   call: string
+  /**
+   * The picture the tool showed the model, when it showed one.
+   *
+   * Only the file is reported: the window keeps it so the next question can put
+   * the same picture in front of the model again. Empty when the capture could
+   * not be saved anywhere.
+   */
+  image?: { mime: string; path: string }
+  /**
+   * Finished files the tool put in front of the person, for `show`.
+   *
+   * The window draws one card per file under the row. Only files the model chose
+   * to hand over are here: a browser download stays the model's business until it
+   * calls `show`.
+   */
+  files?: ToolFile[]
 }
 
 /**
@@ -287,6 +325,13 @@ export interface ApprovalRequest {
   command?: string
   /** For `shell`: the directory as the model wrote it. Empty for a write. */
   cwd?: string
+  /**
+   * True when the call would send a credential (`http` with `auth`).
+   *
+   * The window must show the card even in 完全权限: a key leaving the machine is
+   * the one action a blanket "run everything" setting should not cover.
+   */
+  secret?: boolean
 }
 
 /**
@@ -392,6 +437,8 @@ export interface AgentOptions {
   readOnlyRoots?: string[]
   /** Writable root; `null` means the whole computer, `undefined` means `root`. */
   scopeRoot?: string | null
+  /** Top-level workspace folders the search tools leave out (sibling chats). */
+  skipDirs?: readonly string[]
   /**
    * Folders `shell` / `python` / `node` may reach; null (or absent) skips the
    * path check. The window passes the workspace plus its allowlist, and leaves
@@ -423,6 +470,12 @@ export interface AgentOptions {
   reviewPlan?: (request: PlanReviewRequest) => Promise<boolean>
   /** The model replaced the conversation's todo list. */
   onTodo?: (items: TodoUpdate[]) => void
+  /**
+   * Keep one long-term memory line. The host owns the file, so it decides where
+   * it lives and how large it may grow; returning false means the line was not
+   * kept, while a void return counts as done (the host reports its own errors).
+   */
+  remember?: (entry: { call: string; text: string }) => Promise<boolean | void> | boolean | void
   /** Called once per tool call, before its result goes back to the model. */
   onStep?: (step: AgentStep) => void
   /**
@@ -527,8 +580,12 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
   const planMode = options.plan === true || request.plan === true
   // The loop's tool executor reads the same flag; an approved plan clears it.
   options.plan = planMode
+  // Remembering is offered only when the host has a file to write it into.
+  const memory = request.memory === true
   const interactionTools = INTERACTION_TOOLS.filter(
-    (tool) => planMode || tool.function.name !== 'exit_plan_mode'
+    (tool) =>
+      (planMode || tool.function.name !== 'exit_plan_mode') &&
+      (memory || tool.function.name !== 'remember')
   )
   // Plugin and MCP tools are not in the window's allow-list (that list names
   // the engine's own tools), so they are added on top and callable by name.
@@ -581,6 +638,9 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     origins.set(tool.name, { server: tool.server })
   }
   const scope = options.scopeRoot === undefined ? options.root : options.scopeRoot
+  // Sibling conversation folders are skipped by the search tools; the request
+  // carries the list because only the window knows which folders are chats.
+  options.skipDirs = request.skipDirs ?? []
 
   const messages: WireMessage[] = []
   const system = (request.system ?? '').trim()
@@ -640,30 +700,61 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
   // `call_0` on every round, and a repeated id makes the tool pairing ambiguous
   // for stricter endpoints.
   const seenCalls = new Set<string>()
-  // Indices of tool messages, oldest first, plus their text, so the transcript
-  // can shrink without breaking the `tool_call_id` pairing.
-  const toolResults: number[] = []
+  // How much tool text one question may carry, scaled from the window: a 1M
+  // model can keep far more of what it read than the 60k written for 128k.
+  const budgets = toolBudgets(options.windowTokens ?? DEFAULT_WINDOW_TOKENS)
+  // Indices of tool messages, oldest first, plus what each one was, so the
+  // transcript can shrink without breaking the `tool_call_id` pairing and the
+  // model can still tell which result went away.
+  const toolResults: Array<{ index: number; label: string }> = []
   let toolChars = 0
   /** Replace the oldest results until the transcript fits its budget. */
   const trimToolContext = (): void => {
-    while (toolChars > MAX_TOOL_CONTEXT && toolResults.length > 1) {
-      const oldest = toolResults[0]!
-      const content = messages[oldest]!.content
+    while (toolChars > budgets.context && toolResults.length > 1) {
+      const oldest = toolResults[0]
+      if (oldest === undefined) break
+      const content = messages[oldest.index]?.content
+      const note = droppedToolResult(oldest.label)
       // Dropping a result that is already shorter than the note would only
       // make the transcript longer, so a run of tiny results stops here.
-      if (typeof content !== 'string' || content.length <= DROPPED_TOOL_RESULT.length) break
+      if (typeof content !== 'string' || content.length <= note.length) break
       toolResults.shift()
       toolChars -= content.length
-      messages[oldest]!.content = DROPPED_TOOL_RESULT
-      toolChars += DROPPED_TOOL_RESULT.length
+      messages[oldest.index]!.content = note
+      toolChars += note.length
     }
   }
   /** Record one tool result and keep the whole set inside the budget. */
-  const pushToolResult = (id: string, content: string): void => {
+  const pushToolResult = (id: string, content: string, label: string): void => {
     messages.push({ role: 'tool', tool_call_id: id, content })
-    toolResults.push(messages.length - 1)
+    toolResults.push({ index: messages.length - 1, label })
     toolChars += content.length
     trimToolContext()
+  }
+  // Images one question may show the model. Every round resends the transcript,
+  // so a screenshot loop has to be bounded or it would crowd out the answer.
+  let imageCount = 0
+  let imageChars = 0
+  /** Whether one more image still fits this question. */
+  const imageRoom = (image: ToolImage): boolean =>
+    imageCount < MAX_IMAGES_PER_QUESTION && imageChars + image.data.length <= MAX_IMAGE_BASE64
+  /**
+   * Attach an image the model should look at.
+   *
+   * A tool message only carries text, so the picture rides as a user message
+   * right after it: that is the one shape every OpenAI-compatible endpoint
+   * accepts for `image_url`.
+   */
+  const attachImage = (tool: string, image: ToolImage): void => {
+    imageCount += 1
+    imageChars += image.data.length
+    messages.push({
+      role: 'user',
+      content: [
+        { type: 'text', text: `（这是工具 ${tool} 返回的图片。）` },
+        { type: 'image_url', image_url: { url: `data:${image.mime};base64,${image.data}` } }
+      ]
+    })
   }
   // Every round is billed separately, so the answer reports the whole question.
   const usage = { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
@@ -755,12 +846,21 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     })
     if (!report.changed) return undefined
     // Indices moved when the range was replaced, so the pairing bookkeeping is
-    // rebuilt from the transcript instead of trusted.
+    // rebuilt from the transcript instead of trusted. The labels come from the
+    // assistant turns that requested the calls: after compaction the id is the
+    // only link left, and it is enough.
     toolResults.length = 0
     toolChars = 0
+    const labels = new Map<string, string>()
+    for (const message of messages) {
+      for (const call of message.tool_calls ?? []) {
+        if (call.id !== '') labels.set(call.id, call.function?.name ?? '')
+      }
+    }
     for (const [index, message] of messages.entries()) {
       if (message.role !== 'tool' || typeof message.content !== 'string') continue
-      toolResults.push(index)
+      const id = typeof message.tool_call_id === 'string' ? message.tool_call_id : ''
+      toolResults.push({ index, label: labels.get(id) ?? '' })
       toolChars += message.content.length
     }
     return report
@@ -827,6 +927,10 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       }
     }
   }
+  /** Whether this question already sent the "you promised but acted on nothing" reminder. */
+  let nudged = false
+  /** The round that reminder went out in. */
+  let nudgedRound = 0
   for (let round = 1; round <= maxRounds; round += 1) {
     taken = round
     // The status strip follows the loop, so it is told before the request goes
@@ -874,8 +978,22 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     if (answer.toolCalls.length === 0) {
       const text = fullAnswer(answer.content, answer.finishReason)
       if (!text.trim()) throw new Error(emptyAnswerReason(model, answer.finishReason))
+      // A small model sometimes narrates the next step and stops without calling
+      // anything ("我先打开这个页面看看…"). Ending the answer there looks like the
+      // conversation died, and it happened in the field. One reminder costs a
+      // round and usually produces the call it described.
+      const promised = unfulfilledPromise(text)
+      if (!nudged && round < maxRounds && promised) {
+        nudged = true
+        nudgedRound = round
+        messages.push({ role: 'user', content: PROMISE_NUDGE })
+        continue
+      }
+      // Still nothing after the reminder: say so in the answer rather than leave
+      // the person wondering why it stopped.
+      const stopped = nudged && promised && round === nudgedRound + 1
       return {
-        text,
+        text: stopped ? `${text}\n\n（这一轮没有调用任何工具；如果需要我继续，回复「继续」。）` : text,
         model,
         usage: spent ? usage : undefined,
         context,
@@ -913,13 +1031,21 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
     // model may have written a file that a later call reads back.
     const remaining = Math.max(0, maxCalls - calls)
     const onlyReads = planned.every((entry) => READ_ONLY_TOOLS.has(entry.name))
+    // A model that asks the same read twice in one round should not pay for the
+    // same text twice: the second call gets the first one's promise.
+    const roundReads = new Map<string, Promise<ToolResult>>()
     const prepared = onlyReads
       ? await timed('tool', () =>
           Promise.all(
             planned.map((entry, index) => {
               if (index >= remaining || entry.parsed.problem !== '') return null
               if (!permitted(entry.name)) return null
-              return runToolWithTimeout(options, scope, entry.call.id, entry.name, entry.args)
+              const key = `${entry.name}\u001f${entry.argsText}`
+              const seen = roundReads.get(key)
+              if (seen !== undefined) return seen
+              const work = runToolWithTimeout(options, scope, entry.call.id, entry.name, entry.args)
+              roundReads.set(key, work)
+              return work
             })
           )
         )
@@ -939,7 +1065,7 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
           output: skipped,
           call: call.id
         })
-        pushToolResult(call.id, skipped)
+        pushToolResult(call.id, skipped, `${name} ${describe(name, args)}`.trim())
         reason = `工具调用达到 ${maxCalls} 次上限`
         continue
       }
@@ -948,7 +1074,7 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
       // are reported as-is instead of running the tool with an empty object,
       // which would only produce a misleading "缺少参数" error.
       const ready = prepared[index]
-      let result: { ok: boolean; text: string }
+      let result: ToolResult
       if (ready) {
         result = ready
       } else if (parsed.problem !== '') {
@@ -960,6 +1086,27 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
         // write stays undone and the model still gets a usable turn.
         result = await timed('tool', () => runToolWithTimeout(options, scope, call.id, name, args))
       }
+      // A tool that saw something shows it; anything else answers in text only.
+      const shows = result.ok && result.image !== undefined && imageRoom(result.image)
+      const dropped =
+        result.ok && result.image !== undefined && !shows
+          ? `\n（这张图没有附上：一次提问最多 ${MAX_IMAGES_PER_QUESTION} 张、合计 ${Math.round(MAX_IMAGE_BASE64 / (1024 * 1024))} MB。）`
+          : ''
+      const label = `${name} ${describe(name, args)}`.trim()
+      pushToolResult(call.id, fitToolResult(result.text + dropped, budgets.message), label)
+      if (shows && result.image !== undefined) attachImage(name, result.image)
+      // The window keeps the file so the next question can show it again; the
+      // bytes stay in this request, where they were paid for.
+      const kept =
+        result.image?.path !== undefined && result.image.path !== ''
+          ? { image: { mime: result.image.mime, path: result.image.path } }
+          : {}
+      // Files are what the reader gets to open, so they ride on the step even when
+      // the tool also returned text the model has already read.
+      const shown =
+        result.ok && result.files !== undefined && result.files.length > 0
+          ? { files: result.files }
+          : {}
       options.onStep?.({
         tool: name,
         target: describe(name, args),
@@ -967,9 +1114,10 @@ export async function runAgent(request: AiRequest, options: AgentOptions): Promi
         detail: summarise(name, result.ok, result.text),
         input: clip(argsText, MAX_STEP_INPUT),
         output: clip(result.text, MAX_STEP_OUTPUT),
-        call: call.id
+        call: call.id,
+        ...kept,
+        ...shown
       })
-      pushToolResult(call.id, fitToolResult(result.text))
     }
     // The results are in, so the arguments no longer have to ride along in
     // full: the assistant turn is replayed on every later round of this
@@ -1092,7 +1240,7 @@ async function runAllowedTool(
   id: string,
   name: string,
   args: Record<string, unknown>
-): Promise<{ ok: boolean; text: string }> {
+): Promise<ToolResult> {
   if (name === 'ask_user_question') {
     const question = typeof args.question === 'string' ? args.question.trim() : ''
     if (question === '') return { ok: false, text: '缺少参数 question' }
@@ -1134,6 +1282,23 @@ async function runAllowedTool(
       ok: true,
       text: items.length === 0 ? '待办列表已清空。' : `已更新待办：${done}/${items.length} 完成。`
     }
+  }
+  if (name === 'remember') {
+    const text = typeof args.text === 'string' ? args.text.trim() : ''
+    if (text === '') return { ok: false, text: '缺少参数 text' }
+    if (text.length > MAX_MEMORY_ENTRY) {
+      return {
+        ok: false,
+        text: `要记的内容太长（${text.length} 字符，上限 ${MAX_MEMORY_ENTRY}）；请压缩成一句可复用的结论。`
+      }
+    }
+    if (!options.remember) {
+      return { ok: false, text: '没有长期记忆的写入通道，这次没有记下。' }
+    }
+    const kept = await options.remember({ call: id, text })
+    return kept === false
+      ? { ok: false, text: '长期记忆没有写入（文件不可写或已到上限），这条没有记下。' }
+      : { ok: true, text: `已记入长期记忆：${text}` }
   }
   if (name === 'exit_plan_mode') {
     if (options.plan !== true) return { ok: false, text: '当前不在计划模式。' }
@@ -1320,16 +1485,45 @@ async function runAllowedTool(
       diff: httpSummary(args),
       undoable: false,
       command: '',
-      cwd: ''
+      cwd: '',
+      // A credential has to be confirmed even where commands run unattended.
+      secret: hasCredential(args)
     }
     if (!(await options.confirmActions(question))) {
       return { ok: false, text: '用户拒绝了这次请求，没有发出。' }
     }
   }
+  if (name === 'browser') {
+    const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : ''
+    // Reading the page changes nothing outside this question, so snapshot / text /
+    // console / network / screenshot / wait_for / close run without a card, like
+    // `read_image`. Navigation and anything that touches the page gets one.
+    if (browserNeedsCard(action)) {
+      if (!options.confirmActions) {
+        return { ok: false, text: '没有确认界面，浏览器操作没有执行。' }
+      }
+      const summary = browserSummary(args)
+      const question: ApprovalRequest = {
+        call: id,
+        tool: name,
+        target: summary,
+        // A page action has no file to undo; the empty path is what tells the
+        // window this card is not a write.
+        path: '',
+        diff: summary,
+        undoable: false,
+        command: '',
+        cwd: ''
+      }
+      if (!(await options.confirmActions(question))) {
+        return { ok: false, text: '用户拒绝了这次浏览器操作，没有执行。' }
+      }
+    }
+  }
   if (name === 'task') {
     const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : ''
+    const taskId = typeof args.id === 'string' ? args.id.trim() : ''
     if (action === 'stop' || action === 'stopall') {
-      const taskId = typeof args.id === 'string' ? args.id.trim() : ''
       if (!options.confirmActions) {
         return { ok: false, text: '没有确认界面，后台任务没有结束。' }
       }
@@ -1350,45 +1544,255 @@ async function runAllowedTool(
         return { ok: false, text: '用户拒绝了这次操作，后台任务没有结束。' }
       }
     }
+    if (action === 'input') {
+      const text = typeof args.text === 'string' ? args.text : ''
+      if (taskId === '') return { ok: false, text: '缺少参数 id（例如 task-1）' }
+      if (text.trim() === '') return { ok: false, text: '缺少参数 text（要写进 stdin 的内容）' }
+      if (!options.confirmActions) {
+        return { ok: false, text: '没有确认界面，输入没有写入。' }
+      }
+      const question: ApprovalRequest = {
+        call: id,
+        tool: name,
+        target: `${taskId} ← 输入`,
+        path: '',
+        diff: `向 ${taskId} 的 stdin 写入：\n${clipCode(text)}`,
+        undoable: false,
+        command: '',
+        cwd: ''
+      }
+      if (!(await options.confirmActions(question))) {
+        return { ok: false, text: '用户拒绝了这次输入，没有写入。' }
+      }
+    }
+    if (action === 'close') {
+      if (taskId === '') return { ok: false, text: '缺少参数 id（例如 task-1）' }
+      if (!options.confirmActions) {
+        return { ok: false, text: '没有确认界面，stdin 没有关闭。' }
+      }
+      const question: ApprovalRequest = {
+        call: id,
+        tool: name,
+        target: `${taskId} ← 关闭 stdin`,
+        path: '',
+        diff: `通知 ${taskId} 关闭 stdin：它读到文件末尾后会继续（很多 CLI 等在这一点）。`,
+        undoable: false,
+        command: '',
+        cwd: ''
+      }
+      if (!(await options.confirmActions(question))) {
+        return { ok: false, text: '用户拒绝了这次操作，stdin 没有关闭。' }
+      }
+    }
+    if (action === 'wait') {
+      if (taskId === '') return { ok: false, text: '缺少参数 id（例如 task-1）' }
+      // Waiting only polls the record; it changes nothing, so no card.
+    }
+    if (
+      action !== 'list' &&
+      action !== 'output' &&
+      action !== 'input' &&
+      action !== 'close' &&
+      action !== 'wait' &&
+      action !== 'stop' &&
+      action !== 'stopall'
+    ) {
+      return {
+        ok: false,
+        text: 'action 必须是 list、output、input、close、wait、stop 或 stopAll'
+      }
+    }
   }
-  if (name === 'move' || name === 'delete') {
+  if (name === 'move' || name === 'delete' || name === 'copy' || name === 'mkdir') {
     const from = typeof args.from === 'string' ? args.from : ''
     const to = typeof args.to === 'string' ? args.to : ''
     const target = typeof args.path === 'string' ? args.path : ''
-    if (name === 'move' && (!from || !to)) {
+    if ((name === 'move' || name === 'copy') && (!from || !to)) {
       return { ok: false, text: '缺少参数 from / to' }
     }
-    if (name === 'delete' && !target) return { ok: false, text: '缺少参数 path' }
+    if ((name === 'delete' || name === 'mkdir') && !target) {
+      return { ok: false, text: '缺少参数 path' }
+    }
     if (!options.confirmActions) {
       return { ok: false, text: '没有确认界面，这次改动没有执行。' }
     }
+    const overwrite = name === 'copy' && args.overwrite === true
+    const common = { call: id, tool: name, undoable: false }
     const question: ApprovalRequest =
       name === 'move'
-        ? {
-            call: id,
-            tool: name,
-            target: `${from} → ${to}`,
-            path: from,
-            diff: `移动：${from} → ${to}`,
-            undoable: false
-          }
-        : {
-            call: id,
-            tool: name,
-            target,
-            path: target,
-            diff: `删除文件：${target}`,
-            undoable: false
-          }
+        ? { ...common, target: `${from} → ${to}`, path: from, diff: `移动：${from} → ${to}` }
+        : name === 'copy'
+          ? {
+              ...common,
+              target: `${from} → ${to}`,
+              // The written side is the target, which is also what the window's
+              // automatic review has to judge; the source is only read.
+              path: to,
+              diff: `复制：${from} → ${to}${overwrite ? '（覆盖已存在的目标）' : ''}`
+            }
+          : name === 'mkdir'
+            ? { ...common, target, path: target, diff: `新建目录：${target}` }
+            : {
+                ...common,
+                target,
+                path: target,
+                diff:
+                  args.recursive === true
+                    ? `删除整个文件夹及其内容：${target}`
+                    : `删除文件：${target}`
+              }
     if (!(await options.confirmActions(question))) {
       return { ok: false, text: '用户拒绝了这次改动，文件没有改动。' }
     }
   }
-  if (name === 'write' || name === 'edit' || name === 'replace') {
+  if (name === 'git_write') {
+    const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : ''
+    if (action !== 'commit' && action !== 'branch' && action !== 'stash') {
+      return { ok: false, text: 'action 只能是 commit、branch 或 stash' }
+    }
+    const message = typeof args.message === 'string' ? args.message.trim() : ''
+    const branch = typeof args.name === 'string' ? args.name.trim() : ''
+    const stashAction =
+      typeof args.stashAction === 'string' && args.stashAction.trim() !== ''
+        ? args.stashAction.trim().toLowerCase()
+        : 'push'
+    if (action === 'commit' && message === '') {
+      return { ok: false, text: '缺少参数 message（提交说明）' }
+    }
+    if (action === 'branch' && branch === '') {
+      return { ok: false, text: '缺少参数 name（分支名）' }
+    }
+    if (!options.confirmActions) {
+      return { ok: false, text: '没有确认界面，仓库没有改动。' }
+    }
+    const paths = Array.isArray(args.paths)
+      ? args.paths.filter((entry): entry is string => typeof entry === 'string')
+      : []
+    const lines = ['$ git_write']
+    if (action === 'commit') {
+      lines.push(`提交说明：${message}`)
+      lines.push(
+        args.all === true
+          ? '先 git add -A'
+          : paths.length > 0
+            ? `先 git add -- ${paths.join(' ')}`
+            : '只提交已暂存的改动'
+      )
+    } else if (action === 'branch') {
+      lines.push(`新建分支：${branch}${args.checkout === true ? '（并切过去）' : ''}`)
+    } else {
+      lines.push(
+        `stash ${stashAction}${args.includeUntracked === true ? '（含未跟踪文件）' : ''}`
+      )
+    }
+    const question: ApprovalRequest = {
+      call: id,
+      tool: name,
+      target: describe(name, args),
+      path: '',
+      diff: lines.join('\n'),
+      undoable: false,
+      command: '',
+      cwd: ''
+    }
+    if (!(await options.confirmActions(question))) {
+      return { ok: false, text: '用户拒绝了这次仓库操作，仓库没有改动。' }
+    }
+  }
+  if (name === 'wait_for') {
+    const target = typeof args.target === 'string' ? args.target.trim().toLowerCase() : ''
+    if (target !== 'port' && target !== 'url' && target !== 'output') {
+      // Waiting for a task to end belongs to `task action=wait`; say so instead
+      // of letting the model retry the same question under another name.
+      return {
+        ok: false,
+        text: 'target 只能是 port、url 或 output；等后台任务结束请用 task 的 action=wait'
+      }
+    }
+    if (target === 'output' && typeof args.id !== 'string') {
+      return { ok: false, text: 'target=output 需要 id（例如 task-1）' }
+    }
+    if (target === 'output' && typeof args.pattern !== 'string') {
+      return { ok: false, text: 'target=output 需要 pattern（要等的文本）' }
+    }
+    const asked = typeof args.timeoutMs === 'number' ? args.timeoutMs : 0
+    const timeout = asked > 0 ? asked : 30_000
+    if (!options.confirmActions) {
+      return { ok: false, text: '没有确认界面，这次等待没有开始。' }
+    }
+    const question: ApprovalRequest = {
+      call: id,
+      tool: name,
+      target: describe(name, args),
+      path: '',
+      diff: `等待：${describe(name, args)}\n最多 ${Math.round(timeout / 1000)} 秒，只轮询不改动任何东西。`,
+      undoable: false,
+      command: '',
+      cwd: ''
+    }
+    if (!(await options.confirmActions(question))) {
+      return { ok: false, text: '用户拒绝了这次等待，没有开始。' }
+    }
+  }
+  if (name === 'run_tests' || name === 'diagnostics') {
+    // Both write build output (cargo's target, npm's cache). 「仅可查看」 promises
+    // the workspace stays untouched, so the call is refused before the card
+    // rather than approved and then failing on a permission error.
+    if (process.env.DSH_SANDBOX_READONLY === '1') {
+      return {
+        ok: false,
+        text: '仅可查看模式不跑测试 / 编译检查：它们会写构建产物。切到「工作区内修改」再试，或改用只读命令。'
+      }
+    }
+  }
+  if (name === 'run_tests') {
+    const command = typeof args.command === 'string' ? args.command.trim() : ''
+    if (!options.confirmActions) {
+      return { ok: false, text: '没有确认界面，测试没有运行。' }
+    }
+    const question: ApprovalRequest = {
+      call: id,
+      tool: name,
+      target: describe(name, args),
+      path: '',
+      diff: `运行测试：\n${command === '' ? '（自动识别：cargo test / npm test / pytest）' : `$ ${command}`}\n失败用例会被解析成清单，完整输出附在后面。`,
+      undoable: false,
+      command,
+      cwd: typeof args.cwd === 'string' ? args.cwd : ''
+    }
+    if (!(await options.confirmActions(question))) {
+      return { ok: false, text: '用户拒绝了这次测试，没有运行。' }
+    }
+  }
+  if (name === 'diagnostics') {
+    const command = typeof args.command === 'string' ? args.command.trim() : ''
+    if (!options.confirmActions) {
+      return { ok: false, text: '没有确认界面，编译检查没有运行。' }
+    }
+    const question: ApprovalRequest = {
+      call: id,
+      tool: name,
+      target: describe(name, args),
+      path: '',
+      diff: `运行编译检查：\n${command === '' ? '（自动识别：cargo check --message-format=json / tsc --noEmit）' : `$ ${command}`}\n问题会按「文件:行:列 代码」解析成清单，完整输出附在后面。`,
+      undoable: false,
+      command,
+      cwd: typeof args.cwd === 'string' ? args.cwd : ''
+    }
+    if (!(await options.confirmActions(question))) {
+      return { ok: false, text: '用户拒绝了这次编译检查，没有运行。' }
+    }
+  }
+  // A `replace` that only previews writes nothing, so it needs no card. The
+  // preview it returns is the same plan the card would have shown.
+  if (
+    (name === 'write' || name === 'edit' || name === 'replace') &&
+    !(name === 'replace' && args.dryRun === true)
+  ) {
     // Even without a decision the window gets the diff and the undo pair, so
     // direct writes stay visible and reversible. A batch replace has no undo
     // pair: one card cannot cover several files, so it reports `undoable: false`.
-    const preview = await previewToolScoped(options.root, scope, { id, name, args })
+    const preview = await previewToolScoped(options.root, scope, { id, name, args }, options.skipDirs ?? [])
     if (preview) {
       const question: ApprovalRequest = {
         call: id,
@@ -1415,7 +1819,14 @@ async function runAllowedTool(
       }
     }
   }
-  if (name === 'shell' || name === 'python' || name === 'node' || name === 'http') {
+  if (
+    name === 'shell' ||
+    name === 'python' ||
+    name === 'node' ||
+    name === 'http' ||
+    name === 'run_tests' ||
+    name === 'diagnostics'
+  ) {
     options.onToolStart?.(id, name, describe(name, args))
   }
   return await runToolScoped(
@@ -1426,7 +1837,8 @@ async function runAllowedTool(
     options.onToolOutput
       ? (text) => options.onToolOutput?.(id, name, describe(name, args), text)
       : undefined,
-    options.sandbox ?? null
+    options.sandbox ?? null,
+    options.skipDirs ?? []
   )
 }
 
@@ -1448,7 +1860,7 @@ async function runToolWithTimeout(
   id: string,
   name: string,
   args: Record<string, unknown>
-): Promise<{ ok: boolean; text: string }> {
+): Promise<ToolResult> {
   const work = runAllowedTool(options, scope, id, name, args).catch((error: unknown) => {
     const message = error instanceof Error ? error.message : String(error)
     return { ok: false, text: `工具没有执行：${message}` }
@@ -1460,13 +1872,21 @@ async function runToolWithTimeout(
     name === 'shell' ||
     name === 'python' ||
     name === 'node' ||
+    name === 'git_write' ||
+    name === 'wait_for' ||
+    name === 'run_tests' ||
+    name === 'diagnostics' ||
+    // A browser call starts a process, waits for a page, or clicks something the
+    // model will ask about next: abandoning it mid-flight would leave the page in
+    // a state the transcript does not describe.
+    name === 'browser' ||
     MUTATING_TOOLS.has(name) ||
     INTERACTION_NAMES.has(name)
   ) {
     return await work
   }
   let timer: ReturnType<typeof setTimeout> | undefined
-  const limit = new Promise<{ ok: boolean; text: string }>((resolve) => {
+  const limit = new Promise<ToolResult>((resolve) => {
     timer = setTimeout(() => {
       resolve({
         ok: false,
@@ -1573,6 +1993,19 @@ function textArg(value: unknown): string {
 }
 
 /**
+ * Whether an `http` call would send a credential.
+ *
+ * Only the shape is checked here: whether the variable exists is the tool's
+ * answer, because the card has to be shown before the request is allowed.
+ * @param args - the call's arguments.
+ * @returns true when the call named an `auth` object.
+ */
+function hasCredential(args: Record<string, unknown>): boolean {
+  const auth = args.auth
+  return auth !== null && auth !== undefined && typeof auth === 'object' && !Array.isArray(auth)
+}
+
+/**
  * A short, human-readable description of what a call touches.
  * @param name - the tool name.
  * @param args - the parsed arguments.
@@ -1608,6 +2041,13 @@ function describe(name: string, args: Record<string, unknown>): string {
         : 'GET'
     return url === '' ? `${method}（缺少 url）` : `${method} ${url}`
   }
+  // `browser` is named by what it does to the page, not by a path it has none of.
+  if (name === 'browser') {
+    const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : 'snapshot'
+    const url = typeof args.url === 'string' ? args.url.trim() : ''
+    if (url !== '') return `${action} ${url}`
+    return action
+  }
   // `task` is named by what it does, not by a path it does not have.
   if (name === 'task') {
     const action = typeof args.action === 'string' ? args.action.trim() : ''
@@ -1624,6 +2064,84 @@ function describe(name: string, args: Record<string, unknown>): string {
     return `${items.length} 项待办`
   }
   if (name === 'exit_plan_mode') return '提交计划'
+  if (name === 'remember') {
+    const text = typeof args.text === 'string' ? args.text.trim() : ''
+    return text.length > 60 ? `${text.slice(0, safeEnd(text, 60))}…` : text
+  }
+  // `env` has no target of its own unless the model named a folder.
+  if (name === 'env') return path.trim() === '' ? '当前环境' : path
+  // `show` names the files the reader will see: the first one, then how many.
+  if (name === 'show') {
+    const list = Array.isArray(args.paths)
+      ? args.paths.filter((item): item is string => typeof item === 'string')
+      : []
+    const files = list.length > 0 ? list : path.trim() === '' ? [] : [path]
+    if (files.length === 0) return '（缺少 paths）'
+    const first = files[0].trim().split(/[\\/]/).pop() ?? ''
+    return files.length === 1 ? first : `${first} 等 ${files.length} 个文件`
+  }
+  // A capture names the area it took: the foreground window by default, the whole
+  // screen on request, and the crop when the call asked for one. Saying「全屏」for
+  // the default was wrong and made the row read like a privacy surprise.
+  if (name === 'screenshot') {
+    const region =
+      typeof args.region === 'string' && args.region.trim().toLowerCase() === 'all'
+        ? '整屏'
+        : '前台窗口'
+    const x = Number(args.x)
+    const y = Number(args.y)
+    const width = Number(args.width)
+    const height = Number(args.height)
+    const crop =
+      Number.isFinite(x) && Number.isFinite(y) && width > 0 && height > 0
+        ? `裁切 ${width}×${height} @ (${x},${y})`
+        : ''
+    if (crop !== '') return `${region} · ${crop}`
+    return path.trim() === '' ? region : path
+  }
+  if (name === 'run_tests') {
+    const command = typeof args.command === 'string' ? args.command.trim() : ''
+    const filter = typeof args.filter === 'string' ? args.filter.trim() : ''
+    if (command !== '') return firstLine(command)
+    return filter === '' ? '自动识别测试' : `测试过滤：${filter}`
+  }
+  if (name === 'diagnostics') {
+    const command = typeof args.command === 'string' ? args.command.trim() : ''
+    if (command !== '') return firstLine(command)
+    const severity = typeof args.severity === 'string' ? args.severity.trim() : ''
+    return severity === '' || severity === 'all' ? '自动识别编译检查' : `编译检查（${severity}）`
+  }
+  if (name === 'git_write') {
+    const action = typeof args.action === 'string' ? args.action.trim().toLowerCase() : ''
+    const message = typeof args.message === 'string' ? args.message.trim() : ''
+    const branch = typeof args.name === 'string' ? args.name.trim() : ''
+    const stash =
+      typeof args.stashAction === 'string' && args.stashAction.trim() !== ''
+        ? args.stashAction.trim()
+        : 'push'
+    if (action === 'commit') return `commit ${firstLine(message)}`
+    if (action === 'branch') return `branch ${branch}`
+    return `stash ${stash}`
+  }
+  if (name === 'wait_for') {
+    const target = typeof args.target === 'string' ? args.target.trim().toLowerCase() : ''
+    if (target === 'port') {
+      const host = typeof args.host === 'string' && args.host.trim() ? args.host.trim() : '127.0.0.1'
+      return `port ${host}:${String(args.port ?? '')}`
+    }
+    if (target === 'url') {
+      return typeof args.url === 'string' ? args.url.trim() : 'url'
+    }
+    const id = typeof args.id === 'string' ? args.id.trim() : ''
+    const pattern = typeof args.pattern === 'string' ? args.pattern.trim() : ''
+    return `${id}「${pattern}」`
+  }
+  // `copy` is named by both ends; `from` alone would hide the destination.
+  if (name === 'copy') {
+    const from = typeof args.from === 'string' ? args.from : ''
+    const to = typeof args.to === 'string' ? args.to : ''
+    return `${from} → ${to}`
+  }
   // `move` has no `path`: without this its step row would only say "move".
   const from = typeof args.from === 'string' ? args.from : ''
   const target = path || pattern || command || from || name
@@ -1660,9 +2178,11 @@ function clipArgs(args: Record<string, unknown>): string {  let text: string
  * Both ends survive: the head is what the model asked for, and the tail is
  * where `read` puts its "共 N 行" note and where commands put their errors.
  * The shared implementation lives in `compact.ts`, the first compaction layer.
+ * @param text - what the tool produced.
+ * @param limit - characters to keep, from {@link toolBudgets}.
  */
-function fitToolResult(text: string): string {
-  return fitForModel(text, MAX_TOOL_MESSAGE)
+function fitToolResult(text: string, limit: number): string {
+  return fitForModel(text, limit)
 }
 
 /** What an answer cut short by the output cap says about itself. */

@@ -208,6 +208,10 @@ pub struct Connection {
     /// default, and a model newer than the table is usually larger; either way
     /// the compaction point would be wrong without this.
     pub window: u64,
+    /// Whether the endpoint accepts images, which is what makes `read_image` and
+    /// `screenshot` worth declaring. A text-only model rejects an `image_url`
+    /// part outright, so the two tools are left out of its requests.
+    pub vision: bool,
 }
 
 impl Connection {
@@ -226,6 +230,9 @@ impl Connection {
             reasoning: Reasoning::Default,
             max_tokens: 0,
             window: 0,
+            // Presets are DeepSeek's current models, which are the vision-capable
+            // ones; a text-only endpoint is a switch away in the settings.
+            vision: true,
         })
     }
 
@@ -286,6 +293,7 @@ impl Connection {
             // clamps its own budgets anyway, but keeping the figure sane here
             // stops a bad number from reaching the gauge.
             window: self.window.min(10_000_000),
+            vision: self.vision,
         }
     }
 }
@@ -297,10 +305,11 @@ pub const DEFAULT_MAX_ROUNDS: u32 = MAX_ROUNDS_CHOICE;
 /// Default tool calls per question, likewise the highest on offer.
 pub const DEFAULT_MAX_CALLS: u32 = MAX_CALLS_CHOICE;
 
-/// Highest budgets the settings page offers; the engine clamps again.
-pub const MAX_ROUNDS_CHOICE: u32 = 24;
-/// Highest call budget the settings page offers.
-pub const MAX_CALLS_CHOICE: u32 = 80;
+/// Highest budgets the window offers; the engine clamps again (`MAX_ROUNDS_LIMIT`
+/// there is 50 too, and 200 calls).
+pub const MAX_ROUNDS_CHOICE: u32 = 50;
+/// Highest call budget the window offers.
+pub const MAX_CALLS_CHOICE: u32 = 200;
 
 /// Most plugins the window will list, so a stray folder cannot flood the page.
 pub const MAX_PLUGINS: usize = 64;
@@ -319,6 +328,28 @@ pub fn is_plugin_id(name: &str) -> bool {
         && !name.ends_with('.')
         && !name.contains("..")
         && !is_reserved_name(name)
+}
+
+/// Most commands one review list may hold.
+pub const MAX_REVIEW_PREFIXES: usize = 64;
+
+/// Longest command prefix the review list keeps, in characters.
+pub const MAX_REVIEW_PREFIX: usize = 200;
+
+/// Normalize one `reviewAllow` entry, or drop it.
+///
+/// A prefix is matched against a whole command line, so a control character
+/// (a stray newline from a pasted list) would match nothing at all and is
+/// refused here rather than stored and silently useless.
+pub fn review_prefix(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > MAX_REVIEW_PREFIX {
+        return None;
+    }
+    if trimmed.chars().any(char::is_control) {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Whether Windows reserves the name for a device (`con`, `nul`, `com1`, …).
@@ -639,6 +670,13 @@ pub struct AiSettings {
     /// HTTP proxy the engine's provider calls go through; empty is a direct
     /// connection. Applied to the child processes at startup.
     pub proxy: String,
+    /// Extra commands the automatic review may run without a card.
+    ///
+    /// Each entry is a prefix matched against the whole command line, on top of
+    /// the built-in read-only list. It carries the same trust as the list: the
+    /// binary and every argument under it run unattended, so `npm test` is a
+    /// reasonable entry and `npm` is not.
+    pub review_allow: Vec<String>,
 }
 
 impl Default for AiSettings {
@@ -654,6 +692,7 @@ impl Default for AiSettings {
             modes: Vec::new(),
             budget_tokens: 0,
             proxy: String::new(),
+            review_allow: Vec::new(),
         }
     }
 }
@@ -1055,6 +1094,22 @@ impl AiSettings {
             .unwrap_or(0)
             .min(1_000_000_000);
         settings.proxy = text_field(&value, "proxy");
+        if let Some(list) = value.get("reviewAllow").and_then(|item| item.as_array()) {
+            let mut entries: Vec<String> = Vec::new();
+            for entry in list.iter().filter_map(|item| item.as_str()) {
+                let Some(prefix) = review_prefix(entry) else {
+                    continue;
+                };
+                if entries.iter().any(|seen| seen == &prefix) {
+                    continue;
+                }
+                entries.push(prefix);
+                if entries.len() >= MAX_REVIEW_PREFIXES {
+                    break;
+                }
+            }
+            settings.review_allow = entries;
+        }
         if let Some(map) = value.get("colors").and_then(|item| item.as_object()) {
             let entries: Vec<(String, u32)> = map
                 .iter()
@@ -1204,6 +1259,12 @@ impl AiSettings {
                             .and_then(|value| value.as_u64())
                             .unwrap_or(0)
                             .min(10_000_000),
+                        // Older files have no `vision`: images were declared, so
+                        // keeping that is the behaviour they had.
+                        vision: item
+                            .get("vision")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(true),
                     })
                 })
                 .collect();
@@ -1236,6 +1297,7 @@ impl AiSettings {
             reasoning: Reasoning::Default,
             max_tokens: 0,
             window: 0,
+            vision: true,
         });
         if !model.is_empty() {
             migrated.model = model;
@@ -1295,6 +1357,7 @@ impl AiSettings {
                     "temperature": connection.temperature,
                     "maxTokens": connection.max_tokens,
                     "window": connection.window,
+                    "vision": connection.vision,
                 })
             })
             .collect();
@@ -1331,6 +1394,7 @@ impl AiSettings {
             "modes": modes,
             "budgetTokens": self.budget_tokens,
             "proxy": self.proxy,
+            "reviewAllow": self.review_allow,
             "connections": connections,
         });
         let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
@@ -1463,6 +1527,7 @@ mod tests {
                     // A window narrower than the name table would guess, so the
                     // round trip proves the override survives.
                     window: 262_144,
+                    vision: true,
                 },
                 Connection {
                     id: "c2".to_string(),
@@ -1476,6 +1541,9 @@ mod tests {
                     reasoning: Reasoning::Default,
                     max_tokens: 0,
                     window: 0,
+                    // A text-only endpoint: the two image tools must stay out of
+                    // its requests after a restart too.
+                    vision: false,
                 },
             ],
             active: 1,
@@ -1493,6 +1561,7 @@ mod tests {
             }],
             budget_tokens: 250_000,
             proxy: "http://127.0.0.1:7890".to_string(),
+            review_allow: vec!["npm test".to_string()],
         };
         settings.save_to(&file.0).expect("save");
         let loaded = AiSettings::load_from(&file.0);
@@ -1512,6 +1581,24 @@ mod tests {
         // The spending guard and the proxy survive a round trip too.
         assert_eq!(loaded.budget_tokens, 250_000);
         assert_eq!(loaded.proxy, "http://127.0.0.1:7890");
+        assert_eq!(loaded.review_allow, vec!["npm test".to_string()]);
+    }
+
+    #[test]
+    fn the_review_list_is_cleaned_and_deduplicated() {
+        let file = TempFile::new("review-allow");
+        file.write(r#"{"reviewAllow":["  npm test  ","npm test","","   ","pytest, -q"]}"#);
+        let loaded = AiSettings::load_from(&file.0);
+        assert_eq!(
+            loaded.review_allow,
+            vec!["npm test".to_string(), "pytest, -q".to_string()]
+        );
+
+        assert_eq!(review_prefix("npm test"), Some("npm test".to_string()));
+        assert_eq!(review_prefix("   "), None);
+        // A newline inside an entry could never match a single command line.
+        assert_eq!(review_prefix("npm\ntest"), None);
+        assert_eq!(review_prefix(&"x".repeat(MAX_REVIEW_PREFIX + 1)), None);
     }
 
     #[test]
@@ -1721,6 +1808,7 @@ mod tests {
             reasoning: Reasoning::Default,
             max_tokens: 0,
             window: 0,
+            vision: true,
         };
         let normalized = connection.normalized();
         assert_eq!(normalized.model, "deepseek-chat");
@@ -1763,6 +1851,7 @@ mod tests {
             reasoning: Reasoning::Default,
             max_tokens: 0,
             window: 0,
+            vision: true,
         }
     }
 

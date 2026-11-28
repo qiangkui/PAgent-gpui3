@@ -1,10 +1,6 @@
 /** Execution tools: shell commands and Python / Node snippets. */
 
-import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
-import { mkdirSync, writeFileSync } from 'node:fs'
-import { existsSync } from 'node:fs'
-import path from 'node:path'
 import { describeRuntime, resolveProjectRuntime } from '../runtime.ts'
 import type { ToolResult } from './types.ts'
 import {
@@ -15,10 +11,13 @@ import {
   decodeOutput, decodeText, keepBytes, safeEnd, safeStart, stripAnsi, trimUtf8Tail
 } from './text.ts'
 import { intArg, textArg } from './paths.ts'
-import { commandEnv, killTree } from './process.ts'
+import { killTree } from './process.ts'
 import type { Sandbox } from './sandbox.ts'
 import { outsidePaths, resolveCommandDir, sandboxRefusal } from './sandbox.ts'
 import { startBackground } from './tasks.ts'
+import { credentialMentions, credentialRefusal } from './secrets.ts'
+import { spawnTool } from './spawn.ts'
+import type { SpawnSpec } from './spawn.ts'
 
 /** `shell`: run one command in the conversation folder, with limits. */
 export async function runShell(
@@ -42,13 +41,16 @@ export async function runShell(
   if (!info) throw new Error(`找不到运行目录：${cwdArg}`)
   if (!info.isDirectory()) throw new Error(`运行目录不是文件夹：${cwdArg}`)
   await refuseOutside(command, cwd, sandbox)
+  // `read` and `grep` refuse credential files; a command can print the same bytes,
+  // so the command line is checked before it runs.
+  const mentions = credentialMentions(command)
+  if (mentions.length > 0) throw new Error(credentialRefusal(mentions))
   const stdin = inputOf(args)
   if (args.background === true) {
-    // A background task has no stdin: nothing is left to feed it once this
-    // answer ends, and a half-open pipe would only make it wait forever.
-    if (stdin !== '') throw new Error('后台任务不支持 stdin；需要输入的命令请去掉 background')
+    // The first lines go into the task's control file, which its wrapper feeds
+    // to the command's stdin; later lines arrive through `task input`.
     const name = typeof args.name === 'string' ? args.name.trim().slice(0, 60) : ''
-    return await startBackground(workDir, command, cwd, cwdArg, name)
+    return await startBackground(workDir, command, cwd, cwdArg, name, stdin)
   }
   const requested = intArg(args, 'timeoutMs') ?? SHELL_TIMEOUT_MS
   const timeoutMs = Math.min(Math.max(requested, 100), MAX_SHELL_TIMEOUT_MS)
@@ -85,6 +87,10 @@ export async function runCode(
   if (!info) throw new Error(`找不到运行目录：${cwdArg}`)
   if (!info.isDirectory()) throw new Error(`运行目录不是文件夹：${cwdArg}`)
   await refuseOutside(code, cwd, sandbox)
+  // Same rule as `shell`: a snippet that opens `.env` prints the key into the
+  // transcript exactly as `read` would.
+  const mentions = credentialMentions(code)
+  if (mentions.length > 0) throw new Error(credentialRefusal(mentions))
   const stdin = inputOf(args)
   // A project interpreter beats PATH, and its bin folder joins PATH so the
   // snippet can call tools the project installed.
@@ -146,39 +152,10 @@ const LIVE_OUTPUT_INTERVAL_MS = 200
 /** Newest bytes kept for the live row; enough for the last few lines. */
 const MAX_LIVE_BYTES = 8 * 1024
 
-/** What to start: a shell line, or a resolved runtime with its own arguments. */
-interface SpawnSpec {
-  /** Executable (or the whole line when `shell` is true). */
-  file: string
-  /** Arguments passed straight to the executable. */
-  args: string[]
-  /** Run through the platform shell, which is how `shell` works. */
-  shell: boolean
+/** What to start, plus the line shown after `$` in the result. */
+interface LabeledSpawn extends SpawnSpec {
   /** Text shown after `$` in the result. */
   label: string
-  /** Folders placed in front of this command's PATH. */
-  pathPrepend?: string[]
-}
-
-/**
- * Resolve a bare executable against PATH for CreateProcessAsUser.
- *
- * The sandbox helper passes the application name explicitly; Windows does not
- * search PATH for that form, so `node` / `python` from a runtime resolver must
- * become an absolute path first.
- */
-function absoluteFile(file: string, prepend: readonly string[] = []): string {
-  if (path.isAbsolute(file)) return file
-  const search = process.env.PATH ?? process.env.Path ?? ''
-  const names = file.toLowerCase().endsWith('.exe') ? [file] : [file, `${file}.exe`]
-  for (const dir of [...prepend, ...search.split(path.delimiter)]) {
-    if (dir === '') continue
-    for (const name of names) {
-      const candidate = path.join(dir, name)
-      if (existsSync(candidate)) return candidate
-    }
-  }
-  return file
 }
 
 /**
@@ -193,7 +170,7 @@ function absoluteFile(file: string, prepend: readonly string[] = []): string {
  * @returns the exit code plus bounded output.
  */
 function spawnProcess(
-  spec: SpawnSpec,
+  spec: LabeledSpawn,
   cwd: string,
   cwdArg: string,
   timeoutMs: number,
@@ -201,47 +178,10 @@ function spawnProcess(
   input = ''
 ): Promise<ToolResult> {
   return new Promise((resolve) => {
-    // The window can hand commands to the Windows sandbox helper. It lowers the
-    // child to Low integrity and keeps it in a Job Object; the command sees the
-    // same stdio pipes, so the live rows and the timeout path are unchanged.
-    const helper = process.env.DSH_SANDBOX_HELPER
-    const workspace = process.env.DSH_SANDBOX_WORKSPACE || cwd
-    const env = commandEnv(spec.pathPrepend ?? [])
-    let child
-    if (helper && process.platform === 'win32') {
-      const dir = path.join(workspace, '.dsh-flow')
-      mkdirSync(dir, { recursive: true })
-      const specPath = path.join(
-        dir,
-        `sandbox-${process.pid}-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}.json`
-      )
-      const payload = {
-        cwd,
-        workspace,
-        readonly: process.env.DSH_SANDBOX_READONLY === '1',
-        file: spec.shell ? process.env.ComSpec || 'cmd.exe' : absoluteFile(spec.file, spec.pathPrepend ?? []),
-        args: spec.shell ? ['/d', '/s', '/c', spec.file] : spec.args
-      }
-      writeFileSync(specPath, JSON.stringify(payload), 'utf8')
-      const temp = path.join(dir, 'sandbox-tmp')
-      env.TEMP = temp
-      env.TMP = temp
-      child = spawn(helper, ['--spec', specPath], {
-        cwd,
-        windowsHide: true,
-        stdio: [input === '' ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-        env
-      })
-    } else {
-      child = spawn(spec.file, spec.args, {
-        cwd,
-        shell: spec.shell,
-        windowsHide: true,
-        // Staying in the engine's group lets the window's stop kill it too.
-        stdio: [input === '' ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-        env
-      })
-    }
+    // The window can hand commands to the Windows sandbox helper; `spawnTool`
+    // applies it (low integrity + Job Object) and keeps the same stdio pipes, so
+    // the live rows and the timeout path are unchanged.
+    const child = spawnTool(spec, cwd, { capture: true, stdin: input !== '' })
     if (input !== '') child.stdin?.end(input)
     let failure = ''
     let timedOut = false

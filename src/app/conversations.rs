@@ -2,6 +2,52 @@
 
 use super::*;
 
+/**
+ * One message as it goes to disk, with the two texts that can dwarf a transcript
+ * clipped: the tool arguments and the tool output. The request ledger keeps them
+ * whole, so the expanded row still has something worth showing.
+ * @param message - the transcript row.
+ * @returns the row as `chat.json` stores it.
+ */
+fn stored_message(message: &ChatMessage) -> crate::chats::StoredMessage {
+    crate::chats::StoredMessage {
+        role: role_name(message.role).to_string(),
+        text: message.text.clone(),
+        failed: message.failed,
+        model: message.model.clone(),
+        elapsed_ms: message.elapsed_ms,
+        model_ms: message.model_ms,
+        tool_ms: message.tool_ms,
+        tokens: message.tokens,
+        context: message.context,
+        cache_hits: message.cache_hits,
+        rounds: message.rounds,
+        round_tokens: message.round_tokens.clone(),
+        round_reasoning: message.round_reasoning.clone(),
+        composition: message.composition.clone(),
+        tools_tokens: message.tools_tokens,
+        compaction_layer: message.compaction_layer.clone(),
+        compaction_saved: message.compaction_saved,
+        interrupted: message.interrupted,
+        reasoning: message.reasoning.clone(),
+        server_tool_calls: message.server_tool_calls.clone(),
+        round: message.round,
+        kind: message.kind.key().to_string(),
+        input: crate::chats::clip_stored_text(&message.input),
+        output: crate::chats::clip_stored_text(&message.output),
+        open: message.open,
+        call: message.call.clone(),
+        path: message.path.clone(),
+        image_mime: message.image_mime.clone(),
+        image_path: message.image_path.clone(),
+        files: message.files.clone(),
+        before: message.before.clone(),
+        after: message.after.clone(),
+        existed: message.existed,
+        undoable: message.undoable,
+    }
+}
+
 impl DshFlowApp {
     /// Write every conversation into the data directory, one folder each.
     ///
@@ -9,6 +55,15 @@ impl DshFlowApp {
     /// window loses at most the answer in flight. A failed write is reported in
     /// the banner but never interrupts the conversation.
     pub(crate) fn save_chats(&mut self) {
+        // Which conversations changed since the last successful write. A clean one
+        // keeps its messages out of memory here and out of the file below, so a
+        // step in one chat no longer re-serializes the whole history.
+        let changed: std::collections::BTreeSet<String> = self
+            .chats
+            .iter()
+            .filter(|chat| self.saved_revisions.get(&chat.dir).copied() != Some(chat.revision))
+            .map(|chat| chat.dir.clone())
+            .collect();
         let stored: Vec<crate::chats::StoredChat> = self
             .chats
             .iter()
@@ -66,47 +121,23 @@ impl DshFlowApp {
                         status: todo.status.key().to_string(),
                     })
                     .collect(),
-                messages: chat
-                    .messages
-                    .iter()
-                    .map(|message| crate::chats::StoredMessage {
-                        role: role_name(message.role).to_string(),
-                        text: message.text.clone(),
-                        failed: message.failed,
-                        model: message.model.clone(),
-                        elapsed_ms: message.elapsed_ms,
-                        model_ms: message.model_ms,
-                        tool_ms: message.tool_ms,
-                        tokens: message.tokens,
-                        context: message.context,
-                        cache_hits: message.cache_hits,
-                        rounds: message.rounds,
-                        round_tokens: message.round_tokens.clone(),
-                        round_reasoning: message.round_reasoning.clone(),
-                        composition: message.composition.clone(),
-                        tools_tokens: message.tools_tokens,
-                        compaction_layer: message.compaction_layer.clone(),
-                        compaction_saved: message.compaction_saved,
-                        interrupted: message.interrupted,
-                        reasoning: message.reasoning.clone(),
-                        server_tool_calls: message.server_tool_calls.clone(),
-                        round: message.round,
-                        kind: message.kind.key().to_string(),
-                        input: message.input.clone(),
-                        output: message.output.clone(),
-                        open: message.open,
-                        call: message.call.clone(),
-                        path: message.path.clone(),
-                        before: message.before.clone(),
-                        after: message.after.clone(),
-                        existed: message.existed,
-                        undoable: message.undoable,
-                    })
-                    .collect(),
+                messages: if changed.contains(&chat.dir) {
+                    chat.messages.iter().map(stored_message).collect()
+                } else {
+                    Vec::new()
+                },
             })
             .collect();
-        if let Err(error) = crate::chats::save(&self.ai.data_dir(), &stored) {
+        if let Err(error) = crate::chats::save_changed(&self.ai.data_dir(), &stored, Some(&changed))
+        {
             self.banner = Some(Banner::error(error));
+            return;
+        }
+        // Only a successful write may record these revisions as saved.
+        for chat in &self.chats {
+            if changed.contains(&chat.dir) {
+                self.saved_revisions.insert(chat.dir.clone(), chat.revision);
+            }
         }
     }
 
@@ -306,7 +337,7 @@ impl DshFlowApp {
         };
         let mut field = TextField::new(cx);
         field.set_text(chat.title.clone());
-        self.renaming = Some((index, field));
+        self.renaming = Some((RenameTarget::Chat(index), field));
         self.focused = Some(Field::ChatTitle);
         if let Some((_, field)) = self.renaming.as_ref() {
             window.focus(&field.focus_handle().clone(), cx);
@@ -317,16 +348,58 @@ impl DshFlowApp {
 
     /// Keep whatever was typed as the title, unless it is blank.
     pub(crate) fn commit_rename(&mut self) {
-        let Some((index, field)) = self.renaming.take() else {
+        let Some((target, field)) = self.renaming.take() else {
             return;
         };
-        let Some(title) = rename_to(&field.text) else {
+        let Some(label) = rename_to(&field.text) else {
             return;
         };
-        if let Some(chat) = self.chats.get_mut(index) {
-            chat.title = title;
+        match target {
+            RenameTarget::Chat(index) => {
+                if let Some(chat) = self.chats.get_mut(index) {
+                    chat.title = label;
+                }
+                self.save_chats();
+            }
+            RenameTarget::Workflow(name) => {
+                // Presentation only: the manifest keeps its name, so discovery,
+                // filing and run history are untouched.
+                if label == name {
+                    self.workflow_labels.remove(&name);
+                } else {
+                    self.workflow_labels.insert(name, label);
+                }
+                self.save_categories();
+            }
         }
-        self.save_chats();
+    }
+
+    /// Start renaming a workflow card's display name.
+    ///
+    /// The label lives in the sidebar file; the manifest on disk is not edited,
+    /// so a renamed card keeps its run history and its discovery identity.
+    pub(crate) fn start_rename_workflow(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.card_menu = None;
+        self.confirm_delete_workflow = None;
+        let current = self
+            .workflow_labels
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let mut field = TextField::new(cx);
+        field.set_text(current);
+        self.renaming = Some((RenameTarget::Workflow(name.to_string()), field));
+        self.focused = Some(Field::ChatTitle);
+        if let Some((_, field)) = self.renaming.as_ref() {
+            window.focus(&field.focus_handle().clone(), cx);
+        }
+        self.start_caret_blink(cx);
+        cx.notify();
     }
 
     /// Drop the edit and keep the old title.
@@ -361,6 +434,8 @@ impl DshFlowApp {
 
     /// Write the categories, which one is open, and the workflow cards.
     pub(crate) fn save_categories(&mut self) {
+        let mut cleared: Vec<String> = self.flow_cleared.iter().cloned().collect();
+        cleared.sort();
         let stored = crate::sidebar_store::StoredSidebar {
             categories: self
                 .categories
@@ -376,6 +451,8 @@ impl DshFlowApp {
                 .chats
                 .get(self.active_chat)
                 .map_or_else(String::new, |chat| chat.dir.clone()),
+            labels: self.workflow_labels.clone(),
+            cleared,
         };
         let dir = self.ai.data_dir();
         if let Err(error) = crate::sidebar_store::save(&dir, &stored) {
@@ -505,6 +582,7 @@ impl DshFlowApp {
     /// from the list is the reversible option; the folder is not ours to delete.
     pub(crate) fn remove_workflow(&mut self, name: &str, cx: &mut Context<Self>) {
         self.card_menu = None;
+        self.confirm_delete_workflow = None;
         if !self.hidden_workflows.iter().any(|hidden| hidden == name) {
             self.hidden_workflows.push(name.to_string());
             self.workflow_categories
@@ -520,6 +598,97 @@ impl DshFlowApp {
             self.view = View::Chat;
         }
         self.save_categories();
+        cx.notify();
+    }
+
+    /// Delete a workflow card **and its folder**.
+    ///
+    /// The folder is moved to `<scan root>/backups/deleted-workflows/` rather than
+    /// erased: the reader asked for it to leave the workspace, and a backup keeps
+    /// the code recoverable. The card's store record (category, hidden flag, run
+    /// history) is removed by the next save.
+    pub(crate) fn delete_workflow(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.card_menu = None;
+        self.confirm_delete_workflow = None;
+        let Some(entry) = self
+            .workflows
+            .iter()
+            .find(|entry| entry.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(folder) = entry.path.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        if !folder.starts_with(&self.scan_root) {
+            self.banner = Some(Banner::error(format!(
+                "拒绝删除扫描根之外的目录：{}",
+                folder.display()
+            )));
+            cx.notify();
+            return;
+        }
+        let backups = self.scan_root.join("backups").join("deleted-workflows");
+        if let Err(error) = std::fs::create_dir_all(&backups) {
+            self.banner = Some(Banner::error(format!(
+                "无法创建 {}：{error}",
+                backups.display()
+            )));
+            cx.notify();
+            return;
+        }
+        let label = folder
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workflow");
+        let dest = backups.join(format!("{}-{label}", util::now_ms()));
+        if let Err(error) = std::fs::rename(&folder, &dest) {
+            self.banner = Some(Banner::error(format!(
+                "无法移动 {}：{error}",
+                folder.display()
+            )));
+            cx.notify();
+            return;
+        }
+
+        let shown = self
+            .workflow_labels
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let selected_name = self
+            .selected_flow
+            .and_then(|index| self.workflows.get(index))
+            .map(|entry| entry.name.clone());
+        self.workflows.retain(|entry| entry.name != name);
+        self.workflow_categories.retain(|(workflow, _)| workflow != name);
+        self.hidden_workflows.retain(|hidden| hidden != name);
+        self.workflow_labels.remove(name);
+        self.flow_cleared.remove(name);
+        self.past_runs.retain(|run| run.workflow != name);
+        let had_history = self.history.iter().any(|record| record.workflow_name == name);
+        self.history.retain(|record| record.workflow_name != name);
+        if had_history {
+            self.selected_run = None;
+        }
+        if selected_name.as_deref() == Some(name) {
+            self.selected_flow = None;
+            self.view = View::Chat;
+        } else {
+            self.selected_flow = selected_name
+                .as_deref()
+                .and_then(|name| self.workflows.iter().position(|entry| entry.name == name));
+        }
+        // The next save also drops the store folder, because its name is no
+        // longer in any list.
+        self.save_categories();
+        self.refresh_workflows();
+        self.show_toast(
+            format!("已删除「{shown}」；文件夹在 backups/deleted-workflows/"),
+            false,
+            cx,
+        );
         cx.notify();
     }
 
@@ -684,11 +853,86 @@ impl DshFlowApp {
 
     /// Show one workflow's plan.
     pub(crate) fn select_flow(&mut self, index: usize, cx: &mut Context<Self>) {
+        // `pane()` always shows the run in flight, so letting the sidebar move to
+        // another workflow here would pair that run with the other card's title
+        // and inputs. Keep the selection on the running workflow until it stops.
+        let active_name = self
+            .active
+            .as_ref()
+            .map(|active| active.workflow_name.clone());
+        if let Some(active_name) = active_name
+            && self
+                .workflows
+                .get(index)
+                .is_some_and(|entry| entry.name != active_name)
+        {
+            self.show_toast("有工作流正在运行，先停止再切换", true, cx);
+            return;
+        }
         self.selected_flow = Some(index);
         self.selected_run = None;
         self.selected_step = None;
+        self.flow_tab = FlowTab::Current;
+        self.history_open = None;
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
         self.view = View::Flow;
         self.rebuild_inputs(cx);
+        self.load_recent_runs(cx);
+        // The "current" tab opens on the newest finished run of this workflow
+        // when nothing is in flight and the reader has not started a new run;
+        // a run in flight is shown instead.
+        let name = self.selected_entry().map(|entry| entry.name.clone());
+        let cleared = name
+            .as_ref()
+            .is_some_and(|name| self.flow_cleared.contains(name));
+        if self.active.is_none() && !cleared {
+            self.selected_run = name.as_ref().and_then(|name| {
+                self.history
+                    .iter()
+                    .position(|record| &record.workflow_name == name)
+            });
+        }
+    }
+
+    /// Pull the selected workflow's newest saved snapshots into the history.
+    ///
+    /// The app loads the tail of every workflow at start-up; this covers a
+    /// workflow whose folder was opened for the first time since then, and it
+    /// keeps the "复盘" list on disk rather than only in memory.
+    fn load_recent_runs(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.selected_entry() else {
+            return;
+        };
+        let name = entry.name.clone();
+        let spec = entry.spec.clone();
+        let path = entry.path.clone();
+        let data = self.ai.data_dir();
+        let stored = crate::run_store::load_workflow(&data, &name, MAX_HISTORY);
+        let mut added = false;
+        for run in stored {
+            // A run that died before the engine assigned an id shares `run_id
+            // == ""` with every other such run; the finish time is what tells
+            // them apart.
+            if self.history.iter().any(|record| {
+                record.workflow_name == run.workflow
+                    && record.outcome.run_id == run.run_id
+                    && record.finished_ms == run.finished_ms
+            }) {
+                continue;
+            }
+            self.history.push(RunRecord::from_stored_parts(
+                run,
+                Some(spec.clone()),
+                Some(path.clone()),
+            ));
+            added = true;
+        }
+        if added {
+            self.history
+                .sort_by_key(|record| std::cmp::Reverse(record.finished_ms));
+            self.history.truncate(MAX_HISTORY);
+            cx.notify();
+        }
     }
 
     /// Resize the sidebar from a pointer position in window coordinates.
@@ -698,6 +942,71 @@ impl DshFlowApp {
             self.sidebar_width = width;
             cx.notify();
         }
+    }
+
+    /// Show the current run: the one in flight, or the newest finished one.
+    pub(crate) fn show_current_run(&mut self, cx: &mut Context<Self>) {
+        self.flow_tab = FlowTab::Current;
+        self.history_open = None;
+        let name = self.selected_entry().map(|entry| entry.name.clone());
+        let cleared = name
+            .as_ref()
+            .is_some_and(|name| self.flow_cleared.contains(name));
+        let newest = name.as_ref().and_then(|name| {
+            self.history
+                .iter()
+                .position(|record| &record.workflow_name == name)
+        });
+        self.selected_run = if self.active.is_some() || cleared {
+            None
+        } else {
+            newest
+        };
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Show every saved run of this workflow, newest first.
+    pub(crate) fn show_run_history(&mut self, cx: &mut Context<Self>) {
+        self.flow_tab = FlowTab::History;
+        self.history_open = None;
+        self.selected_run = None;
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
+        cx.notify();
+    }
+
+    /// Open one saved run from the history list.
+    pub(crate) fn open_run_history(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.flow_tab = FlowTab::History;
+        self.history_open = Some(index);
+        self.selected_run = Some(index);
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
+        self.leave_fields(window, cx);
+        cx.notify();
+    }
+
+    /// Leave the opened history record and go back to the list.
+    pub(crate) fn close_run_history(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.history_open = None;
+        self.selected_run = None;
+        self.transcript_scroll.set_offset(point(px(0.), px(0.)));
+        self.leave_fields(window, cx);
+        cx.notify();
+    }
+
+    /// The history entries of one workflow, newest first, as indices.
+    pub(crate) fn flow_history(&self, workflow: &str) -> Vec<usize> {
+        self.history
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.workflow_name == workflow)
+            .map(|(index, _)| index)
+            .collect()
     }
 
     /// Hold one conversation at the top of its category, or put it back.
@@ -744,6 +1053,10 @@ pub(crate) struct SavedSidebar {
     pub(crate) width: Option<f32>,
     /// Folder of the conversation that was on screen.
     pub(crate) active: String,
+    /// Display names for workflow cards, keyed by manifest name.
+    pub(crate) labels: std::collections::HashMap<String, String>,
+    /// Workflows whose current tab was cleared by “新建运行”.
+    pub(crate) cleared: Vec<String>,
 }
 
 /// What the workflow record said, ready for the sidebar.
@@ -828,6 +1141,9 @@ pub(crate) fn load_saved(
                     restored.open = message.open;
                     restored.call = message.call;
                     restored.path = message.path;
+                    restored.image_mime = message.image_mime;
+                    restored.image_path = message.image_path;
+                    restored.files = message.files;
                     restored.before = message.before;
                     restored.after = message.after;
                     restored.existed = message.existed;
@@ -1047,6 +1363,8 @@ pub(crate) fn load_sidebar(dir: &Path) -> SavedSidebar {
             open: String::new(),
             width: None,
             active: String::new(),
+            labels: std::collections::HashMap::new(),
+            cleared: Vec::new(),
         };
     };
     let mut categories: Vec<Category> = stored
@@ -1065,6 +1383,8 @@ pub(crate) fn load_sidebar(dir: &Path) -> SavedSidebar {
         open: stored.open,
         width: stored.width,
         active: stored.active,
+        labels: stored.labels,
+        cleared: stored.cleared,
     }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "Office 文档操作",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "api": 1,
   "main": "index.js"
 }

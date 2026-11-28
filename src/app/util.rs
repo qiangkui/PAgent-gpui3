@@ -28,6 +28,28 @@ pub(crate) fn ago(finished_ms: u64) -> String {
     elapsed_label(now.saturating_sub(finished_ms) / 1000)
 }
 
+/// The name a workflow card and its header show.
+///
+/// 输入框 + 生成的草稿会在清单的 `name:` 后面加「（草稿·第N轮）」，让三份文件一眼
+/// 能看出是草稿。占位步骤全部被替换后，这个后缀只是噪音：显示时去掉它，但不改写文件。
+/// @param name - 清单里的 `name:`。
+/// @param placeholders - 仍然是 `skip` 的步骤数。
+/// @returns 显示用的名字。
+pub(crate) fn workflow_display_name(name: &str, placeholders: usize) -> String {
+    if placeholders > 0 {
+        return name.to_string();
+    }
+    if name.ends_with('）')
+        && let Some(at) = name.rfind("（草稿")
+    {
+        let base = name[..at].trim();
+        if !base.is_empty() {
+            return base.to_string();
+        }
+    }
+    name.to_string()
+}
+
 /// The words for an age in seconds.
 ///
 /// Split from [`ago`] so the wording can be checked without waiting for a clock.
@@ -162,10 +184,19 @@ fn binary_kind(bytes: &[u8]) -> Option<(AttachmentKind, &'static str)> {
     if bytes.starts_with(b"BM") {
         return image("image/bmp");
     }
-    if bytes.starts_with(b"%PDF-") {
+    if has_pdf_header(bytes) {
         return Some((AttachmentKind::Pdf, "application/pdf"));
     }
     None
+}
+
+/// Whether a PDF header sits where the specification allows it.
+///
+/// Up to 1024 bytes of junk may precede `%PDF-` (mail gateways and some scanners
+/// add it), so requiring the marker at byte zero would refuse a valid file.
+fn has_pdf_header(bytes: &[u8]) -> bool {
+    let window = bytes.len().min(1_024);
+    bytes[..window].windows(5).any(|slice| slice == b"%PDF-")
 }
 
 /// How an attached file reaches the model: its name, then its text.
@@ -1070,12 +1101,62 @@ pub(crate) fn allow_session_button(tool: &str, input: &str) -> bool {
     matches!(tool, "shell" | "python" | "node") && !input.contains(CLIPPED_CARD_MARK)
 }
 
+/// Whether an approval may be answered without the person seeing it.
+///
+/// `auto` is the engine saying the action already ran (a write it reported after
+/// the fact); `trusted`, `remembered` and `reviewed` are the conversation's own
+/// rules. A credential is never answered this way: a key leaving the machine is
+/// the one action 完全权限 should not cover, so the card is always drawn.
+pub(crate) fn approval_auto_answered(
+    secret: bool,
+    auto: bool,
+    trusted: bool,
+    remembered: bool,
+    reviewed: bool,
+) -> bool {
+    if secret && !auto {
+        return false;
+    }
+    auto || trusted || remembered || reviewed
+}
+
+/// Whether a card may offer "本次会话都允许" for a file it would change.
+///
+/// Only `write` and `edit` on a named path are remembered, and the key is the
+/// path rather than the content: a burst of small edits to one file stops asking,
+/// while a different file still asks. `replace` spans several files, so it keeps
+/// asking every time.
+pub(crate) fn allow_file_session_button(tool: &str, path: &str) -> bool {
+    matches!(tool, "write" | "edit") && !path.trim().is_empty()
+}
+
+/**
+ * The key `write` / `edit` remember under: one path, one conversation.
+ *
+ * `./a.txt`, `a.txt` and `a\b.txt` name the same file on Windows, so the key is
+ * normalised the same way the tools resolve them.
+ * @param path - the path as the approval card carries it.
+ * @returns the key stored in `chat.allow_session`.
+ */
+pub(crate) fn file_session_key(path: &str) -> String {
+    let normalised = path
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_string();
+    format!("file{}{normalised}", SESSION_SEP)
+}
+
+/// Separator between a session key's kind and its target: unit separator, which
+/// cannot appear in a command line or a path.
+const SESSION_SEP: char = '\u{1f}';
+
 /// The key remembered by "本次会话都允许": the tool plus its exact command or snippet.
 ///
 /// The tool is part of the key so a code snippet can never approve a command
 /// that happens to start with the same text.
 pub(crate) fn session_key(tool: &str, command: &str) -> String {
-    format!("{tool}\u{1f}{command}")
+    format!("{tool}{SESSION_SEP}{command}")
 }
 
 /// Longest project instruction text handed to the model.
@@ -1297,6 +1378,12 @@ pub(crate) fn approval_label(tool: &str) -> &'static str {
         "python" | "node" => "代码确认",
         "task" => "任务确认",
         "move" => "移动确认",
+        "git_write" => "仓库确认",
+        "wait_for" => "等待确认",
+        "run_tests" => "测试确认",
+        "diagnostics" => "检查确认",
+        "copy" => "复制确认",
+        "mkdir" => "建目录确认",
         "delete" => "删除确认",
         "replace" => "批量替换确认",
         "write" | "edit" => "写入确认",
@@ -1310,13 +1397,21 @@ pub(crate) fn approval_label(tool: &str) -> &'static str {
 pub(crate) fn approval_hint(tool: &str) -> &'static str {
     match tool {
         "shell" => "允许后才会执行；「本次会话都允许」只记住同一条命令",
-        "http" => "允许后才会发出请求；请求不会自动跟随重定向",
+        "http" => {
+            "允许后才会发出请求；会跟随最多 5 次 http / https 重定向；认证只从环境变量取，值不会显示"
+        }
         "python" | "node" => "允许后才会运行这段代码；「本次会话都允许」只记住同一段代码",
-        "task" => "允许后才会结束后台任务；拒绝则它继续运行",
+        "task" => "允许后才会改动后台任务（写 stdin / 关 stdin / 结束）；拒绝则它保持原样",
         "move" => "允许后才会移动；拒绝则文件保持原样",
+        "git_write" => "允许后才会改动仓库；拒绝则 commit / 分支 / stash 都不会发生",
+        "wait_for" => "允许后才会开始等待；它只轮询，不改动任何东西",
+        "run_tests" => "允许后才会运行测试；失败用例会被解析成清单，完整输出附在后面",
+        "diagnostics" => "允许后才会运行编译检查；错误与警告会解析成「文件:行:列」清单",
+        "copy" => "允许后才会复制；目标已存在时不会覆盖，除非调用时写了 overwrite",
+        "mkdir" => "允许后才会新建目录；拒绝则什么也不会创建",
         "delete" => "允许后才会删除；删除后不能撤销",
         "replace" => "允许后才会改写列出的文件；拒绝则文件保持原样",
-        "write" | "edit" => "允许后才会写入；拒绝则文件保持原样",
+        "write" | "edit" => "允许后才会写入；「本次会话都允许」只记住这个文件的路径",
         "mcp" => "允许后才会调用 MCP 工具；每次调用都会再问一次",
         name if name.starts_with("mcp_") => "允许后才会调用 MCP 工具；每次调用都会再问一次",
         // Plugin code runs inside the engine, so it asks every single time and
@@ -1332,10 +1427,22 @@ pub(crate) fn approval_state(tool: &str, ok: bool) -> &'static str {
         ("shell" | "python" | "node", false) => "执行失败",
         ("http", true) => "已完成",
         ("http", false) => "请求失败",
-        ("task", true) => "已结束",
-        ("task", false) => "结束失败",
+        ("task", true) => "已完成",
+        ("task", false) => "操作失败",
         ("move", true) => "已移动",
         ("move", false) => "移动失败",
+        ("copy", true) => "已复制",
+        ("copy", false) => "复制失败",
+        ("git_write", true) => "已完成",
+        ("git_write", false) => "失败",
+        ("wait_for", true) => "已就绪",
+        ("wait_for", false) => "等待失败",
+        ("run_tests", true) => "测试通过",
+        ("run_tests", false) => "测试未通过",
+        ("diagnostics", true) => "检查通过",
+        ("diagnostics", false) => "有错误",
+        ("mkdir", true) => "已创建",
+        ("mkdir", false) => "创建失败",
         ("delete", true) => "已删除",
         ("delete", false) => "删除失败",
         ("replace", true) => "已替换",
@@ -1396,13 +1503,19 @@ pub(crate) fn settle_interactions(chat: &mut Chat, state: &str) {
 /// Whether a low-risk approval can be granted by rule instead of a card.
 ///
 /// Deliberately conservative: only writes inside the conversation's workspace
-/// with an ordinary path, and a short list of read-only commands. Anything a
-/// shell can chain (`&&`, `|`, `>`, `$(…)`), anything that deletes or publishes,
-/// and every plugin/MCP call still asks. Note that `cargo` commands on the list
-/// do run the workspace's own build scripts and tests, so auto review is only
-/// meant for a workspace the person trusts.
-pub(crate) fn auto_review_allows(tool: &str, command: &str, path: &str, diff: &str) -> bool {
-    if matches!(tool, "write" | "edit") {
+/// with an ordinary path, a short list of read-only commands, and `wait_for`
+/// (which only polls). Anything a shell can chain (`&&`, `|`, `>`, `$(…)`),
+/// anything that deletes or publishes, and every plugin/MCP call still asks. Note
+/// that `cargo` commands on the list do run the workspace's own build scripts and
+/// tests, so auto review is only meant for a workspace the person trusts.
+pub(crate) fn auto_review_allows(
+    tool: &str,
+    command: &str,
+    path: &str,
+    diff: &str,
+    extra: &[String],
+) -> bool {
+    if matches!(tool, "write" | "edit" | "copy" | "mkdir") {
         let path = path.trim().to_ascii_lowercase();
         if path.is_empty() {
             return false;
@@ -1430,6 +1543,11 @@ pub(crate) fn auto_review_allows(tool: &str, command: &str, path: &str, diff: &s
         }
         // A huge rewrite is worth a card even inside the workspace.
         return diff.len() <= 200_000;
+    }
+    // `wait_for` only polls a port, a page or a task log: it changes nothing, so
+    // a development loop does not need a card for every readiness check.
+    if tool == "wait_for" {
+        return true;
     }
     if tool != "shell" {
         return false;
@@ -1459,7 +1577,7 @@ pub(crate) fn auto_review_allows(tool: &str, command: &str, path: &str, diff: &s
         return false;
     }
     let words: Vec<&str> = command.split_whitespace().collect();
-    matches!(
+    let built_in = matches!(
         words.as_slice(),
         ["git", "status", ..]
             | ["git", "diff", ..]
@@ -1481,7 +1599,18 @@ pub(crate) fn auto_review_allows(tool: &str, command: &str, path: &str, diff: &s
             | ["node", "-v"]
             | ["python", "--version"]
             | ["python", "-V"]
-    )
+    );
+    if built_in {
+        return true;
+    }
+    // Commands the person added to the review list. The guards above still
+    // apply, so nothing chained or redirected sneaks in; the entry has to cover
+    // the whole line, which is why `npm test` also covers `npm test --watch`
+    // while `npm` would cover every npm script there is.
+    extra.iter().any(|prefix| {
+        let prefix = prefix.trim();
+        !prefix.is_empty() && (command == prefix || command.starts_with(&format!("{prefix} ")))
+    })
 }
 
 /// Short conversation title from the first question.
@@ -1715,6 +1844,37 @@ pub(crate) fn open_path(path: &Path) -> std::io::Result<()> {
     let mut command = {
         let mut command = std::process::Command::new("xdg-open");
         command.arg(path);
+        command
+    };
+    command.spawn().map(|_| ())
+}
+
+/// Show a file inside the folder that holds it, selected, never through a shell.
+///
+/// `open_path` opens the file itself; this is for the reader who wants to move,
+/// rename or send it, and would otherwise go looking through the workspace.
+pub(crate) fn reveal_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        // `explorer /select,<path>` takes the switch and the path as one argument,
+        // and no quotes around the path: it reads the rest of the argument itself.
+        let mut argument = std::ffi::OsString::from("/select,");
+        argument.push(path);
+        command.arg(argument);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        // There is no portable "select this file"; the folder is the closest thing.
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
         command
     };
     command.spawn().map(|_| ())

@@ -6,11 +6,13 @@
  * checked without executing anything.
  */
 
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { validateSchema } from './schema.ts'
 import { checkTemplateSyntax } from './template.ts'
-import type { AiSpec, InputSpec, MapSpec, RunSpec, ServiceSpec, Step, Workflow } from './types.ts'
+import type {
+  AiSpec, InputSpec, MapSpec, RunSpec, ServiceSpec, Step, UseSpec, Workflow
+} from './types.ts'
 import { parseYaml } from './yaml.ts'
 
 /** Manifest entry as written, before normalization. */
@@ -43,6 +45,8 @@ interface RawStep {
   map?: unknown
   /** Model-call form. */
   ai?: unknown
+  /** Sub-flow form. */
+  use?: unknown
 }
 
 /** A loaded manifest plus the directory its paths resolve against. */
@@ -58,7 +62,7 @@ export interface LoadedWorkflow {
 }
 
 const ALLOWED_STEP_KEYS = new Set([
-  'id', 'desc', 'when', 'skip', 'once', 'allowFailure', 'retries', 'retryDelayMs', 'save', 'why', 'run', 'set', 'map', 'ai',
+  'id', 'desc', 'when', 'skip', 'once', 'allowFailure', 'retries', 'retryDelayMs', 'save', 'why', 'run', 'set', 'map', 'ai', 'use',
 ])
 
 /**
@@ -211,10 +215,17 @@ function normalizeInputs(raw: unknown, file: string): Record<string, InputSpec> 
   const out: Record<string, InputSpec> = {}
   for (const [name, spec] of Object.entries(raw)) {
     if (!isRecord(spec)) throw new Error(`${file}: input "${name}" must be a mapping`)
+    const secret = spec.secret === true
+    if (secret && spec.default !== undefined && spec.default !== null) {
+      // A default in the manifest is the very leak this flag exists to stop:
+      // the file is committed, and the value would also travel on a command line.
+      throw new Error(`${file}: input "${name}" 标了 secret: true，就不能再写 default（密码不进清单）`)
+    }
     out[name] = {
       description: typeof spec.description === 'string' ? spec.description : undefined,
       required: spec.required === true,
       default: spec.default,
+      secret: secret ? true : undefined,
     }
   }
   return out
@@ -275,9 +286,13 @@ function normalizeStep(raw: unknown, file: string, warnings: string[], where: st
   const id = step.id as string
   if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`${file}: step id "${id}" may only contain letters, digits, "_" and "-"`)
 
-  const kinds = [step.run, step.set, step.map, step.ai].filter(value => value !== undefined && value !== null)
-  if (kinds.length === 0) throw new Error(`${file}: step "${id}" needs exactly one of "run", "set", "map", or "ai"`)
-  if (kinds.length > 1) throw new Error(`${file}: step "${id}" may only use one of "run", "set", "map", or "ai"`)
+  const kinds = [step.run, step.set, step.map, step.ai, step.use].filter(value => value !== undefined && value !== null)
+  if (kinds.length === 0) {
+    throw new Error(`${file}: step "${id}" needs exactly one of "run", "set", "map", "ai", or "use"`)
+  }
+  if (kinds.length > 1) {
+    throw new Error(`${file}: step "${id}" may only use one of "run", "set", "map", "ai", or "use"`)
+  }
 
   const when = optionalString(step.when, `${file}: step "${id}" has a non-string "when"`)
   if (when !== undefined) checkTemplateSyntax(`{{ ${when} }}`)
@@ -304,7 +319,56 @@ function normalizeStep(raw: unknown, file: string, warnings: string[], where: st
     return { ...base, set: step.set }
   }
   if (step.ai !== undefined && step.ai !== null) return { ...base, ai: normalizeAi(step.ai, id, file, warnings) }
+  if (step.use !== undefined && step.use !== null) return { ...base, use: normalizeUse(step.use, id, file, warnings) }
   return { ...base, map: normalizeMap(step.map, id, file, warnings) }
+}
+
+/**
+ * Normalize a `use` step: a path, or a mapping with `manifest` and `inputs`.
+ *
+ * A manifest path without a template is checked on disk here, so a renamed or
+ * mistyped sub-flow is a `validate` error rather than a mid-run surprise.
+ * @param raw - the `use` value.
+ * @param id - step id, for messages.
+ * @param file - manifest path, for messages.
+ * @param warnings - collector for non-fatal findings.
+ * @returns the normalized sub-flow call.
+ */
+function normalizeUse(raw: unknown, id: string, file: string, warnings: string[]): UseSpec {
+  if (typeof raw === 'string') return useSpec(raw.trim(), undefined, id, file)
+  if (!isRecord(raw)) throw new Error(`${file}: step "${id}" "use" must be a path or a mapping`)
+  for (const key of Object.keys(raw)) {
+    if (key !== 'manifest' && key !== 'inputs') warnings.push(`${file}: step "${id}" has unknown "use.${key}"`)
+  }
+  if (typeof raw.manifest !== 'string' || raw.manifest.trim() === '') {
+    throw new Error(`${file}: step "${id}" "use.manifest" is required`)
+  }
+  let inputs: Record<string, unknown> | undefined
+  if (raw.inputs !== undefined && raw.inputs !== null) {
+    if (!isRecord(raw.inputs)) throw new Error(`${file}: step "${id}" "use.inputs" must be a mapping`)
+    inputs = raw.inputs
+    for (const value of Object.values(inputs)) {
+      if (typeof value === 'string') checkTemplateSyntax(value)
+    }
+  }
+  return useSpec(raw.manifest.trim(), inputs, id, file)
+}
+
+/** One checked `use` spec. */
+function useSpec(
+  manifest: string,
+  inputs: Record<string, unknown> | undefined,
+  id: string,
+  file: string
+): UseSpec {
+  checkTemplateSyntax(manifest)
+  if (!manifest.includes('{{')) {
+    const target = resolve(dirname(file), manifest)
+    if (!existsSync(target)) {
+      throw new Error(`${file}: step "${id}" uses a manifest that does not exist: ${manifest}`)
+    }
+  }
+  return { manifest, inputs }
 }
 
 /**
@@ -378,6 +442,7 @@ function normalizeMap(raw: unknown, id: string, file: string, warnings: string[]
 /** Keys understood inside an `ai` step. */
 const ALLOWED_AI_KEYS = new Set([
   'prompt', 'system', 'schema', 'model', 'temperature', 'maxTokens', 'backend', 'command', 'timeoutMs',
+  'images', 'cache',
 ])
 
 /**
@@ -429,6 +494,14 @@ function normalizeAi(raw: unknown, id: string, file: string, warnings: string[])
   const timeoutMs = optionalNumber(raw.timeoutMs, `${file}: step "${id}" has a non-numeric "ai.timeoutMs"`)
   if (timeoutMs !== undefined && timeoutMs < 1) throw new Error(`${file}: step "${id}" "ai.timeoutMs" must be positive`)
 
+  const images = normalizeAiImages(raw.images, id, file)
+  const cache = normalizeAiCache(raw.cache, id, file)
+  if (cache === false) {
+    warnings.push(
+      `${file}: step "${id}" 的 ai.cache 是 false：每次运行都会调用模型，记录不复用（验证码这类每次都变的判断点就该这样）`,
+    )
+  }
+
   return {
     prompt,
     system,
@@ -436,10 +509,49 @@ function normalizeAi(raw: unknown, id: string, file: string, warnings: string[])
     model: optionalString(raw.model, `${file}: step "${id}" has a non-string "ai.model"`),
     temperature,
     maxTokens,
+    images,
+    cache,
     backend: backend as AiSpec['backend'],
     command,
     timeoutMs,
   }
+}
+
+/**
+ * Normalize `ai.images`.
+ * @param raw - the manifest value.
+ * @param id - owning step id, for messages.
+ * @param file - manifest path, for messages.
+ * @returns the list of path templates, or undefined.
+ */
+function normalizeAiImages(raw: unknown, id: string, file: string): string[] | undefined {
+  if (raw === undefined || raw === null) return undefined
+  if (!Array.isArray(raw)) throw new Error(`${file}: step "${id}" "ai.images" must be a list of paths`)
+  if (raw.length === 0) throw new Error(`${file}: step "${id}" "ai.images" is an empty list`)
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new Error(`${file}: step "${id}" "ai.images" entries must be non-empty strings`)
+    }
+    checkTemplateSyntax(entry)
+  }
+  return raw as string[]
+}
+
+/**
+ * Normalize `ai.cache`.
+ *
+ * Only `true` and `false` are accepted: leaving it out means "replay when the
+ * question is unchanged", which is the engine default and the reason a settled
+ * workflow costs nothing.
+ * @param raw - the manifest value.
+ * @param id - owning step id, for messages.
+ * @param file - manifest path, for messages.
+ * @returns the flag, or undefined when the step follows the default.
+ */
+function normalizeAiCache(raw: unknown, id: string, file: string): boolean | undefined {
+  if (raw === undefined || raw === null) return undefined
+  if (raw !== true && raw !== false) throw new Error(`${file}: step "${id}" "ai.cache" must be true or false`)
+  return raw
 }
 
 /**

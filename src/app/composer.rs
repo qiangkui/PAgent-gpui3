@@ -224,6 +224,141 @@ impl DshFlowApp {
                 .text_color(rgb(palette.faint))
                 .child(text)
         };
+        // 「固化为工作流」选的是**一轮**，不是整段对话：长对话里只有某一轮真正
+        // 执行过业务流程，默认取最后一轮常常取到「继续」。多于一轮时展开列表。
+        let candidates = if self.distill_menu {
+            super::distill::distill_turns(&self.chat().messages, 6)
+        } else {
+            Vec::new()
+        };
+        let mut distill_rows: Vec<AnyElement> = Vec::new();
+        if self.distill_menu {
+            distill_rows.push(heading("选择要固化的一轮", false).into_any_element());
+            distill_rows.push(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .text_color(rgb(palette.faint))
+                    .whitespace_normal()
+                    .child("交给 Agent：中间草稿只放 out/，验证通过后才出现卡片")
+                    .into_any_element(),
+            );
+            if candidates.is_empty() {
+                distill_rows.push(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_xs()
+                        .text_color(rgb(palette.faint))
+                        .child("这个对话还没有可固化的工具调用")
+                        .into_any_element(),
+                );
+            }
+            for turn in &candidates {
+                let number = turn.turn;
+                let tools = turn.tools;
+                let question = turn.question.clone();
+                distill_rows.push(
+                    div()
+                        .id(("distill-turn", number as usize))
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.solidify_with_agent(number, cx)
+                        }))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(palette.text))
+                                .child(format!("第 {number} 轮 · {tools} 次工具调用")),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(palette.faint))
+                                .truncate()
+                                .child(if question.is_empty() {
+                                    format!("第 {number} 轮")
+                                } else {
+                                    question
+                                }),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if candidates.len() >= 6 {
+                distill_rows.push(
+                    div()
+                        .px_2()
+                        .pt_1()
+                        .text_xs()
+                        .text_color(rgb(palette.faint))
+                        .child("只列最近 6 轮；更早的用命令行 --turn")
+                        .into_any_element(),
+                );
+            }
+            distill_rows.push(
+                div()
+                    .id("distill-back")
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.distill_menu = false;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette.accent))
+                            .child("← 返回"),
+                    )
+                    .into_any_element(),
+            );
+        } else {
+            distill_rows.push(
+                div()
+                    .id("attach-distill")
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                    .on_click(
+                        cx.listener(|view, _, window, cx| {
+                            view.insert_workflow_command(window, cx)
+                        }),
+                    )
+                    .child(
+                        svg()
+                            .path("icons/layers.svg")
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_shrink_0()
+                            .text_color(rgb(palette.muted)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(palette.text))
+                            .child("固化为工作流"),
+                    )
+                    .into_any_element(),
+            );
+        }
         div()
             .flex()
             .flex_col()
@@ -291,6 +426,7 @@ impl DshFlowApp {
                             .child("压缩上下文"),
                     ),
             )
+            .children(distill_rows)
             // The conversation's own switches. They used to sit as chips on the
             // composer's lower row, which made that row a list of states rather
             // than a place to type; dsh keeps only the permission and the model
@@ -377,7 +513,7 @@ impl DshFlowApp {
             .child(menu_budget_row(
                 "menu-rounds",
                 "轮数上限",
-                &[6, 12, 24],
+                &[6, 12, 24, 50],
                 self.chat().max_rounds,
                 palette,
                 cx,
@@ -386,7 +522,7 @@ impl DshFlowApp {
             .child(menu_budget_row(
                 "menu-calls",
                 "工具调用上限",
-                &[20, 40, 80],
+                &[20, 40, 80, 200],
                 self.chat().max_calls,
                 palette,
                 cx,

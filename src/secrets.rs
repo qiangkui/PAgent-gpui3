@@ -33,6 +33,68 @@ pub fn forget_connection(id: &str) {
     system().forget(&format!("{TARGET_PREFIX}{id}"));
 }
 
+/// The target one workflow input is kept under.
+///
+/// Workflow inputs live in the same store as endpoint keys, separated by a
+/// second level: `dsh-flow-ui/workflow:<name>:input:<input>`. The shape is
+/// documented in the workflow card's design notes, so both sides agree on what
+/// "保存到本机" means.
+/// @param workflow - the manifest's `name`.
+/// @param input - the declared input's name.
+/// @returns the credential target name.
+pub fn input_target(workflow: &str, input: &str) -> String {
+    format!(
+        "{TARGET_PREFIX}workflow:{}:input:{}",
+        credential_label(workflow),
+        credential_label(input)
+    )
+}
+
+/// One part of a target, with separators that would confuse the key removed.
+///
+/// The Credential Manager shows target names verbatim, and the UI reads the
+/// suffix back to know which input a secret belongs to, so `:` and `/` may not
+/// appear inside a name.
+fn credential_label(text: &str) -> String {
+    let cleaned: String = text
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// A workflow input kept on this machine, if any.
+/// @param workflow - the manifest's `name`.
+/// @param input - the declared input's name.
+/// @returns the stored value; empty values are treated as absent.
+pub fn read_input(workflow: &str, input: &str) -> Option<String> {
+    system()
+        .read(&input_target(workflow, input))
+        .filter(|value| !value.is_empty())
+}
+
+/// Keep one workflow input on this machine.
+/// @returns the store's refusal, when it has one (no store on this platform).
+pub fn save_input(workflow: &str, input: &str, value: &str) -> Result<(), String> {
+    system().write(&input_target(workflow, input), value)
+}
+
+/// Forget one workflow input, best effort.
+pub fn forget_input(workflow: &str, input: &str) {
+    system().forget(&input_target(workflow, input));
+}
+
 /// The store a run should use.
 pub fn system() -> &'static dyn SecretStore {
     #[cfg(windows)]
@@ -256,6 +318,38 @@ mod tests {
         let store = NoStore;
         assert!(store.write("dsh-flow-ui/a", "sk-a").is_err());
         assert_eq!(store.read("dsh-flow-ui/a"), None);
+    }
+
+    #[test]
+    fn workflow_inputs_get_their_own_target() {
+        assert_eq!(
+            input_target("maers-units-export", "password"),
+            "dsh-flow-ui/workflow:maers-units-export:input:password"
+        );
+        // Separators that would split the key are folded, so the suffix after
+        // the last colon is always the input name.
+        assert_eq!(
+            input_target("a/b:c", "p:w/d"),
+            "dsh-flow-ui/workflow:a_b_c:input:p_w_d"
+        );
+        assert_eq!(input_target("  ", ""), "dsh-flow-ui/workflow:_:input:_");
+        // It is not the endpoint key of a connection that happens to share the id.
+        assert_ne!(input_target("chat", "key"), format!("{TARGET_PREFIX}chat"));
+    }
+
+    #[test]
+    fn a_memory_store_round_trips_one_workflow_input() {
+        let store = MemoryStore::new();
+        let target = input_target("maers-units-export", "password");
+        store.write(&target, "p@ss").expect("write");
+        assert_eq!(store.read(&target).as_deref(), Some("p@ss"));
+        assert_eq!(
+            store.read(&input_target("maers-units-export", "account")),
+            None,
+            "each input has its own slot"
+        );
+        store.forget(&target);
+        assert_eq!(store.read(&target), None);
     }
 
     /// Round-trips through the real store; run by hand because it writes a

@@ -108,6 +108,31 @@ test('refuses a tool that shadows a built-in or breaks the naming rule', async (
     'export function activate(api) { api.registerTool({ name: "Bad Name", description: "x" }, () => "x") }'
   )
   assert.match((await loadPlugins({ dir: odd, enabled: ['odd'] })).errors[0].message, /不合法/)
+
+  // The interaction tools are reserved too: they are intercepted before the
+  // plugin lookup, so a plugin that took one of those names would never be
+  // called at all.
+  const interaction = await plugin(
+    'interaction',
+    { api: PLUGIN_API },
+    'export function activate(api) { api.registerTool({ name: "todo_write", description: "x" }, () => "x") }'
+  )
+  assert.match(
+    (await loadPlugins({ dir: interaction, enabled: ['interaction'] })).errors[0].message,
+    /内置工具重名/
+  )
+
+  // `mcp_` is how MCP server tools are named, so the window would draw and
+  // approve a plugin tool as if a server had offered it.
+  const prefixed = await plugin(
+    'prefixed',
+    { api: PLUGIN_API },
+    'export function activate(api) { api.registerTool({ name: "mcp_echo", description: "x" }, () => "x") }'
+  )
+  assert.match(
+    (await loadPlugins({ dir: prefixed, enabled: ['prefixed'] })).errors[0].message,
+    /MCP/
+  )
 })
 
 test('turns a throwing plugin into a failed tool call', async () => {

@@ -107,12 +107,14 @@ pub(crate) fn tool_of(message: &ChatMessage) -> String {
 /// Which group a tool belongs to; a name the engine never uses is a plugin tool.
 pub(crate) fn action_kind(tool: &str) -> ActionKind {
     match tool {
-        "write" | "edit" | "replace" | "move" | "delete" => ActionKind::File,
-        "shell" | "python" | "node" | "task" => ActionKind::Command,
-        "http" | "web_search" | "read_url" => ActionKind::Network,
+        "write" | "edit" | "replace" | "move" | "copy" | "mkdir" | "delete" => ActionKind::File,
+        "shell" | "python" | "node" | "task" | "git_write" | "run_tests" | "diagnostics"
+        | "wait_for" => ActionKind::Command,
+        "http" | "web_search" | "read_url" | "browser" => ActionKind::Network,
         "mcp" => ActionKind::Mcp,
         name if name.starts_with("mcp_") => ActionKind::Mcp,
-        "read" | "list" | "glob" | "tree" | "grep" | "symbols" | "git" => ActionKind::Other,
+        "read" | "list" | "glob" | "tree" | "grep" | "symbols" | "git" | "env" | "read_image"
+        | "screenshot" | "remember" => ActionKind::Other,
         _ => ActionKind::Plugin,
     }
 }
@@ -132,16 +134,34 @@ pub(crate) fn action_detail(tool: &str, input: &str, text: &str) -> String {
         "shell" => first_line(&field("command")),
         "python" | "node" => first_line(&field("code")),
         "http" => field("url"),
-        "write" | "edit" | "delete" => field("path"),
+        "write" | "edit" | "delete" | "mkdir" => field("path"),
         "replace" => match field("pattern") {
             pattern if pattern.is_empty() => field("path"),
             pattern => pattern,
         },
-        "move" => match (field("from"), field("to")) {
+        "copy" | "move" => match (field("from"), field("to")) {
             (from, to) if from.is_empty() && to.is_empty() => String::new(),
             (from, to) if from.is_empty() => to,
             (from, to) if to.is_empty() => from,
             (from, to) => format!("{from} → {to}"),
+        },
+        "remember" => first_line(&field("text")),
+        "env" => field("path"),
+        "run_tests" => match field("command") {
+            command if command.is_empty() => "自动识别测试".to_string(),
+            command => first_line(&command),
+        },
+        "diagnostics" => match field("command") {
+            command if command.is_empty() => "自动识别编译检查".to_string(),
+            command => first_line(&command),
+        },
+        "git_write" => match field("action").as_str() {
+            "commit" => format!("commit {}", first_line(&field("message"))),
+            "branch" => format!("branch {}", field("name")),
+            action => match field("stashAction") {
+                stash if !stash.is_empty() => format!("stash {stash}"),
+                _ => action.to_string(),
+            },
         },
         "mcp" => match (field("server"), field("tool")) {
             (server, tool) if server.is_empty() => tool,

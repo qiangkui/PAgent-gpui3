@@ -1,13 +1,13 @@
 /** The read-only git tool. */
 
-import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
 import type { ToolResult, ToolScope } from './types.ts'
 import { GIT_TIMEOUT_MS, MAX_GIT_CHARS } from './limits.ts'
 import { decodeOutput, keepBytes, safeEnd, stripAnsi } from './text.ts'
 import { resolveScoped, textArg } from './paths.ts'
 import { MAX_SHELL_BUFFER } from './exec.ts'
-import { commandEnv, killTree } from './process.ts'
+import { killTree } from './process.ts'
+import { spawnTool } from './spawn.ts'
 
 /** Subcommands `git` may run: nothing here writes to the repository. */
 const GIT_READONLY = new Set([
@@ -72,12 +72,18 @@ export async function runGit(
 function spawnGit(argv: string[], cwd: string, cwdArg: string): Promise<ToolResult> {
   return new Promise((resolve) => {
     const line = `git ${argv.join(' ')}`
-    const child = spawn('git', argv, {
+    // Through the same jail as every other spawned tool: a repository can carry
+    // `textconv` drivers and hooks, and a read-only look must not run them
+    // outside the sandbox. `commandEnv` already drops the pager variables, so
+    // they are passed explicitly here.
+    const child = spawnTool(
+      { file: 'git', args: argv, shell: false },
       cwd,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...commandEnv(), GIT_PAGER: 'cat', GIT_TERMINAL_PROMPT: '0' }
-    })
+      {
+        capture: true,
+        env: { GIT_PAGER: 'cat', GIT_TERMINAL_PROMPT: '0' }
+      }
+    )
     let timedOut = false
     let settled = false
     const outChunks: Buffer[] = []

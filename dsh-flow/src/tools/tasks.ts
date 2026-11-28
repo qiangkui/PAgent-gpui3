@@ -7,16 +7,15 @@
  * under the conversation's `.dsh-flow/tasks` folder.
  */
 
-import { spawn } from 'node:child_process'
 import { promises as fs } from 'node:fs'
-import { mkdirSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import path from 'node:path'
 import type { ToolResult } from './types.ts'
-import { commandEnv, isRunning, killPid } from './process.ts'
+import { isRunning, killPid } from './process.ts'
 import { intArg, textArg } from './paths.ts'
-import { safeStart } from './text.ts'
+import { decodeOutput, safeStart } from './text.ts'
 import { MAX_TASK_LINES, MAX_TASK_OUTPUT } from './limits.ts'
+import { spawnTool } from './spawn.ts'
 
 /** One background task as it is kept on disk. */
 interface TaskRecord {
@@ -35,6 +34,9 @@ interface TaskRecord {
   /** `stopped` once `task stop` ended it; absent while it is meant to run. */
   stopped?: boolean
 }
+
+/** How much of a task's log is read back: the answer only shows the last lines. */
+const TAIL_BYTES = 4 * MAX_TASK_OUTPUT
 
 /** Folder holding one conversation's background tasks. */
 function tasksDir(workDir: string): string {
@@ -60,57 +62,42 @@ export async function startBackground(
   command: string,
   cwd: string,
   cwdArg: string,
-  name = ''
+  name = '',
+  stdin = ''
 ): Promise<ToolResult> {
   const dir = tasksDir(workDir)
   await fs.mkdir(dir, { recursive: true })
   const id = `task-${await nextNumber(dir)}`
-  const helper = process.env.DSH_SANDBOX_HELPER
-  const workspace = process.env.DSH_SANDBOX_WORKSPACE || workDir
   const readonly = process.env.DSH_SANDBOX_READONLY === '1'
-  // A read-only sandbox cannot write the task folder, so its log lives in the
-  // Low-integrity temp folder instead; the record still points at it.
-  const log = helper && readonly
-    ? path.join(workspace, '.dsh-flow', 'sandbox-tmp', `${id}.log`)
+  // A read-only sandbox cannot write the task folder, so its log and its input
+  // queue live in the Low-integrity temp folder instead; the record still points
+  // at them.
+  const log = readonly && process.env.DSH_SANDBOX_HELPER
+    ? path.join(process.env.DSH_SANDBOX_WORKSPACE || workDir, '.dsh-flow', 'sandbox-tmp', `${id}.log`)
     : logPath(workDir, id)
+  // Input is queued in a file the wrapper watches; creating it up front means a
+  // task started with `stdin` already has its first lines waiting. The close
+  // marker stays absent until `task close` asks for EOF.
+  const control = path.join(path.dirname(log), `${id}.stdin`)
+  const closeMarker = path.join(path.dirname(log), `${id}.stdin.close`)
+  await fs.mkdir(path.dirname(control), { recursive: true })
+  await fs.writeFile(control, stdin, 'utf8')
   // A detached process cannot hand a file handle to its child on Windows, so a
   // small wrapper runs the command and writes the log itself; it is the process
   // whose pid is recorded, and the tree kill reaches the command from there.
   const wrapper = fileURLToPath(new URL('./task-run.ts', import.meta.url))
-  const env = commandEnv()
-  let child
-  if (helper && process.platform === 'win32') {
-    const temp = path.join(workspace, '.dsh-flow', 'sandbox-tmp')
-    mkdirSync(path.dirname(log), { recursive: true })
-    const specPath = path.join(dir, `sandbox-${id}.json`)
-    const payload = {
-      cwd,
-      workspace,
-      readonly,
+  // Detached so the answer can end while it keeps running; its own group is also
+  // what `killPid` ends. `spawnTool` swaps in the sandbox helper when the window
+  // provided one, and keeps the same detached group + ignored stdio.
+  const child = spawnTool(
+    {
       file: process.execPath,
-      args: [wrapper, log, cwd, command]
-    }
-    writeFileSync(specPath, JSON.stringify(payload), 'utf8')
-    env.TEMP = temp
-    env.TMP = temp
-    child = spawn(helper, ['--spec', specPath], {
-      cwd,
-      windowsHide: true,
-      detached: true,
-      stdio: 'ignore',
-      env
-    })
-  } else {
-    child = spawn(process.execPath, [wrapper, log, cwd, command], {
-      cwd,
-      windowsHide: true,
-      // Detached so the answer can end while it keeps running; its own group is
-      // also what `killPid` ends.
-      detached: true,
-      stdio: 'ignore',
-      env
-    })
-  }
+      args: [wrapper, log, cwd, command, control, closeMarker],
+      shell: false
+    },
+    cwd,
+    { capture: false, detached: true }
+  )
   const pid = child.pid ?? 0
   child.on('error', () => {
     // Recorded below with pid 0; an empty log is the only trace left.
@@ -134,10 +121,29 @@ export async function startBackground(
   ]
   if (cwdArg !== '.') lines.push(`（工作目录：${cwdArg}）`)
   lines.push(
-    `它会在这次问答结束后继续运行；用 task 工具 action=output id=${id} 看输出，action=stop 结束。`,
+    `它会在这次问答结束后继续运行；用 task 工具 action=output id=${id} 看输出，action=input 写输入（只有读取 stdin 的程序收得到），action=stop 结束。`,
     `日志：${log}`
   )
   return { ok: true, text: lines.join('\n') }
+}
+
+/**
+ * The log file of one recorded task, for tools that watch its output.
+ * @param workDir - conversation folder holding the records.
+ * @param id - the task id, for example `task-1`.
+ * @returns its log path, whether it is still running, and its command.
+ */
+export async function taskLog(
+  workDir: string,
+  id: string
+): Promise<{ id: string; log: string; running: boolean; command: string }> {
+  const record = pick(await readRecords(workDir), id)
+  return {
+    id: record.id,
+    log: record.log,
+    running: state(record) === 'running',
+    command: record.command
+  }
 }
 
 /** The next free `task-N` number in one folder. */
@@ -168,6 +174,33 @@ async function readRecords(workDir: string): Promise<TaskRecord[]> {
     }
   }
   return records.sort((left, right) => left.id.localeCompare(right.id, 'en', { numeric: true }))
+}
+
+/**
+ * The end of a log, decoded like a command's output.
+ *
+ * `shell` decodes its output line by line; a log written to disk has the same
+ * problem, so it goes through the same decoder instead of being read as UTF-8.
+ * Only the last `bytes` are read, which bounds the memory one poll costs.
+ * @param file - the log to read.
+ * @param bytes - how much of its end to read.
+ * @returns the tail, empty when the file is gone.
+ */
+export async function readDecodedTail(file: string, bytes: number): Promise<string> {
+  const handle = await fs.open(file, 'r').catch(() => null)
+  if (handle === null) return ''
+  try {
+    const info = await handle.stat()
+    const start = Math.max(0, info.size - bytes)
+    const length = info.size - start
+    const buffer = Buffer.alloc(length)
+    await handle.read(buffer, 0, length, start)
+    return decodeOutput(buffer)
+  } catch {
+    return ''
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
 }
 
 /** `running`, `exited`, or `stopped`. */
@@ -204,13 +237,74 @@ export async function runTask(workDir: string, args: Record<string, unknown>): P
     const record = pick(records, textArg(args, 'id'))
     const requested = intArg(args, 'lines') ?? 60
     const lines = Math.min(Math.max(requested, 1), MAX_TASK_LINES)
-    const text = await fs.readFile(record.log, 'utf8').catch(() => '')
+    // Only the tail is read: a server's log can be megabytes, and the answer
+    // shows its last lines. The bytes go through `decodeOutput`, because a
+    // Windows program may write the OEM code page rather than UTF-8.
+    const text = await readDecodedTail(record.log, TAIL_BYTES)
     const tail =
       text.length > MAX_TASK_OUTPUT ? text.slice(safeStart(text, text.length - MAX_TASK_OUTPUT)) : text
     const shown = tail.split('\n').slice(-lines).join('\n').trimEnd()
     const head = `${record.id} [${state(record)}] pid ${record.pid}\n$ ${record.command}`
     const body = shown === '' ? '（还没有输出）' : shown
     return { ok: true, text: `${head}\n${body}` }
+  }
+  if (action === 'input') {
+    const record = pick(records, textArg(args, 'id'))
+    const text = textArg(args, 'text')
+    if (text === '') throw new Error('缺少参数 text（要写进 stdin 的内容）')
+    if (state(record) !== 'running') {
+      throw new Error(`${record.id} 已经不在运行，输入不会送达`)
+    }
+    const control = path.join(path.dirname(record.log), `${record.id}.stdin`)
+    await fs.mkdir(path.dirname(control), { recursive: true })
+    // A whole line is the unit a prompt expects; the wrapper forwards the bytes
+    // as they land, so the trailing break is added here rather than guessed at.
+    await fs.appendFile(control, text.endsWith('\n') ? text : `${text}\n`, 'utf8')
+    return {
+      ok: true,
+      text: `已向 ${record.id} 写入输入（${text.length} 字符）。只有读取 stdin 的程序会看到它；用 task output 看反应。`
+    }
+  }
+  if (action === 'close') {
+    const record = pick(records, textArg(args, 'id'))
+    if (state(record) !== 'running') {
+      throw new Error(`${record.id} 已经不在运行，不需要再关闭 stdin`)
+    }
+    const marker = path.join(path.dirname(record.log), `${record.id}.stdin.close`)
+    await fs.writeFile(marker, '1', 'utf8')
+    return {
+      ok: true,
+      text: `已通知 ${record.id} 关闭 stdin：它读到 EOF 后会继续（很多 CLI 等在这一点）。本来就只读一次输入或根本不读 stdin 的程序不会因此改变。`
+    }
+  }
+  if (action === 'wait') {
+    const record = pick(records, textArg(args, 'id'))
+    if (state(record) !== 'running') {
+      const text = await fs.readFile(record.log, 'utf8').catch(() => '')
+      const note = exitNote(text)
+      return {
+        ok: true,
+        text: `${record.id} ${record.stopped ? '早已停止' : '早已结束'}${note === '' ? '' : `（${note}）`}。`
+      }
+    }
+    const asked = intArg(args, 'timeoutMs') ?? 30_000
+    const timeoutMs = Math.min(Math.max(asked, 500), 120_000)
+    const started = Date.now()
+    while (state(record) === 'running' && Date.now() - started < timeoutMs) {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+    }
+    if (state(record) === 'running') {
+      const waited = ((Date.now() - started) / 1000).toFixed(1)
+      throw new Error(
+        `${record.id} 还在运行（已等 ${waited} 秒）。用 task stop 结束它，或加大 timeoutMs（上限 120000）。`
+      )
+    }
+    const text = await fs.readFile(record.log, 'utf8').catch(() => '')
+    const note = exitNote(text)
+    return {
+      ok: true,
+      text: `${record.id} ${record.stopped ? '已停止' : '已结束'}${note === '' ? '' : `（${note}）`}，用时 ${((Date.now() - started) / 1000).toFixed(1)} 秒。`
+    }
   }
   if (action === 'stop' || action === 'stopall') {
     const targets =
@@ -227,7 +321,23 @@ export async function runTask(workDir: string, args: Record<string, unknown>): P
     }
     return { ok: true, text: `已结束后台任务：${stopped.join('、')}` }
   }
-  throw new Error('action 必须是 list、output、stop 或 stopAll')
+  throw new Error('action 必须是 list、output、input、close、wait、stop 或 stopAll')
+}
+
+/**
+ * How a finished background task ended, as its wrapper wrote it to the log.
+ * @param text - the task's log.
+ * @returns `退出码 N`, `被信号 … 结束`, or empty when the log says neither.
+ */
+export function exitNote(text: string): string {
+  const tail = text.slice(-4_000)
+  const exit = /\[退出码 (-?\d+)\]/.exec(tail)
+  if (exit) return `退出码 ${exit[1]}`
+  const signal = /\[被信号 ([^\]]+?) 结束\]/.exec(tail)
+  if (signal) return `被信号 ${signal[1]} 结束`
+  const failed = /\[无法启动：([^\]]+)\]/.exec(tail)
+  if (failed) return `无法启动：${failed[1]}`
+  return ''
 }
 
 /** The record a call named, or a readable error. */

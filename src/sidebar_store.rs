@@ -8,6 +8,7 @@
 //!
 //! Only the stored shape is here; the window owns the live category type.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 /// One category as it is stored.
@@ -31,6 +32,13 @@ pub struct StoredSidebar {
     pub width: Option<f32>,
     /// Folder of the conversation that was open; empty when unknown.
     pub active: String,
+    /// Display names for workflow cards, keyed by manifest name. A card renamed
+    /// in the window keeps its manifest untouched; this map is presentation only.
+    pub labels: HashMap<String, String>,
+    /// Workflows whose current tab is deliberately blank after “新建运行”.
+    /// Kept across restarts so opening the workflow does not resurrect the last
+    /// finished run.
+    pub cleared: Vec<String>,
 }
 
 /// Read the sidebar from a data directory.
@@ -72,6 +80,34 @@ fn load_from(file: &Path) -> Option<StoredSidebar> {
             .and_then(|item| item.as_str())
             .unwrap_or_default()
             .to_string(),
+        labels: value
+            .get("labels")
+            .and_then(|item| item.as_object())
+            .map(|map| {
+                map.iter()
+                    .filter_map(|(name, label)| {
+                        let label = label.as_str()?.trim();
+                        if label.is_empty() {
+                            None
+                        } else {
+                            Some((name.clone(), label.to_string()))
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        cleared: value
+            .get("cleared")
+            .and_then(|item| item.as_array())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -107,6 +143,8 @@ fn save_to(file: &Path, sidebar: &StoredSidebar) -> Result<(), String> {
         "open": sidebar.open,
         "width": sidebar.width,
         "active": sidebar.active,
+        "labels": sidebar.labels,
+        "cleared": sidebar.cleared,
     })
     .to_string();
     if let Some(parent) = file.parent() {
@@ -162,6 +200,11 @@ mod tests {
             open: "c2".to_string(),
             width: Some(300.),
             active: "chat-2".to_string(),
+            labels: HashMap::from([(
+                "maers-units-export".to_string(),
+                "使用单位导出".to_string(),
+            )]),
+            cleared: vec!["maers-units-export".to_string()],
         };
         save_to(&file, &sidebar).unwrap();
         let loaded = load_from(&file);
@@ -228,6 +271,8 @@ mod tests {
         assert_eq!(value["categories"][0]["id"], "c1");
         assert_eq!(value["categories"][0]["name"], "对话");
         assert_eq!(value["open"], "c1");
+        assert_eq!(value["labels"], serde_json::json!({}));
+        assert_eq!(value["cleared"], serde_json::json!([]));
         // A sidebar that was never dragged writes no width at all.
         assert!(value["width"].is_null());
         // Workflow cards are not filed here any more; their folders are.

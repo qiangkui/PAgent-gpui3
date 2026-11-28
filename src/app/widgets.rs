@@ -904,19 +904,29 @@ pub(crate) fn build_rows(spec: &ManifestSpec, results: &[StepView]) -> Vec<StepR
             StepRow {
                 id: step.id.clone(),
                 kind: step.kind.label().to_string(),
-                summary: step.summary.clone(),
+                description: step.description.clone(),
+                // A run's own one-liner wins over the plan's command summary:
+                // "共 51 条" is what a reader wants on the card.
+                summary: result
+                    .and_then(|view| view.summary.clone())
+                    .unwrap_or_else(|| step.summary.clone()),
+                plan_summary: step.summary.clone(),
+                start_line: step.start_line,
+                end_line: step.end_line,
+                program: step.program.clone(),
+                child_manifest: step.child_manifest.clone(),
                 when: step.when.clone(),
                 save: step.save.clone(),
                 notes: step.notes.clone(),
                 status: result.map_or_else(|| "pending".to_string(), |view| view.status.clone()),
                 duration_ms: result.map_or(0, |view| view.duration_ms),
-                detail: result.map_or_else(String::new, |view| view.detail.clone()),
-                command: result.and_then(|view| view.command.clone()),
                 stderr: result.and_then(|view| view.stderr.clone()),
                 stdout: result.and_then(|view| view.stdout.clone()),
                 text: result.and_then(|view| view.text.clone()),
-                model: result.and_then(|view| view.model.clone()),
-                cached: result.is_some_and(|view| view.cached),
+                artifacts: result
+                    .map(|view| view.artifacts.clone())
+                    .unwrap_or_default(),
+                error: result.and_then(|view| view.error.clone()),
             }
         })
         .collect();
@@ -928,15 +938,14 @@ pub(crate) fn build_rows(spec: &ManifestSpec, results: &[StepView]) -> Vec<StepR
         rows.push(StepRow {
             id: result.id.clone(),
             kind: result.kind.clone(),
+            summary: result.summary.clone().unwrap_or_default(),
             status: result.status.clone(),
             duration_ms: result.duration_ms,
-            detail: result.detail.clone(),
-            command: result.command.clone(),
             stderr: result.stderr.clone(),
             stdout: result.stdout.clone(),
             text: result.text.clone(),
-            model: result.model.clone(),
-            cached: result.cached,
+            artifacts: result.artifacts.clone(),
+            error: result.error.clone(),
             ..Default::default()
         });
     }
@@ -1317,41 +1326,6 @@ pub(crate) fn detail_line(label: &str, value: &str, palette: Palette) -> AnyElem
                 .text_color(rgb(palette.muted))
                 .whitespace_normal()
                 .child(value.to_string()),
-        )
-        .into_any_element()
-}
-
-/// A captured stream inside a step detail.
-pub(crate) fn detail_block(label: &str, body: &str, palette: Palette) -> AnyElement {
-    let shown: Vec<&str> = body.lines().take(DETAIL_LINES).collect();
-    let truncated = body.lines().count() > shown.len();
-    let mut text = shown.join("\n");
-    if truncated {
-        text.push_str("\n…");
-    }
-    div()
-        .flex()
-        .flex_col()
-        .min_w(px(0.))
-        .gap_1()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .bg(rgb(palette.field))
-        .border_1()
-        .border_color(rgb(palette.border))
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(palette.faint))
-                .child(label.to_string()),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(palette.text))
-                .whitespace_normal()
-                .child(text),
         )
         .into_any_element()
 }

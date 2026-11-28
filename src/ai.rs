@@ -93,6 +93,37 @@ pub fn kill_children() {
     }
 }
 
+/// Stop every headless browser an engine left running.
+///
+/// The `browser` tool keeps its Chromium alive between questions on purpose — that
+/// is what lets a page (and a login) survive into the next one — and detaches it
+/// from the engine process, so nothing but this can end it when the window goes
+/// away. The engines only ever start browsers with a profile under
+/// `.dsh-flow\browser`, which is what this matches; the person's own browser never
+/// has that in its command line.
+pub fn kill_browsers() {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let script = "Get-CimInstance Win32_Process -Filter \"Name='msedge.exe' OR Name='chrome.exe'\" \
+             | Where-Object { $_.CommandLine -like '*\\.dsh-flow\\browser*' } \
+             | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+        let _ = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+}
+
+/// Sweep browsers left behind by a previous run, without blocking startup.
+///
+/// One instance runs at a time, so anything still matching at startup belongs to a
+/// window that is gone (a crash, a forced quit): its page can never be used again.
+pub fn sweep_browsers_async() {
+    std::thread::spawn(|| kill_browsers());
+}
+
 /// How long a one-shot engine call (a model listing, a compaction) may take
 /// before it is killed. A stalled `node` must not leave the caller's state — a
 /// pending listing, a busy conversation — stuck for the rest of the session.
@@ -122,6 +153,22 @@ fn wait_with_timeout(child: Child, timeout: Duration) -> Result<std::process::Ou
     }
 }
 
+/// A finished file a tool handed to the person, drawn as a card in the transcript.
+///
+/// The model decides which files belong here by calling `show`; a browser
+/// download only becomes one when it does. The path is absolute because that is
+/// what a click opens, and it is the whole value of the card: the reader does not
+/// have to go looking for the file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolFile {
+    /// Name the card shows.
+    pub name: String,
+    /// Absolute path, which is what a click opens.
+    pub path: String,
+    /// Size in bytes, for the second line of the card.
+    pub bytes: u64,
+}
+
 /// One message from a request in flight.
 pub enum AiEvent {
     /// One tool the assistant ran, before its answer.
@@ -140,6 +187,15 @@ pub enum AiEvent {
         output: String,
         /// Provider id of the call, linking it to an approval card.
         call: String,
+        /// MIME type of the picture this step showed the model, when it showed
+        /// one; empty for every step that only answered in text.
+        image_mime: String,
+        /// Absolute file holding that picture, which is what lets the next
+        /// question show it again; empty when the capture was not saved.
+        image_path: String,
+        /// Files the tool put in front of the reader, for `show`; empty for every
+        /// tool that only answers in text.
+        files: Vec<ToolFile>,
     },
     /// A `shell` command that is about to run, before its first output.
     ToolStart {
@@ -272,6 +328,9 @@ pub enum AiEvent {
         auto: bool,
         /// Command line for `shell`; empty for a write.
         command: String,
+        /// True when the call would send a credential; the card says so and is
+        /// never answered automatically.
+        secret: bool,
     },
     /// A structured question waiting for one option.
     Question {
@@ -296,6 +355,15 @@ pub enum AiEvent {
         /// The new list, as `(text, status)`; status is `pending`,
         /// `in_progress` or `completed`.
         items: Vec<(String, String)>,
+    },
+    /// The model asked to keep one long-term memory line.
+    ///
+    /// The window owns the file, so the entry arrives as an event and the tool
+    /// reports it as written; the window appends it to `memory.md`. The step row
+    /// already carries the call id, so the event does not repeat it.
+    Memory {
+        /// The line to keep, already trimmed by the engine.
+        text: String,
     },
     /// The request could not be answered; the text is meant for the user.
     Failed(String),
@@ -626,12 +694,14 @@ impl AiRequest {
         max_rounds: u32,
         max_calls: u32,
         plan: bool,
+        memory: bool,
         web_search: bool,
         attachments: &[AskAttachment],
         plugin_dir: Option<&Path>,
         plugins: &[String],
         mcp_servers: &[crate::mcp::McpServer],
         mcp_dir: Option<&Path>,
+        skip_dirs: &[String],
     ) -> Result<Self, String> {
         let cli = engine_dir.join("src").join("cli.ts");
         if !cli.exists() {
@@ -708,12 +778,14 @@ impl AiRequest {
                 max_rounds,
                 max_calls,
                 plan,
+                memory,
                 web_search,
                 attachments,
                 plugin_dir,
                 plugins,
                 mcp_servers,
                 mcp_dir,
+                skip_dirs,
             );
             // With tools on, the pipe stays open after the request so the
             // engine can wait for an approval reply on the same pipe.
@@ -921,12 +993,14 @@ fn payload(
         DEFAULT_MAX_ROUNDS,
         DEFAULT_MAX_CALLS,
         false,
+        false,
         true,
         &[],
         None,
         &[],
         &[],
         None,
+        &[],
     )
 }
 
@@ -945,12 +1019,14 @@ fn payload_with_budgets(
     max_rounds: u32,
     max_calls: u32,
     plan: bool,
+    memory: bool,
     web_search: bool,
     attachments: &[AskAttachment],
     plugin_dir: Option<&Path>,
     plugins: &[String],
     mcp_servers: &[crate::mcp::McpServer],
     mcp_dir: Option<&Path>,
+    skip_dirs: &[String],
 ) -> String {
     let mut request = serde_json::Map::new();
     request.insert(
@@ -1050,6 +1126,11 @@ fn payload_with_budgets(
         if plan {
             request.insert("plan".to_string(), serde_json::Value::Bool(true));
         }
+        // The window keeps a `memory.md`, so the engine may offer `remember`;
+        // the entry itself comes back as an event and is written here.
+        if memory {
+            request.insert("memory".to_string(), serde_json::Value::Bool(true));
+        }
         match scope_root {
             Some(root) => {
                 request.insert(
@@ -1133,6 +1214,16 @@ fn payload_with_budgets(
             .collect();
         request.insert("attachments".to_string(), serde_json::Value::Array(files));
     }
+    // Sibling conversation folders: searching the workspace must not walk into
+    // another conversation's files. The engine skips them by their top-level
+    // names, relative to the workspace root.
+    if tools && !skip_dirs.is_empty() {
+        let names: Vec<serde_json::Value> = skip_dirs
+            .iter()
+            .map(|name| serde_json::Value::String(name.clone()))
+            .collect();
+        request.insert("skipDirs".to_string(), serde_json::Value::Array(names));
+    }
     serde_json::Value::Object(request).to_string()
 }
 
@@ -1187,6 +1278,41 @@ fn events(stdout: &str, stderr: &str, exit_code: Option<i32>) -> Vec<AiEvent> {
     events
 }
 
+/// One entry of a step event's `files` array.
+///
+/// A path is the only thing a card cannot work without, so an entry without one
+/// is dropped instead of drawing a card that opens nothing. A missing `name`
+/// falls back to the file name, which is what the model's tool reported anyway.
+/// @param value - one array element of `{name, path, bytes}`.
+/// @returns the file, or `None` when it has no path.
+pub(crate) fn step_file(value: &serde_json::Value) -> Option<ToolFile> {
+    let path = value.get("path").and_then(|path| path.as_str())?.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let name = value
+        .get("name")
+        .and_then(|name| name.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    Some(ToolFile {
+        name: if name.is_empty() {
+            path.rsplit(['\\', '/'])
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            name
+        },
+        path: path.to_string(),
+        bytes: value
+            .get("bytes")
+            .and_then(|bytes| bytes.as_u64())
+            .unwrap_or(0),
+    })
+}
+
 /// Turn one stdout line into an event, or `None` when the line is not ours.
 fn line_event(line: &str) -> Option<AiEvent> {
     if !line.starts_with('{') {
@@ -1227,6 +1353,23 @@ fn line_event(line: &str) -> Option<AiEvent> {
                     .and_then(|call| call.as_str())
                     .unwrap_or_default()
                     .to_string(),
+                image_mime: value
+                    .get("image")
+                    .and_then(|image| image.get("mime"))
+                    .and_then(|mime| mime.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                image_path: value
+                    .get("image")
+                    .and_then(|image| image.get("path"))
+                    .and_then(|path| path.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                files: value
+                    .get("files")
+                    .and_then(|files| files.as_array())
+                    .map(|items| items.iter().filter_map(step_file).collect())
+                    .unwrap_or_default(),
             });
         }
         Some("progress") => {
@@ -1341,6 +1484,10 @@ fn line_event(line: &str) -> Option<AiEvent> {
                     .and_then(|command| command.as_str())
                     .unwrap_or_default()
                     .to_string(),
+                secret: value
+                    .get("secret")
+                    .and_then(|secret| secret.as_bool())
+                    .unwrap_or(false),
             });
         }
         Some("question") => {
@@ -1409,6 +1556,18 @@ fn line_event(line: &str) -> Option<AiEvent> {
                 })
                 .unwrap_or_default();
             return Some(AiEvent::Todo { items });
+        }
+        Some("memory") => {
+            let text = value
+                .get("text")
+                .and_then(|text| text.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                return None;
+            }
+            return Some(AiEvent::Memory { text });
         }
         Some("delta") => {
             let text = value
@@ -2737,6 +2896,54 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_memory_line() {
+        match line_event("{\"type\":\"memory\",\"call\":\"c1\",\"text\":\"先跑 cargo test\"}") {
+            Some(AiEvent::Memory { text }) => assert_eq!(text, "先跑 cargo test"),
+            _ => panic!("a memory line should be its own event"),
+        }
+        assert!(
+            line_event("{\"type\":\"memory\",\"text\":\"  \"}").is_none(),
+            "an empty entry is not worth an event"
+        );
+    }
+
+    #[test]
+    fn offers_memory_only_when_the_window_keeps_a_file() {
+        let connection = Connection::from_preset("deepseek").expect("preset");
+        let with_memory = payload_with_budgets(
+            "hi",
+            None,
+            &[],
+            &connection,
+            true,
+            None,
+            false,
+            None,
+            &[],
+            DEFAULT_MAX_ROUNDS,
+            DEFAULT_MAX_CALLS,
+            false,
+            true,
+            true,
+            &[],
+            None,
+            &[],
+            &[],
+            None,
+            &[],
+        );
+        let value: serde_json::Value = serde_json::from_str(&with_memory).unwrap();
+        assert_eq!(value["memory"], true);
+
+        let plain = payload("hi", None, &[], &connection, true, None, false, None, &[]);
+        let value: serde_json::Value = serde_json::from_str(&plain).unwrap();
+        assert!(
+            value.get("memory").is_none(),
+            "no file, no flag for the engine to offer `remember`"
+        );
+    }
+
+    #[test]
     fn sends_the_conversation_with_the_question() {
         let connection = Connection::from_preset("deepseek").expect("preset");
         let history = vec![
@@ -2936,12 +3143,14 @@ mod tests {
             8,
             20,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&offered).unwrap();
         assert_eq!(value["webSearch"], true);
@@ -2960,11 +3169,13 @@ mod tests {
             20,
             false,
             false,
+            false,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&off).unwrap();
         assert!(value.get("webSearch").is_none(), "off sends nothing");
@@ -2983,12 +3194,14 @@ mod tests {
             8,
             20,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&unsupported).unwrap();
         assert!(
@@ -3110,12 +3323,14 @@ mod tests {
             12,
             40,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&custom).unwrap();
         assert_eq!(value["maxRounds"], 12);
@@ -3135,6 +3350,7 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             Some(Path::new(
@@ -3148,6 +3364,7 @@ mod tests {
             ],
             &[],
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&with_plugins).unwrap();
         assert_eq!(
@@ -3190,12 +3407,14 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             std::slice::from_ref(&server),
             Some(Path::new("E:\\mcpserver")),
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&with_mcp).unwrap();
         assert_eq!(value["mcpServers"][0]["id"], "demo");
@@ -3220,16 +3439,55 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             std::slice::from_ref(&server),
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&prose).unwrap();
         assert!(value.get("mcpServers").is_none());
         assert!(value.get("mcpDir").is_none());
+    }
+
+    #[test]
+    fn sends_the_sibling_folders_tools_must_skip() {
+        let connection = Connection::from_preset("deepseek").expect("preset");
+        let skip = vec!["chat-2".to_string()];
+        #[allow(clippy::too_many_arguments)]
+        let build = |tools: bool| {
+            payload_with_budgets(
+                "hi",
+                None,
+                &[],
+                &connection,
+                tools,
+                None,
+                false,
+                None,
+                &[],
+                DEFAULT_MAX_ROUNDS,
+                DEFAULT_MAX_CALLS,
+                false,
+                false,
+                true,
+                &[],
+                None,
+                &[],
+                &[],
+                None,
+                &skip,
+            )
+        };
+        let value: serde_json::Value = serde_json::from_str(&build(true)).unwrap();
+        assert_eq!(value["skipDirs"], serde_json::json!(["chat-2"]));
+
+        // A prose answer searches nothing, so the list stays out of the request.
+        let prose: serde_json::Value = serde_json::from_str(&build(false)).unwrap();
+        assert!(prose.get("skipDirs").is_none());
     }
 
     #[test]
@@ -3283,6 +3541,7 @@ mod tests {
                     AiEvent::Question { question, .. } => format!("question:{question}"),
                     AiEvent::Plan { .. } => "plan".to_string(),
                     AiEvent::Todo { items } => format!("todo:{}", items.len()),
+                    AiEvent::Memory { text } => format!("memory:{text}"),
                 });
             }
             thread::sleep(std::time::Duration::from_millis(25));
@@ -3383,12 +3642,14 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         )
         .expect("spawn");
 
@@ -3451,6 +3712,34 @@ mod tests {
         assert!(matches!(parsed[1], AiEvent::Done { ref text, .. } if text == "written"));
     }
 
+    /// A credential card says so on the wire, so the window can keep it in front
+    /// of the person even where commands run unattended.
+    #[test]
+    fn parses_the_credential_flag_of_an_http_approval() {
+        let stdout = concat!(
+            "{\"type\":\"approval\",\"auto\":false,\"call\":\"c2\",\"tool\":\"http\",",
+            "\"target\":\"GET https://api.example\",\"path\":\"\",\"diff\":\"$ http GET\",",
+            "\"secret\":true}\n",
+            "{\"text\":\"done\"}\n",
+        );
+        let parsed = events(stdout, "", Some(0));
+        match &parsed[0] {
+            AiEvent::Approval {
+                tool,
+                secret,
+                path,
+                undoable,
+                ..
+            } => {
+                assert_eq!(tool, "http");
+                assert!(secret);
+                assert_eq!(path, "");
+                assert!(!undoable);
+            }
+            _ => panic!("expected an approval"),
+        }
+    }
+
     /// The approval reply has to travel back over the same pipe the request
     /// arrived on: the engine is paused until the window decides.
     #[test]
@@ -3489,12 +3778,14 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         )
         .expect("spawn");
 
@@ -3512,9 +3803,11 @@ mod tests {
                 undoable,
                 auto,
                 command,
+                secret,
             } => {
                 assert_eq!(call, "call-1");
                 assert_eq!(command, "");
+                assert!(!secret, "a write card is not a credential card");
                 assert_eq!(tool, "write");
                 assert_eq!(target, "a.txt");
                 assert_eq!(path, "a.txt");
@@ -3557,12 +3850,14 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &[],
             None,
             &[],
             &[],
             None,
+            &[],
         )
         .err()
         .unwrap();
@@ -3596,12 +3891,14 @@ mod tests {
             DEFAULT_MAX_ROUNDS,
             DEFAULT_MAX_CALLS,
             false,
+            false,
             true,
             &files,
             None,
             &[],
             &[],
             None,
+            &[],
         );
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(

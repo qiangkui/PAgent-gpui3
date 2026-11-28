@@ -17,6 +17,7 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { TOOLS } from './tools/specs.ts'
+import { INTERACTION_NAMES } from './tools/interaction.ts'
 
 /** The API version this engine understands. */
 export const PLUGIN_API = 1
@@ -52,7 +53,17 @@ const PANEL_TIMEOUT_MS = 3_000
 const MAX_DESCRIPTION = 400
 
 /** Tool names the engine already uses; a plugin may not shadow one. */
-const BUILTIN = new Set([...TOOLS.map((tool) => tool.function.name), 'mcp'])
+const BUILTIN = new Set([
+  ...TOOLS.map((tool) => tool.function.name),
+  ...INTERACTION_NAMES,
+  'mcp'
+])
+
+/**
+ * Prefix the MCP bridge uses; a plugin named the same would be drawn and
+ * approved as if it came from a server.
+ */
+const MCP_PREFIX = 'mcp_'
 
 /** A tool a plugin registered. */
 export interface PluginTool {
@@ -322,6 +333,9 @@ function readTool(
     throw new Error(`工具名「${name}」不合法：要小写字母开头，只含小写字母、数字与下划线`)
   }
   if (BUILTIN.has(name)) throw new Error(`工具名「${name}」与内置工具重名`)
+  if (name.startsWith(MCP_PREFIX)) {
+    throw new Error(`工具名「${name}」不能以 ${MCP_PREFIX} 开头：那是 MCP 服务器工具的前缀`)
+  }
   const description = typeof fields.description === 'string' ? fields.description.trim() : ''
   if (description === '') throw new Error(`工具「${name}」缺少 description`)
   const parameters =

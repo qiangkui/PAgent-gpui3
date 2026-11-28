@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+  <!-- PAgent mark: a rounded P inside a soft frame, with one live node. -->
+  <rect x="3" y="3" width="42" height="42" rx="13" stroke="currentColor" opacity="0.35"/>
+  <path d="M17 35V13h9.2a7.4 7.4 0 0 1 0 14.8H17" stroke="currentColor"/>
+  <circle cx="34" cy="34" r="3.2" fill="currentColor"/>
+</svg>

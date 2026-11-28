@@ -126,6 +126,7 @@ fn thinking_is_split_by_its_rows_when_the_engine_sends_no_figure() {
         answer,
     ];
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 1,
         model: "deepseek-flash".to_string(),
@@ -198,6 +199,7 @@ fn the_stored_request_opens_its_thinking() {
     let dir = std::env::temp_dir().join(format!("dsh-flow-ui-thinking-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 1,
         model: "m".to_string(),
@@ -269,6 +271,7 @@ fn a_request_row_keeps_the_thinking_of_each_round() {
     // Only the thinking is recorded here, so every other slot stays zero.
     answer.composition = vec![0; ContextKind::ALL.len()];
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 0,
         model: "deepseek-reasoner".to_string(),
@@ -758,23 +761,35 @@ fn the_text_a_request_wrote_is_kept_with_that_request() {
 }
 
 #[test]
-fn the_first_question_of_a_conversation_gets_its_tool_schemas_later() {
-    use super::{add_missing_tool_schemas, composition_of, request_items};
+fn a_request_records_the_tool_schemas_its_run_reported() {
+    use super::{composition_of, request_items, set_tool_schemas};
     let schemas = vec![("read".to_string(), "abcd".repeat(3))];
     let mut items = request_items(&[], &[], &[], &[], "q");
     // Recorded before the engine reported anything: no tool definition yet.
     assert_eq!(composition_of(&items)[1], 0);
-    add_missing_tool_schemas(&mut items, &schemas);
+    set_tool_schemas(&mut items, &schemas);
     assert_eq!(composition_of(&items)[1], 3);
-    assert_eq!(items.last().unwrap().label, "read");
-    assert_eq!(items.last().unwrap().tokens, 3);
-    // A request that already recorded its schemas is left alone.
-    let before = composition_of(&items);
-    add_missing_tool_schemas(&mut items, &schemas);
-    assert_eq!(composition_of(&items), before);
-    // No schemas reported (a chat with tools off) adds nothing.
+    assert_eq!(items[0].label, "read");
+    assert_eq!(items[0].tokens, 3);
+    // A later report replaces the row instead of adding a second one: the second
+    // question must not keep the first one's tools.
+    let smaller = vec![("read".to_string(), "ab".to_string())];
+    set_tool_schemas(&mut items, &smaller);
+    assert_eq!(composition_of(&items)[1], 1);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item.kind == super::ContextKind::Tools)
+            .count(),
+        1
+    );
+    // The definitions stay where the request put them: before the question.
+    set_tool_schemas(&mut items, &schemas);
+    assert_eq!(items[0].label, "read");
+    assert_eq!(items[1].label, "q");
+    // No schemas reported (a chat with tools off) leaves what was recorded.
     let mut bare = request_items(&[], &[], &[], &[], "q");
-    add_missing_tool_schemas(&mut bare, &[]);
+    set_tool_schemas(&mut bare, &[]);
     assert_eq!(composition_of(&bare)[1], 0);
 }
 
@@ -945,6 +960,7 @@ fn a_request_row_uses_the_sum_of_its_rounds() {
     use super::{ContextKind, request_rows};
     use crate::chats::{StoredRequest, StoredRequestItem};
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 0,
         model: "m".to_string(),
@@ -1026,6 +1042,7 @@ fn the_totals_use_the_same_closed_split_as_the_request_card() {
     // 工具结果; the totals and the timeline must do the same instead of
     // keeping the raw 10-token estimate and showing 1%.
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 0,
         model: "m".to_string(),
@@ -1093,6 +1110,7 @@ fn without_a_server_call_the_gap_goes_to_injected() {
     use super::{ContextKind, request_rows};
     use crate::chats::{StoredRequest, StoredRequestItem};
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 0,
         model: "m".to_string(),
@@ -1306,6 +1324,7 @@ fn a_round_the_endpoint_did_not_split_does_not_inflate_the_bill() {
     // adding them to the prompt target as well used to make the categories
     // add up to more than the endpoint charged.
     let stored = StoredRequest {
+        tool_names: Vec::new(),
         turn: 1,
         at_ms: 0,
         model: "m".to_string(),

@@ -2,6 +2,24 @@
 
 use super::*;
 #[test]
+fn a_finished_draft_drops_its_suffix() {
+    // The distill button appends 「（草稿·第N轮）」; while a placeholder is left it
+    // stays, and once every step is real the card reads as the plain name.
+    assert_eq!(
+        super::util::workflow_display_name("新对话（草稿·第1轮）", 0),
+        "新对话"
+    );
+    assert_eq!(
+        super::util::workflow_display_name("新对话（草稿·第1轮）", 2),
+        "新对话（草稿·第1轮）"
+    );
+    assert_eq!(
+        super::util::workflow_display_name("maers-units-export", 0),
+        "maers-units-export"
+    );
+}
+
+#[test]
 fn the_caption_buttons_are_named_by_the_pointer() {
     use super::{TITLEBAR_HEIGHT, window_button_at};
     use gpui::WindowControlArea;
@@ -138,6 +156,14 @@ fn images_and_pdfs_travel_as_bytes() {
     assert_eq!(document.kind, AttachmentKind::Pdf);
     assert_eq!(document.mime, "application/pdf");
     assert!(document.text.contains("PDF"), "{}", document.text);
+
+    // A mail gateway may put junk before the header; the specification allows it.
+    let prefixed = root.join("forwarded.pdf");
+    std::fs::write(&prefixed, b"From: someone\r\n\r\n%PDF-1.5\n1 0 obj\n").unwrap();
+    assert_eq!(
+        read_attachment(&prefixed).expect("prefixed pdf").kind,
+        AttachmentKind::Pdf
+    );
 
     // A text file keeps its bytes empty and carries its content.
     let text = root.join("note.txt");
@@ -1001,6 +1027,9 @@ fn saved_conversations_come_back() {
                     after: String::new(),
                     existed: false,
                     undoable: false,
+                    image_mime: String::new(),
+                    image_path: String::new(),
+                    files: Vec::new(),
                 },
                 crate::chats::StoredMessage {
                     role: "assistant".to_string(),
@@ -1034,6 +1063,9 @@ fn saved_conversations_come_back() {
                     after: String::new(),
                     existed: false,
                     undoable: false,
+                    image_mime: String::new(),
+                    image_path: String::new(),
+                    files: Vec::new(),
                 },
                 crate::chats::StoredMessage {
                     role: "odd".to_string(),
@@ -1067,6 +1099,9 @@ fn saved_conversations_come_back() {
                     after: String::new(),
                     existed: false,
                     undoable: false,
+                    image_mime: String::new(),
+                    image_path: String::new(),
+                    files: Vec::new(),
                 },
             ],
         },
@@ -1491,6 +1526,9 @@ fn merges_plan_and_results() {
         text: None,
         model: None,
         cached: false,
+        summary: None,
+        artifacts: Vec::new(),
+        error: None,
     }];
     let rows = build_rows(&spec, &results);
     assert_eq!(rows.len(), 2);
@@ -1516,6 +1554,9 @@ fn keeps_results_that_are_missing_from_the_plan() {
         text: None,
         model: None,
         cached: false,
+        summary: None,
+        artifacts: Vec::new(),
+        error: None,
     }];
     let rows = build_rows(&spec, &results);
     assert_eq!(rows.len(), 2);
@@ -1613,15 +1654,61 @@ fn the_tool_list_offers_code_runners() {
     assert!(ALL_TOOLS.contains(&"task"), "task 要出现在允许列表里");
     assert!(ALL_TOOLS.contains(&"replace"), "replace 要出现在允许列表里");
     assert!(ALL_TOOLS.contains(&"http"), "http 要出现在允许列表里");
+    assert!(ALL_TOOLS.contains(&"copy"), "copy 要出现在允许列表里");
+    assert!(ALL_TOOLS.contains(&"mkdir"), "mkdir 要出现在允许列表里");
+    assert!(ALL_TOOLS.contains(&"env"), "env 要出现在允许列表里");
+    assert!(
+        ALL_TOOLS.contains(&"read_image"),
+        "read_image 要出现在允许列表里"
+    );
+    assert!(
+        ALL_TOOLS.contains(&"screenshot"),
+        "screenshot 要出现在允许列表里"
+    );
+    assert!(ALL_TOOLS.contains(&"browser"), "browser 要出现在允许列表里");
+    assert!(ALL_TOOLS.contains(&"show"), "show 要出现在允许列表里");
+    assert!(
+        ALL_TOOLS.contains(&"git_write"),
+        "git_write 要出现在允许列表里"
+    );
+    assert!(
+        ALL_TOOLS.contains(&"wait_for"),
+        "wait_for 要出现在允许列表里"
+    );
+    assert!(
+        ALL_TOOLS.contains(&"run_tests"),
+        "run_tests 要出现在允许列表里"
+    );
+    assert!(
+        ALL_TOOLS.contains(&"diagnostics"),
+        "diagnostics 要出现在允许列表里"
+    );
     assert!(ALL_TOOLS.contains(&"mcp"), "mcp 要出现在允许列表里");
-    assert_eq!(ALL_TOOLS.len(), 18);
+    assert_eq!(ALL_TOOLS.len(), 29);
 }
 
 #[test]
-fn a_task_approval_reads_as_ending_a_background_command() {
+fn copy_and_mkdir_read_as_their_own_actions() {
+    assert_eq!(approval_label("copy"), "复制确认");
+    assert_eq!(approval_state("copy", true), "已复制");
+    assert_eq!(approval_state("copy", false), "复制失败");
+    assert!(approval_hint("copy").contains("覆盖"));
+
+    assert_eq!(approval_label("mkdir"), "建目录确认");
+    assert_eq!(approval_state("mkdir", true), "已创建");
+    assert_eq!(approval_state("mkdir", false), "创建失败");
+    assert!(approval_hint("mkdir").contains("目录"));
+}
+
+#[test]
+fn a_task_approval_reads_as_an_operation_on_a_background_command() {
     assert_eq!(approval_label("task"), "任务确认");
-    assert_eq!(approval_state("task", true), "已结束");
+    // The same card covers `input`, `close` and `stop`, so the state cannot say
+    // "ended" for a call that only wrote a line into its stdin.
+    assert_eq!(approval_state("task", true), "已完成");
+    assert_eq!(approval_state("task", false), "操作失败");
     assert!(approval_hint("task").contains("后台任务"));
+    assert!(approval_hint("task").contains("stdin"));
 }
 
 #[test]
@@ -1980,6 +2067,57 @@ fn only_a_command_or_a_whole_snippet_may_be_allowed_for_the_session() {
 }
 
 #[test]
+fn a_quiet_answer_is_given_up_on_but_a_card_is_not() {
+    let limit = STALL_LIMIT;
+    // Nothing has arrived for longer than the limit, and no card is open.
+    assert!(answer_stalled(limit, false));
+    assert!(answer_stalled(limit + Duration::from_secs(600), false));
+    // Progress arrived recently.
+    assert!(!answer_stalled(Duration::from_secs(30), false));
+    // A card, a question or a plan is waiting for the person: that is not a hang.
+    assert!(!answer_stalled(limit + Duration::from_secs(600), true));
+}
+
+#[test]
+fn a_credential_card_is_never_answered_by_a_rule() {
+    // 完全权限, 会话记忆 and 自动审查 all leave it to the person.
+    assert!(!approval_auto_answered(true, false, true, true, true));
+    // A write the engine already ran still needs no card.
+    assert!(approval_auto_answered(false, true, false, false, false));
+    // And the ordinary rules still answer what they always answered.
+    assert!(approval_auto_answered(false, false, true, false, false));
+    assert!(approval_auto_answered(false, false, false, true, false));
+    assert!(approval_auto_answered(false, false, false, false, true));
+    assert!(!approval_auto_answered(false, false, false, false, false));
+}
+
+#[test]
+fn a_file_card_may_be_allowed_for_the_session_by_its_path() {
+    assert!(allow_file_session_button("write", "a.txt"));
+    assert!(allow_file_session_button("edit", "src/main.rs"));
+    // A card with no path cannot name what it would remember.
+    assert!(!allow_file_session_button("write", "   "));
+    // `replace` spans several files, and `delete` is not a write.
+    assert!(!allow_file_session_button("replace", ""));
+    assert!(!allow_file_session_button("delete", "a.txt"));
+    assert!(!allow_file_session_button("shell", "a.txt"));
+}
+
+#[test]
+fn a_file_session_key_names_one_normalised_path() {
+    // The same file written three ways is one key.
+    assert_eq!(file_session_key("a.txt"), file_session_key("./a.txt"));
+    assert_eq!(file_session_key("a\\b.txt"), file_session_key("a/b.txt"));
+    assert_eq!(file_session_key(" a.txt "), file_session_key("a.txt"));
+    assert_ne!(file_session_key("a.txt"), file_session_key("b.txt"));
+    // A file key never collides with a command key for the same text.
+    assert_ne!(
+        file_session_key("npm test"),
+        session_key("shell", "npm test")
+    );
+}
+
+#[test]
 fn a_session_key_never_mixes_a_snippet_with_a_command() {
     let command = session_key("shell", "npm test");
     let snippet = session_key("python", "npm test");
@@ -2031,7 +2169,11 @@ fn wrapped_rows_start_where_the_caret_and_the_click_look_for_them() {
 
     let rows = logical_rows("one\ntwo\nthree");
     assert_eq!(row_of_caret(&rows, 0), 0);
-    assert_eq!(row_of_caret(&rows, 3), 0, "the break belongs to the row above");
+    assert_eq!(
+        row_of_caret(&rows, 3),
+        0,
+        "the break belongs to the row above"
+    );
     assert_eq!(row_of_caret(&rows, 4), 1);
     assert_eq!(row_of_caret(&rows, 12), 2, "past the end still finds a row");
 
@@ -2291,6 +2433,35 @@ fn dragging_a_tool_bar_moves_by_the_same_ratio_as_its_thumb() {
     assert_eq!(at_end, -max);
     let halfway = (px(0.) - travel / 2.) * (max / travel);
     assert!(halfway < px(0.) && halfway > -max, "{halfway:?}");
+}
+
+#[test]
+fn a_file_card_badge_names_the_kind_of_file() {
+    use super::file_badge;
+    assert_eq!(file_badge("report.pdf"), "PDF");
+    assert_eq!(file_badge("数据.xlsx"), "XLSX");
+    // The last dot decides, so a double extension reads as the outer one.
+    assert_eq!(file_badge("archive.tar.gz"), "GZ");
+    // Nothing worth reading: no dot, a leading dot, or a tail longer than an
+    // extension ever is (`docx`, `json` and `html` are four characters).
+    assert_eq!(file_badge("Makefile"), "文件");
+    assert_eq!(file_badge(".env"), "文件");
+    assert_eq!(file_badge("notes.longer"), "文件");
+}
+
+#[test]
+fn a_step_file_needs_a_path_but_takes_its_name_from_it() {
+    // The window draws a card per entry; one without a path would open nothing.
+    let listed = serde_json::json!({
+        "name": "",
+        "path": "C:\\work\\报告.pdf",
+        "bytes": 2048,
+    });
+    let file = crate::ai::step_file(&listed).expect("有路径就该算数");
+    assert_eq!(file.name, "报告.pdf");
+    assert_eq!(file.bytes, 2048);
+    assert!(crate::ai::step_file(&serde_json::json!({ "name": "x.pdf" })).is_none());
+    assert!(crate::ai::step_file(&serde_json::json!({ "path": "  " })).is_none());
 }
 
 #[test]
@@ -2618,61 +2789,248 @@ fn interaction_cards_settle_when_the_request_ends() {
 fn auto_review_only_grants_low_risk_actions() {
     use crate::app::util::auto_review_allows;
 
+    // The window calls the rule with the commands the person added; these cases
+    // are about the built-in list, so the added list is empty.
+    let allows = |tool: &str, command: &str, path: &str, diff: &str| {
+        auto_review_allows(tool, command, path, diff, &[])
+    };
+
     // Ordinary workspace writes.
-    assert!(auto_review_allows("write", "", "src/main.rs", "diff"));
-    assert!(auto_review_allows("edit", "", "README.md", "diff"));
+    assert!(allows("write", "", "src/main.rs", "diff"));
+    assert!(allows("edit", "", "README.md", "diff"));
+    // Copying and folder creation are the same low-risk class: the target is
+    // what gets checked, and it may not leave the workspace or touch secrets.
+    assert!(allows("copy", "", "assets/logo.png", ""));
+    assert!(allows("mkdir", "", "out/reports", ""));
+    assert!(!allows("copy", "", "../outside.png", ""));
+    assert!(!allows("mkdir", "", "C:\\Windows\\x", ""));
+    assert!(!allows("mkdir", "", ".git/hooks", ""));
     // Outside the workspace, sensitive files, or a huge rewrite.
-    assert!(!auto_review_allows("write", "", "C:\\Windows\\x.txt", "d"));
-    assert!(!auto_review_allows("write", "", "../outside.txt", "d"));
-    assert!(!auto_review_allows("write", "", ".env", "d"));
-    assert!(!auto_review_allows("write", "", "keys/server.pem", "d"));
-    assert!(!auto_review_allows("write", "", ".git/config", "d"));
-    assert!(!auto_review_allows(
-        "write",
-        "",
-        "big.txt",
-        &"x".repeat(200_001)
-    ));
+    assert!(!allows("write", "", "C:\\Windows\\x.txt", "d"));
+    assert!(!allows("write", "", "../outside.txt", "d"));
+    assert!(!allows("write", "", ".env", "d"));
+    assert!(!allows("write", "", "keys/server.pem", "d"));
+    assert!(!allows("write", "", ".git/config", "d"));
+    assert!(!allows("write", "", "big.txt", &"x".repeat(200_001)));
     // Read-only commands.
-    assert!(auto_review_allows("shell", "git status", "", ""));
-    assert!(auto_review_allows(
-        "shell",
-        "git branch --show-current",
-        "",
-        ""
-    ));
-    assert!(auto_review_allows("shell", "cargo test --release", "", ""));
-    assert!(auto_review_allows("shell", "dir", "", ""));
+    assert!(allows("shell", "git status", "", ""));
+    assert!(allows("shell", "git branch --show-current", "", ""));
+    assert!(allows("shell", "cargo test --release", "", ""));
+    assert!(allows("shell", "dir", "", ""));
     // Anything that can chain, delete, publish or run code still asks.
-    assert!(!auto_review_allows(
-        "shell",
-        "git status && rm -rf .",
-        "",
-        ""
-    ));
-    assert!(!auto_review_allows("shell", "git branch -D main", "", ""));
-    assert!(!auto_review_allows(
-        "shell",
-        "git diff --output=diff.patch",
-        "",
-        ""
-    ));
-    assert!(!auto_review_allows("shell", "cargo clippy --fix", "", ""));
-    assert!(!auto_review_allows("shell", "git push", "", ""));
-    assert!(!auto_review_allows("shell", "cargo fmt", "", ""));
-    assert!(!auto_review_allows("shell", "npm test", "", ""));
-    assert!(!auto_review_allows("python", "", "", ""));
-    assert!(!auto_review_allows("delete", "", "gone.txt", ""));
+    assert!(!allows("shell", "git status && rm -rf .", "", ""));
+    assert!(!allows("shell", "git branch -D main", "", ""));
+    assert!(!allows("shell", "git diff --output=diff.patch", "", ""));
+    assert!(!allows("shell", "cargo clippy --fix", "", ""));
+    assert!(!allows("shell", "git push", "", ""));
+    assert!(!allows("shell", "cargo fmt", "", ""));
+    assert!(!allows("shell", "npm test", "", ""));
+    assert!(!allows("python", "", "", ""));
+    assert!(!allows("delete", "", "gone.txt", ""));
     // Command substitution runs a second command inside an allowed one, so it
     // must ask instead of slipping through `cat` / `git diff`.
-    assert!(!auto_review_allows("shell", "cat $(rm -rf .)", "", ""));
+    assert!(!allows("shell", "cat $(rm -rf .)", "", ""));
+    assert!(!allows("shell", "git log $(curl -s https://x/y)", "", ""));
+    assert!(!allows("shell", "cat `rm -rf .`", "", ""));
+}
+
+#[test]
+fn recent_images_are_only_the_last_turns_pictures() {
+    let mut messages = vec![
+        ChatMessage::user("第一问"),
+        ChatMessage::assistant("第一答"),
+        ChatMessage::user("第二问"),
+    ];
+    let picture = |name: &str| {
+        let mut message = ChatMessage::tool("screenshot · 全屏", false);
+        message.image_mime = "image/png".to_string();
+        message.image_path = name.to_string();
+        message
+    };
+    messages.push(picture("old.png"));
+    messages.push(ChatMessage::assistant("第二答"));
+    messages.push(ChatMessage::user("第三问"));
+    messages.push(picture("a.png"));
+    messages.push(picture("b.png"));
+    messages.push(picture("c.png"));
+    messages.push(ChatMessage::assistant("第三答"));
+
+    // Only the turn that just finished, and only the newest two: a picture from
+    // three questions ago is not what a follow-up is about.
+    assert_eq!(
+        recent_images(&messages, 2),
+        vec![
+            ("image/png".to_string(), "b.png".to_string()),
+            ("image/png".to_string(), "c.png".to_string())
+        ]
+    );
+    assert!(recent_images(&messages, 0).is_empty());
+
+    let no_pictures = vec![
+        ChatMessage::user("问"),
+        ChatMessage::tool("read · a.txt", false),
+        ChatMessage::assistant("答"),
+    ];
+    assert!(recent_images(&no_pictures, 2).is_empty());
+}
+
+#[test]
+fn a_text_only_endpoint_is_not_offered_the_image_tools() {
+    use crate::config::ModeSelection;
+
+    let selection = ModeSelection {
+        plugins: Vec::new(),
+        skills: Vec::new(),
+        mcp_servers: Vec::new(),
+    };
+    let seen = mode_tools_for(&selection, true);
+    assert!(seen.contains(&"read_image"));
+    assert!(seen.contains(&"screenshot"));
+    let text_only = mode_tools_for(&selection, false);
+    assert!(!text_only.contains(&"read_image"));
+    assert!(!text_only.contains(&"screenshot"));
+    // Nothing else depends on the endpoint: only the two image tools drop out.
+    assert_eq!(text_only.len() + 2, seen.len());
+}
+
+#[test]
+fn a_request_only_records_the_tools_it_actually_sends() {
+    // The cache from the previous run: a built-in, a plugin tool, two server
+    // tools and one nobody claims any more.
+    let cached = vec![
+        ("read".to_string(), "read-schema".to_string()),
+        ("office_word".to_string(), "office-schema".to_string()),
+        ("mcp_files_read".to_string(), "files-schema".to_string()),
+        ("mcp_git_log".to_string(), "git-schema".to_string()),
+        ("stale_tool".to_string(), "stale-schema".to_string()),
+    ];
+    let plugin_tools = vec![("office".to_string(), "office_word".to_string())];
+    let mcp_tools = vec![
+        ("files".to_string(), "mcp_files_read".to_string()),
+        ("git".to_string(), "mcp_git_log".to_string()),
+    ];
+    let builtins: Vec<&str> = vec!["read", "write"];
+
+    // Full mode as it was: everything the previous run reported and still valid.
+    let all = request_schemas(
+        &cached,
+        true,
+        &builtins,
+        &["office".to_string()],
+        &["files".to_string(), "git".to_string()],
+        &plugin_tools,
+        &mcp_tools,
+    );
+    assert_eq!(all.len(), 4, "{all:?}");
+    assert!(!all.iter().any(|(name, _)| name == "stale_tool"));
+
+    // Every MCP server switched off between two questions: their definitions are
+    // not sent, so the record must not name them either.
+    let without_mcp = request_schemas(
+        &cached,
+        true,
+        &builtins,
+        &["office".to_string()],
+        &[],
+        &plugin_tools,
+        &mcp_tools,
+    );
+    assert_eq!(
+        without_mcp
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["read", "office_word"]
+    );
+
+    // Basic mode: no plugins, no servers, and no built-in outside the list.
+    let basic = request_schemas(
+        &cached,
+        true,
+        &builtins,
+        &[],
+        &[],
+        &plugin_tools,
+        &mcp_tools,
+    );
+    assert_eq!(basic, vec![("read".to_string(), "read-schema".to_string())]);
+
+    // Tools switched off in the conversation: nothing travels at all.
+    assert!(
+        request_schemas(
+            &cached,
+            false,
+            &builtins,
+            &[],
+            &[],
+            &plugin_tools,
+            &mcp_tools
+        )
+        .is_empty()
+    );
+
+    // The plugin prompts follow the same rule: a plugin switched off keeps none
+    // of its injected text in the next request's record.
+    let prompts = vec![
+        ("office".to_string(), "office-prompt".to_string()),
+        ("win32-input".to_string(), "input-prompt".to_string()),
+    ];
+    assert_eq!(request_prompts(&prompts, &[]), Vec::new());
+    assert_eq!(
+        request_prompts(&prompts, &["office".to_string()]),
+        vec![("office".to_string(), "office-prompt".to_string())]
+    );
+}
+
+#[test]
+fn auto_review_accepts_commands_the_person_added() {
+    use crate::app::util::auto_review_allows;
+
+    let extra = vec!["npm test".to_string(), "pytest".to_string()];
+    // The entry covers the whole line, arguments included.
+    assert!(auto_review_allows("shell", "npm test", "", "", &extra));
+    assert!(auto_review_allows(
+        "shell",
+        "npm test -- --watch",
+        "",
+        "",
+        &extra
+    ));
+    assert!(auto_review_allows("shell", "pytest -q", "", "", &extra));
+    // A prefix covers its own program, not a neighbour that merely starts alike.
+    assert!(!auto_review_allows("shell", "npm install", "", "", &extra));
+    assert!(!auto_review_allows("shell", "npm testx", "", "", &extra));
+    // The guards still apply: chaining, redirecting or substituting commands from
+    // the list still asks, which is the only thing keeping the list from being a
+    // full-access switch.
     assert!(!auto_review_allows(
         "shell",
-        "git log $(curl -s https://x/y)",
+        "npm test && rm -rf .",
         "",
-        ""
+        "",
+        &extra
     ));
-    assert!(!auto_review_allows("shell", "cat `rm -rf .`", "", ""));
+    assert!(!auto_review_allows(
+        "shell",
+        "pytest > out.txt",
+        "",
+        "",
+        &extra
+    ));
+    assert!(!auto_review_allows(
+        "shell",
+        "pytest $(curl -s https://x/y)",
+        "",
+        "",
+        &extra
+    ));
+    // Code runners are not shell commands, so a configured prefix never applies.
+    assert!(!auto_review_allows("python", "", "", "", &extra));
+    // `wait_for` only polls, so a dev loop does not need a card for every check;
+    // deletion and batch replace still ask.
+    assert!(auto_review_allows("wait_for", "", "", "", &extra));
+    assert!(!auto_review_allows("delete", "", "a.txt", "", &extra));
+    assert!(!auto_review_allows("replace", "", "", "", &extra));
 }
 
 #[test]
@@ -2692,7 +3050,11 @@ fn sliders_land_on_the_notch_their_value_stands_for() {
     assert_eq!(max_tokens_notch(2_048, Reasoning::Off), 0);
     assert_eq!(max_tokens_notch(8_192, Reasoning::Off), 2);
     assert_eq!(max_tokens_notch(6_000, Reasoning::Off), 1, "nearest below");
-    assert_eq!(max_tokens_notch(999_999, Reasoning::Off), 7, "nearest above");
+    assert_eq!(
+        max_tokens_notch(999_999, Reasoning::Off),
+        7,
+        "nearest above"
+    );
 
     assert_eq!(
         window_notch(0, "deepseek-flash"),
@@ -2723,4 +3085,65 @@ fn sliders_land_on_the_notch_their_value_stands_for() {
     assert_eq!(temperature_notch(Some(1.25)), 5);
     assert_eq!(temperature_notch(Some(0.73)), 3);
     assert_eq!(temperature_notch(Some(9.0)), TEMPERATURE_NOTCHES - 1);
+}
+
+#[test]
+fn input_cards_fit_the_panel_width() {
+    // One card needs 240px; every further card another 252 (240 + the 12px gap).
+    assert_eq!(input_columns(0.), 1);
+    assert_eq!(input_columns(-10.), 1);
+    assert_eq!(input_columns(f32::NAN), 1);
+    assert_eq!(input_columns(200.), 1, "a narrow panel still gets the card");
+    assert_eq!(input_columns(240.), 1);
+    assert_eq!(input_columns(491.), 1);
+    assert_eq!(input_columns(492.), 2);
+    assert_eq!(input_columns(743.), 2);
+    assert_eq!(input_columns(744.), 3);
+    assert_eq!(input_columns(996.), 4);
+    // The number of cards a row holds times the card, plus its gaps, fits.
+    for columns in 1..=6 {
+        let needed = INPUT_CARD_WIDTH * columns as f32 + INPUT_CARD_GAP * (columns as f32 - 1.);
+        assert_eq!(input_columns(needed), columns);
+        assert_eq!(input_columns(needed - 1.), (columns - 1).max(1));
+    }
+}
+
+#[test]
+fn code_sections_cap_and_label_source_files() {
+    assert_eq!(code_language("steps/units.py"), "python");
+    assert_eq!(code_language("steps/smoke.js"), "javascript");
+    assert_eq!(code_language("src/cli.ts"), "typescript");
+    assert_eq!(code_language("flows/login/flow.yml"), "yaml");
+    assert_eq!(code_language("no-extension"), "text");
+    let long: String = (0..805)
+        .map(|line| format!("line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (body, cut) = clip_code(&long);
+    assert!(cut, "a file past the cap says so");
+    assert_eq!(body.lines().count(), 800, "and only the head is drawn");
+    let (whole, cut) = clip_code("one\ntwo\n");
+    assert!(!cut);
+    assert_eq!(whole, "one\ntwo");
+}
+
+#[test]
+fn a_masked_value_is_one_dot_per_character_and_keeps_the_caret() {
+    assert_eq!(masked_text("abc"), "•••");
+    assert_eq!(masked_text("a中b"), "•••", "a CJK character is one dot too");
+    assert_eq!(masked_text("😀x"), "••");
+    assert_eq!(masked_text(""), "");
+
+    // The caret is measured in the dots on screen, not in the hidden bytes.
+    let dot = "•".len();
+    assert_eq!(masked_caret("abc", 0), 0);
+    assert_eq!(masked_caret("abc", 1), dot);
+    assert_eq!(masked_caret("中文", 3), dot);
+    assert_eq!(masked_caret("中文", 6), 2 * dot);
+
+    // A click lands on a dot; the character it hides is what the field edits.
+    assert_eq!(masked_index("abc", 2 * dot), 2);
+    assert_eq!(masked_index("中文", dot), 3);
+    assert_eq!(masked_index("", dot), 0);
+    assert_eq!(masked_index("中文", 999), 6, "past the end is the end");
 }

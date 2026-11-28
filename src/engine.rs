@@ -8,7 +8,7 @@
 //! the child process stays reachable so the window can cancel it.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,6 +67,12 @@ pub struct StepView {
     pub model: Option<String>,
     /// True when the answer came from the recorded decision cache.
     pub cached: bool,
+    /// The step's own one-line result, which the card shows first.
+    pub summary: Option<String>,
+    /// Files and pictures the step produced.
+    pub artifacts: Vec<ArtifactView>,
+    /// Structured failure, when the step reported one.
+    pub error: Option<ErrorView>,
 }
 
 /// The settled state of one run.
@@ -112,10 +118,67 @@ pub struct RunCredentials {
     pub model: String,
 }
 
+/// One file or picture a step handed over.
+#[derive(Clone, Debug, Default)]
+pub struct ArtifactView {
+    /// `file` or `image`.
+    pub kind: String,
+    /// Name the card shows.
+    pub name: String,
+    /// Absolute path.
+    pub path: String,
+    /// Size in bytes.
+    pub bytes: u64,
+}
+
+/// Why a step failed, as the step itself described it.
+#[derive(Clone, Debug, Default)]
+pub struct ErrorView {
+    /// `credential`, `selector-miss`, `assert`… (see the engine's vocabulary).
+    pub kind: String,
+    /// One sentence: what happened.
+    pub message: String,
+    /// One sentence: what to do about it.
+    pub hint: Option<String>,
+    /// Where it happened, for example `maers-login:read`.
+    pub location: Option<String>,
+    /// What was expected, when the failure is a comparison.
+    pub expected: Option<String>,
+    /// What was actually found.
+    pub gotten: Option<String>,
+}
+
+/// One line of the engine's live event stream (`--events`).
+#[derive(Clone, Debug, Default)]
+pub struct StepEvent {
+    /// `run/start`, `step/start`, `step/end`, `run/end`.
+    pub kind: String,
+    /// Step id, empty for run-level events.
+    pub id: String,
+    /// Executor of the step: `run`, `ai`, `set`, `map`, `use`.
+    pub step_kind: String,
+    /// `running` for a start, otherwise the settled status.
+    pub status: String,
+    /// How long it took, for a finished step.
+    pub duration_ms: u64,
+    /// The step's own one-line result.
+    pub summary: Option<String>,
+    /// Failure text or skip reason.
+    pub detail: Option<String>,
+    /// Rendered command line.
+    pub command: Option<String>,
+    /// Files and pictures the step produced.
+    pub artifacts: Vec<ArtifactView>,
+    /// Structured failure, when the step reported one.
+    pub error: Option<ErrorView>,
+}
+
 /// One message from a running engine.
 pub enum RunMessage {
     /// A line written to stderr by the engine.
     Line(String),
+    /// One record from the `--events` stream.
+    Event(StepEvent),
     /// The engine finished and produced a summary.
     Done(Box<RunOutcome>),
     /// The engine could not be read.
@@ -135,7 +198,9 @@ pub struct RunSession {
 /// A poisoned lock is not a reason to lose the window: the data inside is still
 /// a valid list or slot, and panicking here would take the whole app with it.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Kill one process and, on Windows, everything it started.
@@ -179,6 +244,7 @@ impl RunSession {
         manifest: &Path,
         inputs: &[(String, String)],
         credentials: Option<&RunCredentials>,
+        secrets: &[(String, String)],
     ) -> Result<Self, String> {
         let cli = engine_dir.join("src").join("cli.ts");
         if !cli.exists() {
@@ -189,16 +255,19 @@ impl RunSession {
         }
 
         let mut command = Command::new("node");
-        command.arg(&cli).arg("run").arg(manifest).arg("--json");
+        // `--events` is the live channel: one NDJSON record per step boundary,
+        // plus the summary as the last line. The log pane still gets stderr.
+        command.arg(&cli).arg("run").arg(manifest).arg("--events");
         for (name, value) in inputs {
             command.arg("--input").arg(format!("{name}={value}"));
         }
-        if credentials.is_some() {
+        let handover = credentials.is_some() || !secrets.is_empty();
+        if handover {
             command.arg("--credentials-stdin");
         }
         command
             .current_dir(engine_dir)
-            .stdin(if credentials.is_some() {
+            .stdin(if handover {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -223,17 +292,41 @@ impl RunSession {
             .spawn()
             .map_err(|error| format!("cannot start node: {error}"))?;
 
-        if let Some(credentials) = credentials
-            && let Some(mut stdin) = child.stdin.take()
-        {
-            let payload = serde_json::json!({
-                "apiKey": credentials.api_key,
-                "baseUrl": credentials.base_url,
-                "model": credentials.model,
-            });
+        if handover {
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("引擎在凭据交接前关闭了 stdin".to_string());
+            };
+            // One payload carries both: the endpoint the `ai` steps use, and the
+            // secret inputs. Neither ever appears on the command line.
+            let mut payload = serde_json::Map::new();
+            if let Some(credentials) = credentials {
+                payload.insert("apiKey".to_string(), serde_json::json!(credentials.api_key));
+                payload.insert(
+                    "baseUrl".to_string(),
+                    serde_json::json!(credentials.base_url),
+                );
+                payload.insert("model".to_string(), serde_json::json!(credentials.model));
+            }
+            if !secrets.is_empty() {
+                let map: serde_json::Map<String, serde_json::Value> = secrets
+                    .iter()
+                    .map(|(name, value)| (name.clone(), serde_json::json!(value)))
+                    .collect();
+                payload.insert("secrets".to_string(), serde_json::Value::Object(map));
+            }
             // Dropping the handle after the write closes stdin, which is
-            // what tells the CLI the payload is complete.
-            let _ = stdin.write_all(payload.to_string().as_bytes());
+            // what tells the CLI the payload is complete. A failed write means
+            // the run would start without the key/secrets it was given, so fail
+            // here instead of letting a later `ai` step report "no api key".
+            if let Err(error) =
+                stdin.write_all(serde_json::Value::Object(payload).to_string().as_bytes())
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("无法把凭据交给引擎：{error}"));
+            }
         }
 
         let stdout = child.stdout.take();
@@ -256,15 +349,25 @@ impl RunSession {
             let queue = queue.clone();
             let slot = slot.clone();
             thread::spawn(move || {
-                let mut collected = String::new();
-                if let Some(mut stdout) = stdout {
-                    let _ = stdout.read_to_string(&mut collected);
+                // Events arrive line by line; anything that is not an event is
+                // the summary, which may be pretty-printed across lines.
+                let mut summary_text = String::new();
+                if let Some(stdout) = stdout {
+                    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                        match step_event(&line) {
+                            Some(event) => lock(&queue).push(RunMessage::Event(event)),
+                            None => {
+                                summary_text.push_str(&line);
+                                summary_text.push('\n');
+                            }
+                        }
+                    }
                 }
                 let exit_code = lock(&slot)
                     .take()
                     .and_then(|mut child| child.wait().ok())
                     .and_then(|status| status.code());
-                let message = match parse_summary(&collected, exit_code) {
+                let message = match parse_summary(&summary_text, exit_code) {
                     Ok(outcome) => RunMessage::Done(Box::new(outcome)),
                     Err(error) => RunMessage::Failed(error),
                 };
@@ -383,7 +486,51 @@ pub fn node_version() -> Option<String> {
 
 /// Why starting `node` failed, with the fix that usually applies.
 pub fn node_error(error: &std::io::Error) -> String {
-    format!("无法启动 node：{error}（请确认已安装 Node.js，并且 node 在 PATH 中）")
+    format!(
+        "无法启动 node：{error}（请确认已安装 Node.js {}.{} 或更新，并且 node 在 PATH 中）",
+        MIN_NODE.0, MIN_NODE.1
+    )
+}
+
+/// Lowest Node.js the engine runs on.
+///
+/// The engine executes its TypeScript directly, and type stripping is on by
+/// default from Node 23.6; an older runtime fails while importing the first file.
+pub const MIN_NODE: (u64, u64) = (23, 6);
+
+/// What is wrong with the Node.js that was found, if anything.
+///
+/// The engine executes its TypeScript directly, so a runtime older than
+/// [`MIN_NODE`] fails while importing the first file. Saying so on the banner is
+/// the difference between "the assistant never answers" and one fixable sentence.
+/// @param version - the line [`node_version`] returned, or an empty string when
+/// node could not be started at all.
+/// @returns the problem in one sentence, or `None` when the runtime is usable.
+pub fn node_version_problem(version: &str) -> Option<String> {
+    let text = version.trim();
+    if text.is_empty() {
+        return Some(format!(
+            "没有找到 Node.js：引擎需要 Node.js {}.{} 或更新。安装后确认 `node --version` 能在命令行运行，再重启界面。",
+            MIN_NODE.0, MIN_NODE.1
+        ));
+    }
+    let cleaned = text.trim_start_matches('v');
+    let mut parts = cleaned.split('.');
+    let major = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let minor = parts.next().and_then(|part| part.parse::<u64>().ok());
+    let (Some(major), Some(minor)) = (major, minor) else {
+        return Some(format!(
+            "无法识别 Node.js 的版本（{text}）：引擎需要 {}.{} 或更新。",
+            MIN_NODE.0, MIN_NODE.1
+        ));
+    };
+    if (major, minor) >= MIN_NODE {
+        return None;
+    }
+    Some(format!(
+        "当前 Node.js {text} 太旧：引擎直接运行 TypeScript，需要 {}.{} 或更新。升级 Node.js 后重启界面。",
+        MIN_NODE.0, MIN_NODE.1
+    ))
 }
 
 /// Locate the `dsh-flow` engine directory next to this crate.
@@ -449,15 +596,13 @@ fn resolve_links(path: &Path) -> PathBuf {
 
 /// Every directory the engine may sit in, nearest first.
 ///
-/// The engine is normally inside this project (`<crate>/dsh-flow`), but a
-/// checkout may also keep it beside the crate. The executable's own path is
-/// walked as well, because `target\debug\dsh-flow-ui.exe` is what people
-/// double-click, and the repository root is then two directories up.
+/// The bundled engine beside the executable comes first: after copying the
+/// program to another drive, the compile-time crate path must not win over the
+/// `dsh-flow` sitting next to the exe. A development checkout still works
+/// because its own `target\debug` / `target\release` has no nested engine, so
+/// the crate-relative candidates are the next fallback.
 fn engine_candidates(crate_dir: &Path) -> Vec<PathBuf> {
-    let mut found = vec![
-        crate_dir.join("dsh-flow"),
-        crate_dir.join("..").join("dsh-flow"),
-    ];
+    let mut found: Vec<PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         let mut here = exe.parent().map(Path::to_path_buf);
         for _ in 0..4 {
@@ -466,6 +611,8 @@ fn engine_candidates(crate_dir: &Path) -> Vec<PathBuf> {
             here = directory.parent().map(Path::to_path_buf);
         }
     }
+    found.push(crate_dir.join("dsh-flow"));
+    found.push(crate_dir.join("..").join("dsh-flow"));
     found
 }
 
@@ -506,7 +653,7 @@ fn collect(directory: &Path, depth: usize, found: &mut Vec<WorkflowEntry>) {
         let name = entry.file_name().to_string_lossy().to_string();
         if matches!(
             name.as_str(),
-            "node_modules" | ".git" | "target" | "lib" | "dist" | ".dsh-flow" | "out"
+            "node_modules" | ".git" | "target" | "lib" | "dist" | ".dsh-flow" | "out" | "backups" | "flows"
         ) {
             continue;
         }
@@ -601,7 +748,114 @@ fn step_from_json(value: &serde_json::Value) -> StepView {
             .get("cached")
             .and_then(|entry| entry.as_bool())
             .unwrap_or(false),
+        summary: get_str("summary"),
+        artifacts: artifact_views(value),
+        error: error_view(value),
     }
+}
+
+/// Read one `--events` record, or `None` when the line is not one.
+fn step_event(line: &str) -> Option<StepEvent> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let kind = value.get("type").and_then(|entry| entry.as_str())?;
+    if !(kind.starts_with("step/") || kind.starts_with("run/")) {
+        return None;
+    }
+    let get_str = |key: &str| {
+        value
+            .get(key)
+            .and_then(|entry| entry.as_str())
+            .map(str::to_string)
+    };
+    // A `step/start` has no verdict yet; the row shows it as running meanwhile.
+    let status = get_str("status").unwrap_or_else(|| {
+        if kind == "step/start" {
+            "running".to_string()
+        } else {
+            String::new()
+        }
+    });
+    Some(StepEvent {
+        kind: kind.to_string(),
+        id: get_str("id").unwrap_or_default(),
+        step_kind: get_str("kind").unwrap_or_default(),
+        status,
+        duration_ms: number_at(&value, "durationMs"),
+        summary: get_str("summary"),
+        detail: get_str("detail"),
+        command: get_str("command"),
+        artifacts: artifact_views(&value),
+        error: error_view(&value),
+    })
+}
+
+/// Read the `artifacts` array an event or a step result carries.
+fn artifact_views(value: &serde_json::Value) -> Vec<ArtifactView> {
+    value
+        .get("artifacts")
+        .and_then(|entry| entry.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let path = item
+                        .get("path")
+                        .and_then(|entry| entry.as_str())?
+                        .to_string();
+                    Some(ArtifactView {
+                        kind: item
+                            .get("kind")
+                            .and_then(|entry| entry.as_str())
+                            .unwrap_or("file")
+                            .to_string(),
+                        name: item
+                            .get("name")
+                            .and_then(|entry| entry.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        path,
+                        bytes: item
+                            .get("bytes")
+                            .and_then(|entry| entry.as_u64())
+                            .unwrap_or(0),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read a structured failure from an event (`error`) or a step result (`errorInfo`).
+fn error_view(value: &serde_json::Value) -> Option<ErrorView> {
+    let raw = value
+        .get("errorInfo")
+        .or_else(|| value.get("error"))
+        .and_then(|entry| entry.as_object())?;
+    let message = raw
+        .get("message")
+        .and_then(|entry| entry.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if message.is_empty() {
+        return None;
+    }
+    let text = |key: &str| {
+        raw.get(key)
+            .and_then(|entry| entry.as_str())
+            .map(str::to_string)
+    };
+    Some(ErrorView {
+        kind: text("kind").unwrap_or_else(|| "engine".to_string()),
+        message,
+        hint: text("hint"),
+        location: text("where"),
+        expected: text("expected"),
+        gotten: text("gotten"),
+    })
 }
 
 /// Read a millisecond count, accepting numbers written as strings.
@@ -636,14 +890,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn looks_for_the_engine_inside_the_project_first() {
+    fn a_node_version_is_read_or_refused() {
+        // The engine runs TypeScript directly: 23.6 is the first runtime that can.
+        assert!(node_version_problem("v24.11.1").is_none());
+        assert!(node_version_problem("v23.6.0").is_none());
+        assert!(node_version_problem("23.6.0").is_none());
+        assert!(node_version_problem("v23.5.9").is_some());
+        assert!(node_version_problem("v20.11.1").is_some());
+        let old = node_version_problem("v20.11.1").expect("too old");
+        assert!(old.contains("23.6"), "{old}");
+        // Nothing installed, and output that is not a version at all.
+        let missing = node_version_problem("").expect("missing");
+        assert!(missing.contains("没有找到 Node.js"), "{missing}");
+        assert!(node_version_problem("garbage").is_some());
+    }
+
+    #[test]
+    fn prefers_the_engine_beside_the_executable() {
         let crate_dir = std::env::temp_dir().join("dsh-flow-ui-candidates");
         let found = engine_candidates(&crate_dir);
-        assert_eq!(found[0], crate_dir.join("dsh-flow"));
-        assert_eq!(found[1], crate_dir.join("..").join("dsh-flow"));
-        // The executable's parents are searched too, so a double-clicked
-        // binary in `target/debug` still finds `<repo>/dsh-flow`.
-        assert!(found.len() > 2);
+        let exe_dir = std::env::current_exe()
+            .expect("test exe")
+            .parent()
+            .expect("test exe directory")
+            .to_path_buf();
+        assert_eq!(found[0], exe_dir.join("dsh-flow"));
+        assert!(found.contains(&crate_dir.join("dsh-flow")));
+        assert!(found.contains(&crate_dir.join("..").join("dsh-flow")));
     }
 
     /// A temp directory that removes itself when the test ends.
@@ -698,6 +971,7 @@ mod tests {
             for message in session.poll() {
                 match message {
                     RunMessage::Line(line) => lines.push(line),
+                    RunMessage::Event(_) => {}
                     RunMessage::Done(outcome) => return (lines, Some(*outcome), None),
                     RunMessage::Failed(error) => return (lines, None, Some(error)),
                 }
@@ -777,9 +1051,47 @@ mod tests {
     }
 
     #[test]
+    fn discovery_ignores_archived_workflows_under_backups() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-flow-ui-discover-backups-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("backups").join("old")).unwrap();
+        std::fs::write(root.join("backups").join("old").join("flow.yml"), "name: archived\n").unwrap();
+        std::fs::create_dir_all(root.join("workflows").join("live")).unwrap();
+        std::fs::write(root.join("workflows").join("live").join("flow.yml"), "name: live\n").unwrap();
+        let found = discover(&root);
+        assert!(found.iter().any(|entry| entry.name == "live"));
+        assert!(!found.iter().any(|entry| entry.name == "archived"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn discovery_skips_subflows_under_flows() {
+        let root = std::env::temp_dir().join(format!(
+            "dsh-flow-ui-discover-flows-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let workflow = root.join("workflows").join("w");
+        std::fs::create_dir_all(workflow.join("flows").join("login")).unwrap();
+        std::fs::write(workflow.join("flow.yml"), "name: w\n").unwrap();
+        std::fs::write(
+            workflow.join("flows").join("login").join("flow.yml"),
+            "name: login\n",
+        )
+        .unwrap();
+        let found = discover(&root);
+        assert!(found.iter().any(|entry| entry.name == "w"));
+        assert!(!found.iter().any(|entry| entry.name == "login"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn reports_a_missing_engine_clearly() {
         let engine = std::env::temp_dir().join("dsh-flow-ui-no-engine");
-        let error = RunSession::start(&engine, Path::new("flow.yml"), &[], None)
+        let error = RunSession::start(&engine, Path::new("flow.yml"), &[], None, &[])
             .err()
             .unwrap();
         assert!(error.contains("engine not found"), "{error}");
@@ -803,7 +1115,8 @@ mod tests {
 const steps = { counts: { id: "counts", kind: "run", status: "ok", durationMs: 40, command: "python steps/count.py", stderr: "1 line" } };
 console.log(JSON.stringify({ status: "ok", runId: "run-1", durationMs: 42, report: "out/report.html", steps }));"#,
         );
-        let session = RunSession::start(engine.path(), Path::new("flow.yml"), &[], None).unwrap();
+        let session =
+            RunSession::start(engine.path(), Path::new("flow.yml"), &[], None, &[]).unwrap();
         let (lines, outcome, failure) = drain(&session);
         assert!(failure.is_none(), "{failure:?}");
         let outcome = outcome.expect("summary");
@@ -819,6 +1132,62 @@ console.log(JSON.stringify({ status: "ok", runId: "run-1", durationMs: 42, repor
         assert!(
             lines.iter().any(|line| line.contains("counting")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn reads_the_event_stream_and_the_summary_after_it() {
+        if !node_available() {
+            return;
+        }
+        let engine = Fixture::engine(
+            "events",
+            r#"console.log(JSON.stringify({ts:"t",type:"run/start",detail:"demo"}));
+console.log(JSON.stringify({ts:"t",type:"step/start",id:"export",kind:"run"}));
+console.log(JSON.stringify({ts:"t",type:"step/end",id:"export",kind:"run",status:"ok",durationMs:8,summary:"已导出 x.xls（3 字节）",artifacts:[{kind:"file",name:"x.xls",path:"C:/tmp/x.xls",bytes:3}]}));
+console.log(JSON.stringify({ts:"t",type:"step/end",id:"verify",kind:"run",status:"failed",durationMs:2,error:{kind:"assert",message:"条数不对",hint:"先查询",where:"units.py:verify",expected:"51 条",gotten:"0 条"}}));
+console.log(JSON.stringify({ts:"t",type:"run/end",status:"failed",durationMs:10,detail:"条数不对"}));
+console.log(JSON.stringify({status:"failed",runId:"run-4",durationMs:10,steps:{export:{id:"export",kind:"run",status:"ok",durationMs:8,summary:"已导出 x.xls（3 字节）",artifacts:[{kind:"file",name:"x.xls",path:"C:/tmp/x.xls",bytes:3}]}}}));"#,
+        );
+        let session =
+            RunSession::start(engine.path(), Path::new("flow.yml"), &[], None, &[]).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        let mut events = Vec::new();
+        let mut outcome = None;
+        while outcome.is_none() {
+            assert!(Instant::now() <= deadline, "engine did not finish");
+            for message in session.poll() {
+                match message {
+                    RunMessage::Event(event) => events.push(event),
+                    RunMessage::Done(summary) => outcome = Some(*summary),
+                    RunMessage::Failed(error) => panic!("{error}"),
+                    RunMessage::Line(_) => {}
+                }
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(events.len(), 5);
+        let ended = events
+            .iter()
+            .find(|event| event.id == "export" && event.status == "ok")
+            .expect("step end");
+        assert_eq!(ended.summary.as_deref(), Some("已导出 x.xls（3 字节）"));
+        assert_eq!(ended.artifacts.len(), 1);
+        assert_eq!(ended.artifacts[0].bytes, 3);
+        let failed = events
+            .iter()
+            .find(|event| event.id == "verify")
+            .expect("failed step");
+        let error = failed.error.as_ref().expect("error view");
+        assert_eq!(error.kind, "assert");
+        assert_eq!(error.location.as_deref(), Some("units.py:verify"));
+        assert_eq!(error.expected.as_deref(), Some("51 条"));
+        // The summary still comes from the last plain JSON line.
+        let outcome = outcome.expect("summary");
+        assert!(!outcome.ok);
+        assert_eq!(
+            outcome.steps[0].summary.as_deref(),
+            Some("已导出 x.xls（3 字节）")
         );
     }
 
@@ -878,6 +1247,7 @@ process.stdin.on("end", () => {
             Path::new("flow.yml"),
             &[],
             Some(&credentials),
+            &[],
         )
         .unwrap();
         let (_lines, outcome, failure) = drain(&session);
@@ -902,7 +1272,7 @@ console.log(JSON.stringify({ status: "ok", runId: "run-2", durationMs: 1, steps:
         );
         let inputs = vec![("repo".to_string(), "E:/work".to_string())];
         let session =
-            RunSession::start(engine.path(), Path::new("flow.yml"), &inputs, None).unwrap();
+            RunSession::start(engine.path(), Path::new("flow.yml"), &inputs, None, &[]).unwrap();
         let (lines, outcome, failure) = drain(&session);
         assert!(failure.is_none(), "{failure:?}");
         assert!(outcome.expect("summary").ok);
@@ -911,7 +1281,7 @@ console.log(JSON.stringify({ status: "ok", runId: "run-2", durationMs: 1, steps:
             .find(|line| line.starts_with("argv "))
             .expect("argv echoed");
         assert!(
-            argv.contains("run flow.yml --json --input repo=E:/work"),
+            argv.contains("run flow.yml --events --input repo=E:/work"),
             "{argv}"
         );
     }

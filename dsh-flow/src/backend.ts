@@ -7,10 +7,21 @@
  * they never touch the network).
  */
 
-import { resolve as resolvePath } from 'node:path'
+import { basename, resolve as resolvePath } from 'node:path'
 import { askModel } from './ai.ts'
+import type { WireAttachment } from './ai.ts'
 import { runCommand, stepEnvironment } from './exec.ts'
 import { resolveRuntime } from './runtime.ts'
+
+/** One image attached to a question. */
+export interface AiImage {
+  /** Absolute path the step read it from; the `cli` backend gets this. */
+  path: string
+  /** MIME type, for example `image/png`. */
+  mime: string
+  /** Base64 bytes without the `data:` prefix; the `http` backend sends these. */
+  data: string
+}
 
 /** One question to a backend. */
 export interface AiAsk {
@@ -26,6 +37,8 @@ export interface AiAsk {
   maxTokens?: number
   /** The expected shape; only the `cli` backend receives it, as a hint. */
   schema?: unknown
+  /** Pictures the model should look at, already read from disk. */
+  images?: AiImage[]
 }
 
 /** One answer from a backend. */
@@ -93,6 +106,7 @@ export function createHttpBackend(options: HttpBackendOptions = {}): AiBackend {
             temperature: ask.temperature,
             maxTokens: ask.maxTokens,
             timeoutMs,
+            attachments: attachmentsOf(ask.images),
           }, { fetchImpl: options.fetchImpl, env: options.env })
           return { text: result.text, model: result.model, usage: result.usage }
         } catch (error) {
@@ -104,6 +118,22 @@ export function createHttpBackend(options: HttpBackendOptions = {}): AiBackend {
       throw lastError instanceof Error ? lastError : new Error(String(lastError))
     },
   }
+}
+
+/**
+ * Turn read images into the wire attachments `askModel` expects.
+ * @param images - pictures attached to the question.
+ * @returns the attachments, or undefined when there are none.
+ */
+function attachmentsOf(images: AiImage[] | undefined): WireAttachment[] | undefined {
+  if (images === undefined || images.length === 0) return undefined
+  return images.map((image) => ({
+    // Anything with an image MIME type travels as an `image_url` part.
+    kind: 'image' as const,
+    name: basename(image.path),
+    mimeType: image.mime,
+    data: image.data,
+  }))
 }
 
 /**
@@ -154,6 +184,9 @@ export function createCliBackend(
           temperature: ask.temperature ?? null,
           maxTokens: ask.maxTokens ?? null,
           schema: ask.schema ?? null,
+          // Paths, not bytes: the program can open the pictures itself, and a
+          // multi-megabyte base64 string would not survive every pipe.
+          images: (ask.images ?? []).map((image) => ({ path: image.path, mime: image.mime })),
         }, null, 2)}\n`,
       })
       if (outcome.spawnError !== undefined) throw new Error(`ai 后端命令 "${line}" 启动失败：${outcome.spawnError}`)

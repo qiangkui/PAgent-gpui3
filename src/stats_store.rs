@@ -65,6 +65,9 @@ pub struct StatsRecord {
     /// Thinking tokens the question produced, summed over its rounds; zero for
     /// records written before they were counted.
     pub reasoning_tokens: u64,
+    /// How often each tool was called for the request; empty for records written
+    /// before the names were kept.
+    pub tool_calls: std::collections::BTreeMap<String, u64>,
     /// True when the time is the conversation's last change, not the answer's.
     pub estimated: bool,
 }
@@ -89,6 +92,7 @@ impl StatsRecord {
             "webSearches": self.web_searches,
             "webFetches": self.web_fetches,
             "reasoningTokens": self.reasoning_tokens,
+            "toolCalls": self.tool_calls,
             "estimated": self.estimated,
         })
     }
@@ -109,10 +113,7 @@ impl StatsRecord {
             tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
             context: value.get("context").and_then(Value::as_u64).unwrap_or(0),
             tools: value.get("tools").and_then(Value::as_u64).unwrap_or(0),
-            cache_hits: value
-                .get("cacheHits")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            cache_hits: value.get("cacheHits").and_then(Value::as_u64).unwrap_or(0),
             prompt_tokens: value
                 .get("promptTokens")
                 .and_then(Value::as_u64)
@@ -133,6 +134,7 @@ impl StatsRecord {
                 .get("reasoningTokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            tool_calls: tool_counts(value),
             estimated: value
                 .get("estimated")
                 .and_then(Value::as_bool)
@@ -179,6 +181,9 @@ pub struct DayRollup {
     pub web_fetches: u64,
     /// Thinking tokens the day's questions produced.
     pub reasoning_tokens: u64,
+    /// How often each tool was called that day; empty for days written before the
+    /// names were kept.
+    pub tool_calls: BTreeMap<String, u64>,
     /// Conversations that answered at least once that day.
     pub chats: Vec<String>,
     /// Model shares for the day.
@@ -218,6 +223,7 @@ impl DayRollup {
             "webSearches": self.web_searches,
             "webFetches": self.web_fetches,
             "reasoningTokens": self.reasoning_tokens,
+            "toolCalls": self.tool_calls,
             "chats": self.chats,
             "models": models,
             "estimated": self.estimated,
@@ -234,10 +240,7 @@ impl DayRollup {
                     ModelCount {
                         requests: item.get("requests").and_then(Value::as_u64).unwrap_or(0),
                         tokens: item.get("tokens").and_then(Value::as_u64).unwrap_or(0),
-                        cache_hits: item
-                            .get("cacheHits")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(0),
+                        cache_hits: item.get("cacheHits").and_then(Value::as_u64).unwrap_or(0),
                         prompt_tokens: item
                             .get("promptTokens")
                             .and_then(Value::as_u64)
@@ -254,10 +257,7 @@ impl DayRollup {
             tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
             prompt: value.get("prompt").and_then(Value::as_u64).unwrap_or(0),
             tools: value.get("tools").and_then(Value::as_u64).unwrap_or(0),
-            cache_hits: value
-                .get("cacheHits")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            cache_hits: value.get("cacheHits").and_then(Value::as_u64).unwrap_or(0),
             prompt_tokens: value
                 .get("promptTokens")
                 .and_then(Value::as_u64)
@@ -268,14 +268,12 @@ impl DayRollup {
                 .get("webSearches")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
-            web_fetches: value
-                .get("webFetches")
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
+            web_fetches: value.get("webFetches").and_then(Value::as_u64).unwrap_or(0),
             reasoning_tokens: value
                 .get("reasoningTokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0),
+            tool_calls: tool_counts(value),
             chats: value
                 .get("chats")
                 .and_then(Value::as_array)
@@ -302,6 +300,23 @@ fn text(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// The `toolCalls` map of one record or day: tool name → times called.
+///
+/// A missing map reads as empty, which is what every line written before tool
+/// names were kept carries.
+fn tool_counts(value: &Value) -> BTreeMap<String, u64> {
+    value
+        .get("toolCalls")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .filter(|(name, _)| !name.trim().is_empty())
+                .filter_map(|(name, count)| count.as_u64().map(|count| (name.clone(), count)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The ledger folder under the program's fixed data directory.
@@ -439,14 +454,27 @@ fn add_to_day(rollup: &mut DayRollup, record: &StatsRecord) {
     rollup.prompt_tokens = rollup.prompt_tokens.saturating_add(record.prompt_tokens);
     rollup.model_ms = rollup.model_ms.saturating_add(record.model_ms);
     rollup.tool_ms = rollup.tool_ms.saturating_add(record.tool_ms);
-    rollup.web_searches = rollup.web_searches.saturating_add(u64::from(record.web_searches));
-    rollup.web_fetches = rollup.web_fetches.saturating_add(u64::from(record.web_fetches));
+    rollup.web_searches = rollup
+        .web_searches
+        .saturating_add(u64::from(record.web_searches));
+    rollup.web_fetches = rollup
+        .web_fetches
+        .saturating_add(u64::from(record.web_fetches));
     rollup.reasoning_tokens = rollup
         .reasoning_tokens
         .saturating_add(record.reasoning_tokens);
     rollup.estimated |= record.estimated;
+    // Per-tool counts add up the same way the totals do.
+    for (name, count) in &record.tool_calls {
+        let entry = rollup.tool_calls.entry(name.clone()).or_insert(0);
+        *entry = entry.saturating_add(*count);
+    }
     let model = record.model.trim();
-    let name = if model.is_empty() { "未知模型" } else { model };
+    let name = if model.is_empty() {
+        "未知模型"
+    } else {
+        model
+    };
     let entry = rollup.models.entry(name.to_string()).or_default();
     entry.requests = entry.requests.saturating_add(1);
     entry.tokens = entry.tokens.saturating_add(record.tokens);
@@ -459,7 +487,10 @@ fn add_to_day(rollup: &mut DayRollup, record: &StatsRecord) {
 fn write_days(dir: &Path, records: &[StatsRecord]) -> Result<(), String> {
     let mut grouped: BTreeMap<u64, Vec<&StatsRecord>> = BTreeMap::new();
     for record in records {
-        grouped.entry(day_start(record.at_ms)).or_default().push(record);
+        grouped
+            .entry(day_start(record.at_ms))
+            .or_default()
+            .push(record);
     }
     std::fs::create_dir_all(daily_dir(dir))
         .map_err(|error| format!("无法创建 {}：{error}", daily_dir(dir).display()))?;
@@ -577,6 +608,7 @@ mod tests {
             web_searches: 0,
             web_fetches: 0,
             reasoning_tokens: 0,
+            tool_calls: BTreeMap::new(),
             estimated: false,
         }
     }
@@ -586,8 +618,11 @@ mod tests {
         let dir = temp_dir("prune");
         let now = now_ms();
         let old = now.saturating_sub(KEEP_DETAIL_MS + DAY_MS);
-        append_many(&dir, &[record(old, "chat-old", 10), record(now, "chat-new", 20)])
-            .unwrap();
+        append_many(
+            &dir,
+            &[record(old, "chat-old", 10), record(now, "chat-new", 20)],
+        )
+        .unwrap();
         let details = load_records(&dir, 0, u64::MAX);
         assert_eq!(details.len(), 1, "only the recent detail remains");
         assert_eq!(details[0].chat, "chat-new");
@@ -606,6 +641,31 @@ mod tests {
         let days = load_daily(&dir, 0, u64::MAX);
         assert_eq!(days.iter().map(|day| day.requests).sum::<u64>(), 1);
         assert!(load_records(&dir, 0, u64::MAX).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn per_tool_counts_survive_both_files() {
+        let dir = temp_dir("tools");
+        let now = now_ms();
+        let mut first = record(now, "chat-a", 10);
+        first.tool_calls = BTreeMap::from([("read".to_string(), 2), ("grep".to_string(), 1)]);
+        let mut second = record(now, "chat-b", 10);
+        second.tool_calls = BTreeMap::from([("read".to_string(), 1)]);
+        append_many(&dir, &[first, second]).unwrap();
+        let details = load_records(&dir, 0, u64::MAX);
+        assert_eq!(details.len(), 2);
+        assert_eq!(details[0].tool_calls.get("read"), Some(&2));
+        assert_eq!(details[1].tool_calls.get("read"), Some(&1));
+        // The day sums each tool across its requests.
+        let day = load_daily(&dir, 0, u64::MAX).remove(0);
+        assert_eq!(day.tool_calls.get("read"), Some(&3));
+        assert_eq!(day.tool_calls.get("grep"), Some(&1));
+        // A line written before the field existed carries no tool names.
+        let mut old = record(now, "chat-old", 5).to_value();
+        old.as_object_mut().expect("object").remove("toolCalls");
+        let old = StatsRecord::from_value(&old).expect("old line");
+        assert!(old.tool_calls.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

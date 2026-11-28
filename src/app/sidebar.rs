@@ -30,7 +30,7 @@ impl DshFlowApp {
                     .window_control_area(WindowControlArea::Drag)
                     .child(
                         svg()
-                            .path("icons/app.svg")
+                            .path("icons/logo.svg")
                             .w(px(16.))
                             .h(px(16.))
                             .text_color(rgb(palette.accent)),
@@ -320,6 +320,16 @@ impl DshFlowApp {
             }
             let selected = self.view == View::Flow && self.selected_flow == Some(index);
             let badge = self.last_run(&entry.name);
+            // A distilled draft is safe to open but not finished: the dot says
+            // "needs review" while any `skip` placeholder is left. Replacing them
+            // all is what makes the card read as a normal workflow again.
+            let placeholders = entry.spec.placeholders();
+            let draft = placeholders > 0;
+            let label = self
+                .workflow_labels
+                .get(&entry.name)
+                .cloned()
+                .unwrap_or_else(|| util::workflow_display_name(&entry.name, placeholders));
             let run_colour = badge.map(|run| run.color(palette));
             let last_run = badge.map(|run| ago(run.finished_ms));
             let menu_open = self
@@ -356,7 +366,7 @@ impl DshFlowApp {
                         .flex_row()
                         .items_center()
                         .gap_2()
-                        .child(status_dot(palette.accent))
+                        .child(status_dot(if draft { palette.warn } else { palette.accent }))
                         .child(
                             div()
                                 .flex_1()
@@ -364,7 +374,7 @@ impl DshFlowApp {
                                 .truncate()
                                 .text_sm()
                                 .text_color(rgb(palette.text))
-                                .child(entry.name.clone()),
+                                .child(label),
                         )
                         .child(
                             div()
@@ -374,7 +384,13 @@ impl DshFlowApp {
                                 .bg(rgb(palette.background))
                                 .text_xs()
                                 .text_color(rgb(palette.faint))
-                                .child(format!("{} 步", entry.spec.steps.len())),
+                                .child(
+                                    if draft {
+                                        format!("草稿 · {} 步", entry.spec.steps.len())
+                                    } else {
+                                        format!("{} 步", entry.spec.steps.len())
+                                    },
+                                ),
                         )
                         .child(
                             div()
@@ -397,6 +413,7 @@ impl DshFlowApp {
                                             });
                                         view.category_menu = None;
                                         view.confirm_delete = None;
+                                        view.confirm_delete_workflow = None;
                                         view.card_menu = if same {
                                             None
                                         } else {
@@ -457,7 +474,9 @@ impl DshFlowApp {
                 .push(card);
         }
         let mut scan_note: Vec<AnyElement> = Vec::new();
-        if workflow_cards.values().all(|cards| cards.is_empty()) && self.hidden_workflows.is_empty()
+        if workflow_cards.values().all(|cards| cards.is_empty())
+            && self.hidden_workflows.is_empty()
+            && !filtering
         {
             scan_note.push(
                 div()
@@ -484,27 +503,17 @@ impl DshFlowApp {
             let cards = chat_cards.remove(&category.id).unwrap_or_default();
             let flows = workflow_cards.remove(&category.id).unwrap_or_default();
             let open = filtering || self.open_category == category.id;
-            if filtering && cards.is_empty() {
+            // A category can hold workflows without a conversation. Search must
+            // still find that workflow, and the count must say "one card", not 0.
+            let count = cards.len() + flows.len();
+            if filtering && count == 0 {
                 continue;
             }
-            let count = cards.len();
             rows.push(self.render_category_header(order, category, open, count, palette, cx));
             if !open {
                 continue;
             }
-            if cards.is_empty() {
-                rows.push(
-                    div()
-                        .mx_2()
-                        .px_3()
-                        .pb_1()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .text_color(rgb(palette.faint))
-                        .child("这个分类还没有对话")
-                        .into_any_element(),
-                );
-            } else {
+            if !cards.is_empty() {
                 rows.extend(cards);
             }
             // Workflow cards follow the conversations of the same category with
@@ -719,7 +728,10 @@ impl DshFlowApp {
                             .flex_row()
                             .items_center()
                             .gap_2()
-                            .mx_2()
+                            // Search and category rows sit one level in from the
+                            // 工作区 title; the card list keeps the full lane.
+                            .ml(px(20.))
+                            .mr_2()
                             .h(px(34.))
                             .px_3()
                             .rounded_md()
@@ -876,10 +888,13 @@ impl DshFlowApp {
             .flex_row()
             .items_center()
             .gap_2()
-            .mx_2()
+            // Same indent as the search box, so the tree under 工作区 reads as
+            // title → search → folder rows → cards.
+            .ml(px(20.))
+            .mr_2()
             .h(px(30.))
             .flex_shrink_0()
-            .px_2()
+            .px_3()
             .rounded_md()
             .cursor_pointer()
             .hover(move |style| style.bg(rgb(palette.panel_soft)))
@@ -1056,10 +1071,11 @@ impl DshFlowApp {
             .flex_row()
             .items_center()
             .gap_2()
-            .mx_2()
+            .ml(px(20.))
+            .mr_2()
             .h(px(28.))
             .flex_shrink_0()
-            .px_2()
+            .px_3()
             .rounded_md()
             .child(
                 svg()
@@ -1281,25 +1297,85 @@ impl DshFlowApp {
                         "删除对话"
                     })
             }
-            CardMenu::Workflow(index) => div()
-                .id("card-remove")
-                .px_3()
-                .py(px(1.))
-                .rounded_sm()
-                .text_xs()
-                .text_color(rgb(palette.failed))
-                .cursor_pointer()
-                .hover(move |style| style.bg(rgb(palette.panel_soft)))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    cx.stop_propagation();
-                    if let Some(entry) = view.workflows.get(index) {
-                        let name = entry.name.clone();
-                        view.remove_workflow(&name, cx);
-                    }
-                }))
-                // The manifest stays on disk: the card leaves the list, the folder
-                // is not ours to delete.
-                .child("从工作区移除"),
+            CardMenu::Workflow(index) => {
+                let delete_armed = self.confirm_delete_workflow.as_deref()
+                    == self
+                        .workflows
+                        .get(index)
+                        .map(|entry| entry.name.as_str());
+                div()
+                    .id("card-workflow-menu")
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("card-rename-workflow")
+                            .px_3()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(palette.text))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(entry) = view.workflows.get(index) {
+                                    let name = entry.name.clone();
+                                    view.start_rename_workflow(&name, window, cx);
+                                }
+                            }))
+                            .child("重命名"),
+                    )
+                    .child(
+                        div()
+                            .id("card-delete-workflow")
+                            .px_3()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(palette.failed))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(entry) = view.workflows.get(index) {
+                                    let name = entry.name.clone();
+                                    if view.confirm_delete_workflow.as_deref()
+                                        == Some(name.as_str())
+                                    {
+                                        view.delete_workflow(&name, cx);
+                                    } else {
+                                        view.confirm_delete_workflow = Some(name);
+                                        cx.notify();
+                                    }
+                                }
+                            }))
+                            .child(if delete_armed {
+                                "再点一次确认删除（含文件夹）"
+                            } else {
+                                "删除工作流（含文件夹）"
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("card-remove")
+                            .px_3()
+                            .py(px(1.))
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(palette.muted))
+                            .cursor_pointer()
+                            .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
+                                if let Some(entry) = view.workflows.get(index) {
+                                    let name = entry.name.clone();
+                                    view.remove_workflow(&name, cx);
+                                }
+                            }))
+                            .child("仅从工作区移除（保留文件夹）"),
+                    )
+            }
         });
         card.into_any_element()
     }
@@ -1314,6 +1390,10 @@ impl DshFlowApp {
         palette: Palette,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let (title, field_label) = match self.renaming.as_ref().map(|(target, _)| target) {
+            Some(RenameTarget::Workflow(_)) => ("重命名工作流", "工作流名称"),
+            _ => ("重命名对话", "对话名称"),
+        };
         div()
             .id("rename-sheet")
             .absolute()
@@ -1354,9 +1434,9 @@ impl DshFlowApp {
                         div()
                             .text_sm()
                             .text_color(rgb(palette.strong))
-                            .child("重命名对话"),
+                            .child(title),
                     )
-                    .child(self.render_field(Field::ChatTitle, "对话名称", palette, cx))
+                    .child(self.render_field(Field::ChatTitle, field_label, palette, cx))
                     .child(
                         div()
                             .flex()

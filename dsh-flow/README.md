@@ -93,8 +93,38 @@ steps:
 | `set` | 纯赋值，值支持模板 |
 | `map` | 对数组扇出，内部再跑一组步骤，默认并发 4 |
 | `ai` | 显式模型调用（见下一节），与 `run`/`set`/`map` 互斥 |
+| `use` | 调另一个清单做子流程（见下一节），与其它执行器互斥 |
 
 `run` 对象形式：`{ command, cwd?, env?, timeoutMs?, shell?, textOnly? }`。
+
+---
+
+### 子流程（`use`）
+
+把 login / fetch / parse 这样的片段拆成独立清单，父流程只声明调用和输入：
+
+```yaml
+steps:
+  - id: login
+    use:
+      manifest: ../shared/login/flow.yml
+      inputs:
+        user: "{{ inputs.user }}"      # 模板值保留类型（数字仍是数字）
+    save: session                       # 子流程最终的 vars 落到 vars.session
+
+  - id: greet
+    set:
+      line: "{{ vars.session.token }}"
+```
+
+也可以只写路径：`use: ../shared/login/flow.yml`。
+
+- 子流程有自己的目录、自己的 `.dsh-flow/answers` 与 `ledger`，所以它可以单独 `run` / `test` / 固化。
+- 父流程拿到的是子流程**最终的 `vars`**，作为 `steps.<id>.json`：能读 `steps.<id>.json.<名字>`，`save` 取的就是它。
+- `inputs` 只接受子清单声明过的名字；必填缺失会在子流程开始前报错。
+- 子流程失败 → 这一步失败（`error` 里写明失败在哪个子步骤）；`allowFailure: true` 时父流程继续。
+- 嵌套最多 5 层；清单调用自己（或互相调用）会被拒绝，报 `sub-flow cycle`。
+- 子流程不写父流程的 trace（避免步骤 id 撞车），它的每一行输出带 `[<父步骤 id>]` 前缀出现在父流程日志里。
 
 ---
 
@@ -136,6 +166,32 @@ steps:
   错误里带具体路径（例如 `$.category: 期望取值 "bug" / "question"`）。
 - **契约与代码步骤相同**：结果写进 `steps.<id>.text`；能解析成 JSON（且有 schema 时通过校验）
   的还写进 `steps.<id>.json`，`save` 取 `json ?? text`。
+
+#### 看图，以及不能回放的判断
+
+- `ai.images`：一组路径（可写模板，相对清单目录解析）。`http` 后端把它们作为 `image_url` 内容块发出
+  ——一次最多 3 张、单张 5 MB、总量 12 MB base64，超了在花 token 之前就报错；`cli` 后端只把
+  `[{path, mime}]` 放进 stdin，脚本自己打开。图片的 sha256 会进判断记录的 key，所以**换了图就是新判断**。
+- `ai.cache: false`：每次都问模型，既不读也不写记录。验证码这类「输入每次都不一样」的判断点必须这么写；
+  `--level manual` 遇到它会直接说明「没有答案可回放」，而不是回放昨天的验证码。
+- `ai.model` 也支持模板，一条流程可以只让某一步走视觉模型：
+
+```yaml
+  - id: read
+    why: 验证码是图灵测试，规则与普通 OCR 都无法稳定识别
+    ai:
+      model: "{{ inputs.vision_model }}"   # 空字符串 → 用接入点默认模型
+      cache: false
+      images: ["{{ steps.shot.json.image }}"]
+      prompt: 逐字读出图里的 4 个字符；看不清就说看不清，不要猜
+      schema:
+        type: object
+        required: [code, readable, reason]
+        properties:
+          code: { type: string, maxLength: 8 }
+          readable: { type: boolean }
+          reason: { type: string, maxLength: 40 }
+```
 
 #### 三档介入
 
@@ -199,7 +255,31 @@ schema、model、temperature、maxTokens** 一起算出。改了其中任何一�
 
 **环境变量** —— 引擎强制注入 UTF-8（`PYTHONUTF8=1`、`PYTHONIOENCODING=utf-8`）。Windows 上 Python 默认按 ANSI 代码页输出，不设这个，中文 JSON 会直接解析失败。
 
-**其他** —— 单流输出上限 4 MB（超出截断并标记）；超时先 SIGTERM，再强杀；命令默认不经 shell（`[cmd, ...args]`），用字符串写命令才走 shell。
+**秘密输入** —— `inputs` 里的名字可以标 `secret: true`：这样的输入**不能写 `default`**（加载时就报错，
+因为清单会被提交）、**不能走 `--input`**（会进命令行、进程列表与日志），只能来自
+`--secrets-stdin`（界面的输入卡就是这么送进来的）或环境变量 `DSH_SECRET_<名字>`。
+引擎把它的值在日志行、trace、步骤的 `stdout` / `stderr` / `text` / `json`、`vars`、汇总与 HTML 报告里
+统一替换成 `***`；步骤程序自己仍然通过 `{{ inputs.名字 }}` 拿到明文。
+
+**其他** —— 单流输出上限 4 MB（超出截断并标记）；超时先 SIGTERM，再强杀；命令默认不经 shell（`[cmd, ...args]`），用字符串写命令才走 shell。每个步骤还会收到 `DSH_ENGINE_DIR`（引擎自己的目录），需要调 `dsh-flow browser` 的步骤用它，不必在清单里写死路径。
+
+**步骤可以描述自己的结果**（三个保留键，都是可选的；一次只能输出**一个** JSON 文档）：
+
+```json
+{
+  "summary": "共 51 条（第 1–10 条）",
+  "artifacts": [{"kind": "file", "name": "使用单位导出.xls", "path": "成品的绝对或相对路径"}],
+  "error": {"kind": "regex-miss", "message": "分页条里没有「共 N 条记录」",
+            "hint": "站点改版时正则要跟着改", "where": "maers_site.py:query",
+            "expected": "共 51 条", "gotten": "每页：10…"}
+}
+```
+
+- `summary` 进卡片的那一行；`ai` 步骤没写时用回答的首行；
+- `artifacts` 最多 12 个，路径相对清单目录、**必须存在**，密钥类文件被拒；大小由引擎补算；
+- `error.kind` 限 `credential` / `config` / `selector-miss` / `regex-miss` / `image-unreadable` /
+  `assert` / `timeout` / `model` / `engine`，其它归为 `engine`。
+  它不改变退出码的含义：**失败仍然是非零退出**，`error` 只是把"为什么、怎么修、期望什么"说清楚。
 
 ---
 
@@ -221,23 +301,37 @@ schema、model、temperature、maxTokens** 一起算出。改了其中任何一�
 ## 命令
 
 ```sh
-node src/cli.ts run     <manifest> [--input k=v]... [--level manual|assist|draft] [--no-strict] [--credentials-stdin] [--dry] [--report file.html] [--json] [--quiet]
+node src/cli.ts run     <manifest> [--input k=v]... [--level manual|assist|draft] [--no-strict] [--credentials-stdin] [--secrets-stdin] [--events] [--dry] [--report file.html] [--json] [--quiet]
 node src/cli.ts validate <manifest> [--no-strict]
 node src/cli.ts explain  <manifest> [--input k=v]...
 node src/cli.ts test     <manifest> [--update] [--filter <step-id>]
 node src/cli.ts init     <dir> [--lang python|node]
 node src/cli.ts derive   <session.jsonl> [--out <dir>] [--name <name>] [--description <text>]
+node src/cli.ts distill  <chat.json> [--out <dir>] [--turn <n>] [--name <name>] [--description <text>]
 node src/cli.ts ai                       # 一次模型问答：stdin 一个 JSON，stdout 一个 JSON
 node src/cli.ts models                   # 该接入点可用的模型：stdin {baseUrl,apiKey}，stdout {models:[…]}
+node src/cli.ts browser '{"action":"goto","url":"…"}' [--workdir <dir>] [--json]
+                                         # 一个浏览器动作：请求是浏览器工具的同一套参数，
+                                         # 默认输出文本，--json 输出 {ok,text,files,image}
 ```
 
 - `run` 会在清单旁写 `.dsh-flow/runs/<runId>.jsonl` 轨迹；失败时自动在同目录生成 HTML 报告，也可以用 `--report` 指定路径。
 - `run` 默认 `--level assist`：先回放 `.dsh-flow/answers/` 里的判断记录，只有缺的才问模型；`--level manual` 一次模型都不调，`--level draft` 每次都问。
+- `browser` 是给**步骤**用的：工作流里的程序（Python / Node 都行）调它打开页面、填表、截图、等下载，
+  与问答里的 `browser` 工具共用同一个浏览器、同一个页面和同一份登录态（指针在
+  `<workdir>/.dsh-flow/browser/session.json`，浏览器活过单个进程）。请求体就是工具参数：
+  `{"action":"eval","expression":"…"}`。退出码 0/1 表示动作是否成功，`--json` 时失败也照样打印
+  `{"ok":false,"text":"…"}`，脚本可以直接分支。`wait_download`（等文件写完）与
+  `downloads`（列目录）不需要浏览器在跑；`screenshot` 支持用 `selector` 只截一个元素。
 - `explain` 打印步骤表和"多少步骤不需要模型"的占比（`ai N` + `ai 判断点` 会列出每一步的 `why`）——这是判断一条流程值不值得固化的指标。
 - `--dry` 只渲染不执行；`--no-strict` 允许 `ai` 步骤暂时不写 `why` / `schema`。
-- `--credentials-stdin` 让 `run` 从 stdin 读一份 `{"apiKey","baseUrl","model"}` 交给 `http` 后端
+- `--credentials-stdin` 让 `run` 从 stdin 读一份 `{"apiKey","baseUrl","model","secrets"}` 交给 `http` 后端
   （`cli` 后端不读它）。界面就是这样在不暴露 Key 的前提下运行带 `ai` 步骤的工作流；
   不给这个参数时回退到 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`。
+- `--secrets-stdin` 是同一份载荷的窄写：只读 `{"secrets": {名字: 值}}`，交给 `secret: true` 的输入。
+- `--events` 把运行边界做成 NDJSON 打在 stdout 上，**最后一行仍是汇总对象**：
+  `run/start`、`step/start`、`step/end`（带 `status` / `summary` / `artifacts` / `error`）、`run/end`（带 verdict）。
+  人读的进度同时照旧走 stderr。`--events` 与 `--json` 互斥。
 - `ai` 是给界面和脚本用的桥：`{"prompt":"…","system":"…","history":[…],"model":"deepseek-chat","apiKey":"…","baseUrl":"…"}`
   进，`{"text":"…","model":"…","usage":…}` 或 `{"error":"…"}` 出；缺省从 `DEEPSEEK_API_KEY` /
   `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL` 取，接口按 OpenAI 兼容的 `/chat/completions` 调用。
@@ -328,6 +422,40 @@ node src/cli.ts derive session.jsonl --out out/derived --name triage-session
 - **不推断**：没见过的工具不会被猜成命令，参数不会被改写。派生出来的是草稿，`validate` / `test` /
   人工 review 之后才算数。
 
+窗口里的聊天记录不是会话 JSONL，用下一节的 `distill`。
+
+## 从聊天记录固化（distill）
+
+`derive` 读的是 dsh 的会话 JSONL；窗口保存的聊天是另一份形状：`data/chats/chat-N/chat.json`
+是一个 JSON 文档，`messages` 里混着助手文字、思考与工具行（工具行的 `text` 以 `工具名 · …` 开头，
+`input` 是参数 JSON，`output` 是结果）。把 `chat.json` 交给 `derive` 只会得到 `0 run · 1 skipped`。
+
+```sh
+node src/cli.ts distill data/chats/chat-1/chat.json --out out/derived
+node src/cli.ts distill data/chats/chat-1/chat.json --out out/derived --turn 1 --name maers-units-export
+```
+
+它只做确定性的部分：
+
+| 聊天记录里的东西 | 派生成什么 |
+|---|---|
+| `shell` 且 `args.command` 是字符串 | `run` 步骤，命令原样保留（多行写 `run: |`）；同参相邻重复合并为 1 步 + `retries` |
+| `browser` 的 open/goto/click/type/press/select、`http`、文件改动、`show`、`run_tests`… | `skip` 占位步骤：`desc` 写清要实现的动作，参数留在 `actions.json` |
+| `browser` 的 eval/snapshot/text 与整页截图；`list`/`glob`/`read`/`grep`… | 丢弃（探索与探测），只在报告里计数，提示写进 SOP |
+| `browser screenshot` 带 `selector` / `ref` | `skip` 占位（产物）：元素截图可以成为 workflow 的 artifact |
+| 同名同参但中间隔着别的步骤 | 不合并，在报告「合并与重试」里点名，由人判断是重试还是两次真实运行 |
+| 收尾的助手结论、看图的调用 | 「判断点候选」：要提升成 `ai` 时再补 `why` / `schema` / `cache: false` |
+
+产物三份：`flow.draft.yml`（能 `validate` 的草稿）、`actions.json`（每个调用的参数、结果、处置与原因）、
+`distill.md`（动作表、被合并/丢弃的调用、判断点、产物与下一步）。默认只固化**最后一个提问**所在的轮次，
+`--turn` 可以指定；第 2 轮及以后不会自动混进来。`--name` 与 `--description` 原样写进清单（不做 slug），
+中文标题可以直接用；只有缺省时才从标题生成 ASCII 名。
+
+三条边界与 `derive` 相同：**不生成 ai 步骤**、**不改写参数**、**不判断成功**。草稿里的 `skip` 占位是
+「这里还需要一个步骤程序」的占位符；哪些步骤留下、合并或删掉，由 review 决定。
+
+review 的口径写在应用侧的 Skill `skills/workflow-distill/SKILL.md`（Skill 页导入后启用）。
+
 ## 设计约束
 
 1. **准确优先，少用 AI 是目标函数**：`min(AI 步骤数) s.t. 步骤契约测试全绿`。
@@ -358,6 +486,7 @@ node src/cli.ts derive session.jsonl --out out/derived --name triage-session
 - 三档介入 `manual` / `assist` / `draft`，判断记录可回放，日常 `run` 0 次模型调用
 - `explain` 输出 AI 依赖度（`ai` 步骤数 / 总步骤数）与每个判断点的 `why`
 - `derive`：从 dsh 会话 JSONL 生成骨架（命令 → `run` 步骤；判断点与其它调用 → `# TODO`）
+- `distill`：从窗口的 `chat.json` 生成草稿（命令 → `run`；其余动作 → `skip` 占位；探索/探测丢弃并报告，同参重复合并）
 - `run` 的两处通道：`--credentials-stdin`（界面把接入点交给 `ai` 步骤）与字符串命令走 shell
 - 思考开关与力度：`ai` 桥的 `reasoning`（`off` / `low` / `high` / `max`），逐轮思考随 `reasoning` 事件与 `roundReasoning` 回报
 
@@ -365,11 +494,10 @@ node src/cli.ts derive session.jsonl --out out/derived --name triage-session
 
 | 能力 | 说明 |
 |---|---|
-| `services` | run 级长驻进程（浏览器/CDP），带 `ready` 探活与 `finally` 清理 |
-| `once` + ledger | 提交类步骤不重复执行 |
 | `approve` / `pause` | 提交前人工确认；2FA/验证码人工接管 |
 | `fetch` 录制回放 | 把响应体存成 fixture，`--offline` 回放 |
-| `use:` | 调用另一个清单做子流程 |
+
+（`services`、`once` + ledger、`use:` 已实现，见上文。）
 
 ---
 

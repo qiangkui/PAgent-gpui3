@@ -6,6 +6,12 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
+/** A 1×1 PNG, for the tools that hand a picture to the model. */
+export const DOT_PNG = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
+  'base64'
+)
+
 /** One captured chat-completions request, for the fetch stub. */
 export interface CapturedRequest {
   url: string

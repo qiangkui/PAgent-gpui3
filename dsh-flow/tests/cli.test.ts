@@ -48,6 +48,101 @@ async function cliAsync(args: string[], stdin: string, cwd?: string): Promise<{ 
   return { code, out }
 }
 
+test('browser runs one action from a step: JSON in, JSON out', async () => {
+  const dir = makeProject({})
+  const downloads = join(dir, '.dsh-flow', 'downloads')
+  await mkdir(downloads, { recursive: true })
+  await writeFile(join(downloads, '使用单位导出.xls'), 'x')
+  const request = JSON.stringify({
+    action: 'wait_download',
+    name: '使用单位导出.xls',
+    timeoutMs: 800,
+  })
+  const result = cli(['browser', '--workdir', dir, '--json', request])
+  assert.equal(result.code, 0)
+  const payload = JSON.parse(result.stdout) as {
+    ok: boolean
+    action: string
+    files?: Array<{ path: string, bytes: number }>
+  }
+  assert.equal(payload.ok, true)
+  assert.equal(payload.action, 'wait_download')
+  assert.equal(payload.files?.[0]?.path, join(downloads, '使用单位导出.xls'))
+  assert.equal(payload.files?.[0]?.bytes, 1)
+})
+
+test('browser says what a missing or malformed request looks like', () => {
+  const missing = cli(['browser'])
+  assert.equal(missing.code, 2)
+  assert.match(missing.out, /JSON/)
+
+  const malformed = cli(['browser', '[]'])
+  assert.equal(malformed.code, 2)
+  assert.match(malformed.out, /JSON/)
+})
+
+test('run --events streams one record per boundary and closes with the summary', async () => {
+  const dir = makeProject({
+    'flow.yml': `name: demo
+description: d
+steps:
+  - id: a
+    run: [node, -e, 'process.stdout.write(JSON.stringify({summary:"done"}))']
+`,
+  })
+  const result = await cliAsync(['run', `${dir}/flow.yml`, '--events'], '')
+  assert.equal(result.code, 0, result.out)
+  // Progress goes to stderr (the log pane's stream); only records start with `{`.
+  const lines = result.out.split(/\r?\n/).map(line => line.trim()).filter(line => line.startsWith('{'))
+  const parsed = lines.map(line => JSON.parse(line) as { type?: string, status?: string, summary?: string })
+  const events = parsed.filter(entry => entry.type !== undefined)
+  assert.equal(events[0]?.type, 'run/start')
+  assert.equal(events.some(entry => entry.type === 'step/start'), true, result.out)
+  assert.equal(events.some(entry => entry.type === 'step/end'), true, result.out)
+  assert.equal(events.at(-1)?.type, 'run/end')
+  const ended = events.at(-1) as { status?: string }
+  assert.equal(ended.status, 'ok')
+  const stepEnd = events.find(entry => entry.type === 'step/end') as { summary?: string, durationMs?: number }
+  assert.equal(stepEnd.summary, 'done')
+  // The last record is the plain summary object, so a reader can stop parsing
+  // events there instead of reconstructing the verdict from `step/end` lines.
+  const summary = parsed.at(-1) as { status?: string, type?: string }
+  assert.equal(summary.type, undefined)
+  assert.equal(summary.status, 'ok')
+})
+
+const SECRET_RUN = `name: secret
+description: d
+inputs:
+  password:
+    required: true
+    secret: true
+steps:
+  - id: a
+    run: [node, -e, 'process.stdout.write(JSON.stringify({summary:"ok"}))']
+`
+
+test('--secrets-stdin hands a password over on stdin, not on the command line', async () => {
+  const dir = makeProject({ 'flow.yml': SECRET_RUN })
+  const result = await cliAsync(
+    ['run', `${dir}/flow.yml`, '--secrets-stdin', '--json'],
+    JSON.stringify({ secrets: { password: 'cli-fish' } }),
+  )
+  assert.equal(result.code, 0, result.out)
+  assert.equal(result.out.includes('cli-fish'), false, result.out)
+})
+
+test('a secret input names the three ways to supply it', async () => {
+  const dir = makeProject({ 'flow.yml': SECRET_RUN })
+  const missing = await cliAsync(['run', `${dir}/flow.yml`], '')
+  assert.equal(missing.code, 1)
+  assert.match(missing.out, /DSH_SECRET_PASSWORD/)
+
+  const onArgv = await cliAsync(['run', `${dir}/flow.yml`, '--input', 'password=nope'], '')
+  assert.equal(onArgv.code, 1)
+  assert.match(onArgv.out, /secret/)
+})
+
 test('validate reports ok and explains the plan', () => {
   const dir = makeProject({ 'flow.yml': `name: demo\ndescription: d\nsteps:\n  - id: a\n    run: [node, -e, '0']\n` })
   const validated = cli(['validate', `${dir}/flow.yml`])
@@ -399,6 +494,96 @@ test('interactive ai waits for a write approval on the same pipe', async () => {
     assert.equal(code, 0, out)
     assert.equal(await readFile(join(dir, 'note.txt'), 'utf8'), 'hello\n')
     assert.match(out, /written/)
+  } finally {
+    child.kill()
+    await new Promise<void>(resolve => server.close(() => resolve()))
+  }
+})
+
+test('interactive ai reports a memory entry on the same pipe', async () => {
+  let round = 0
+  const server = createServer((request, response) => {
+    request.resume()
+    request.on('end', () => {
+      round += 1
+      response.writeHead(200, { 'content-type': 'application/json' })
+      if (round === 1) {
+        response.end(JSON.stringify({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [{
+                id: 'call-1',
+                type: 'function',
+                function: {
+                  name: 'remember',
+                  arguments: JSON.stringify({ text: '先看 README' })
+                }
+              }]
+            }
+          }]
+        }))
+      } else {
+        response.end(JSON.stringify({ choices: [{ message: { content: 'ok' } }] }))
+      }
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  const port = typeof address === 'object' && address !== null ? address.port : 0
+  const dir = await mkdtemp(join(tmpdir(), 'dsh-memory-'))
+  const child = spawn(process.execPath, [CLI, 'ai'], {
+    cwd: dir,
+    stdio: ['pipe', 'pipe', 'pipe']
+  })
+
+  try {
+    let out = ''
+    let resolveMemory: (value: Record<string, unknown>) => void = () => undefined
+    const seen = new Promise<Record<string, unknown>>(resolve => {
+      resolveMemory = resolve
+    })
+    let pending = ''
+    child.stdout.setEncoding('utf8').on('data', chunk => {
+      pending += chunk
+      let newline = pending.indexOf('\n')
+      while (newline >= 0) {
+        const line = pending.slice(0, newline).trim()
+        pending = pending.slice(newline + 1)
+        newline = pending.indexOf('\n')
+        if (!line) continue
+        out += `${line}\n`
+        const value = JSON.parse(line) as Record<string, unknown>
+        if (value.type === 'memory') resolveMemory(value)
+      }
+    })
+    child.stderr.setEncoding('utf8').on('data', chunk => {
+      out += chunk
+    })
+
+    child.stdin.write(`${JSON.stringify({
+      prompt: '记住这条',
+      apiKey: 'sk-test',
+      baseUrl: `http://127.0.0.1:${port}`,
+      model: 'm',
+      tools: true,
+      interactive: true,
+      memory: true
+    })}\n`)
+
+    const entry = await Promise.race([
+      seen,
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error(`no memory event arrived: ${out}`)), 5000)
+      })
+    ])
+    assert.equal(entry.call, 'call-1')
+    assert.equal(entry.text, '先看 README')
+
+    const code = await new Promise<number>(resolve => {
+      child.on('close', value => resolve(value ?? -1))
+    })
+    assert.equal(code, 0, out)
   } finally {
     child.kill()
     await new Promise<void>(resolve => server.close(() => resolve()))
@@ -865,6 +1050,119 @@ test('derive writes a reviewed-later skeleton next to the session', () => {
   const ran = cli(['run', file])
   assert.equal(ran.code, 0, ran.out)
   assert.match(ran.out, /\[OK  \] bash/)
+})
+
+test('distill writes a draft, evidence and report from a saved chat', () => {
+  const dir = makeProject({
+    'chat.json': JSON.stringify({
+      title: '导出使用单位',
+      dir: 'chat-7',
+      messages: [
+        { role: 'user', text: '把脚本跑一遍' },
+        {
+          role: 'tool',
+          text: 'shell · 解析脚本',
+          input: JSON.stringify({ command: 'node -e "console.log(5)"' }),
+          output: '5',
+          failed: false,
+        },
+        {
+          role: 'tool',
+          text: 'browser · open https://maers.adrs.org.cn/console/login.ftl',
+          input: JSON.stringify({ action: 'open', url: 'https://maers.adrs.org.cn/console/login.ftl' }),
+          output: 'ok',
+          failed: false,
+        },
+        {
+          role: 'tool',
+          text: 'read · README.md — 10 行',
+          input: JSON.stringify({ path: 'README.md' }),
+          output: '...',
+          failed: false,
+        },
+      ],
+    }, null, 2),
+  })
+  const out = join(dir, 'derived')
+  const distilled = cli(['distill', `${dir}/chat.json`, '--out', out, '--name', 'from-chat'])
+  assert.equal(distilled.code, 0, distilled.out)
+
+  const draft = readFileSync(join(out, 'flow.draft.yml'), 'utf8')
+  assert.match(draft, /name: "from-chat"/)
+  assert.match(draft, /run: .*node -e/)
+  assert.ok(draft.includes('console.log(5)'), draft)
+
+  const evidence = JSON.parse(readFileSync(join(out, 'actions.json'), 'utf8')) as {
+    actions: Array<{ verdict: string }>
+  }
+  assert.equal(evidence.actions[0]?.verdict, 'step')
+  assert.equal(evidence.actions[1]?.verdict, 'step')
+  assert.equal(evidence.actions[2]?.verdict, 'dropped')
+  assert.match(readFileSync(join(out, 'distill.md'), 'utf8'), /聊天记录固化报告/)
+
+  const validated = cli(['validate', join(out, 'flow.draft.yml')])
+  assert.equal(validated.code, 0, validated.out)
+  const ran = cli(['run', join(out, 'flow.draft.yml')])
+  assert.equal(ran.code, 0, ran.out)
+  assert.match(ran.out, /\[OK  \] shell/)
+  assert.match(ran.out, /\[SKIP\] browser-open/)
+})
+
+test('distill --turn picks an earlier question', () => {
+  const dir = makeProject({
+    'chat.json': JSON.stringify({
+      title: '两轮',
+      messages: [
+        { role: 'user', text: '第一轮' },
+        {
+          role: 'tool',
+          text: 'shell · one',
+          input: JSON.stringify({ command: 'echo one' }),
+          output: 'one',
+          failed: false,
+        },
+        { role: 'user', text: '第二轮' },
+        {
+          role: 'tool',
+          text: 'shell · two',
+          input: JSON.stringify({ command: 'echo two' }),
+          output: 'two',
+          failed: false,
+        },
+      ],
+    }, null, 2),
+  })
+  const last = cli(['distill', `${dir}/chat.json`])
+  assert.equal(last.code, 0, last.out)
+  assert.match(last.stdout, /echo two/)
+  assert.ok(!last.stdout.includes('echo one'), last.stdout)
+
+  const first = cli(['distill', `${dir}/chat.json`, '--turn', '1'])
+  assert.equal(first.code, 0, first.out)
+  assert.match(first.stdout, /echo one/)
+  assert.ok(!first.stdout.includes('echo two'), first.stdout)
+})
+
+test('distill --name keeps a Chinese name', () => {
+  const dir = makeProject({
+    'chat.json': JSON.stringify({
+      title: '导出',
+      messages: [
+        { role: 'user', text: '跑一下' },
+        {
+          role: 'tool',
+          text: 'shell · 命令',
+          input: JSON.stringify({ command: 'echo one' }),
+          output: 'one',
+          failed: false,
+        },
+      ],
+    }),
+  })
+  const out = join(dir, 'derived')
+  const result = cli(['distill', `${dir}/chat.json`, '--out', out, '--name', '使用单位导出（草稿）'])
+  assert.equal(result.code, 0, result.out)
+  assert.match(readFileSync(join(out, 'flow.draft.yml'), 'utf8'), /name: "使用单位导出（草稿）"/)
 })
 
 test('reports plugin panels with the tools event', async () => {

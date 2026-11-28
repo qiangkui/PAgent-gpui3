@@ -1,0 +1,4 @@
+{
+  "name": "工作流固化",
+  "description": "把聊天里跑通的流程固化成可重跑、可测试的 dsh-flow 清单：先 distill，再按判据 review、折叠与验收。"
+}

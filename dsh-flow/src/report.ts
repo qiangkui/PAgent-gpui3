@@ -40,6 +40,9 @@ tr.failed td { background:rgba(198,40,40,.08); }
 code,pre { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:12px; }
 pre { margin:0; padding:8px; overflow:auto; max-height:360px; background:rgba(127,127,127,.10); border-radius:6px; }
 details { margin:4px 0; } summary { cursor:pointer; color:var(--muted); }
+.result { font-size:13px; margin:2px 0; }
+.artifacts { margin:4px 0 0 18px; padding:0; font-size:12px; }
+.artifacts .path { color:var(--muted); font-size:11px; }
 .status-ok { color:var(--ok); } .status-failed { color:var(--fail); } .status-skipped { color:var(--skip); }
 </style>
 </head>
@@ -70,6 +73,27 @@ ${rows}
  */
 function stepSection(result: StepResult): string {
   const details: string[] = []
+  if (result.summary !== undefined) {
+    details.push(`<div class="result">${escapeHtml(result.summary)}</div>`)
+  }
+  if (result.errorInfo !== undefined) {
+    const info = result.errorInfo
+    const parts = [`<strong>${escapeHtml(info.kind)}</strong>`, escapeHtml(info.message)]
+    if (info.hint !== undefined) parts.push(`<em>${escapeHtml(info.hint)}</em>`)
+    if (info.where !== undefined) parts.push(`<code>${escapeHtml(info.where)}</code>`)
+    if (info.expected !== undefined || info.gotten !== undefined) {
+      parts.push(
+        `期望 <code>${escapeHtml(info.expected ?? '—')}</code> · 实际 <code>${escapeHtml(info.gotten ?? '—')}</code>`,
+      )
+    }
+    details.push(`<div class="status-failed">${parts.join(' · ')}</div>`)
+  }
+  if (result.artifacts !== undefined && result.artifacts.length > 0) {
+    const items = result.artifacts
+      .map((artifact) => `<li><code>${escapeHtml(artifact.name)}</code> ${escapeHtml(artifact.kind)} · ${artifact.bytes} B<br><span class="path">${escapeHtml(artifact.path)}</span></li>`)
+      .join('')
+    details.push(`<details open><summary>产物 (${result.artifacts.length})</summary><ul class="artifacts">${items}</ul></details>`)
+  }
   if (result.command !== undefined) details.push(`<details><summary>command</summary><pre>${escapeHtml(result.command)}</pre></details>`)
   if (result.stdout !== undefined && result.stdout.trim() !== '') {
     details.push(`<details><summary>stdout</summary><pre>${escapeHtml(clip(result.stdout))}</pre></details>`)

@@ -1,5 +1,4 @@
-//! The plugins page: built-in tools, externally installed plugins, and what is
-//! still planned.
+//! The plugins page: built-in tools and externally installed plugins.
 //!
 //! Every entry is a card of the same size, with two lines of grey text; the
 //! arrow in the corner opens the rest of a long description. The built-in cards
@@ -63,149 +62,59 @@ fn name_width(dot: bool, trailing: Option<f32>, arrow: bool, menu: bool) -> f32 
     width.max(32.)
 }
 
+/// Whether one card survives the tools filter.
+///
+/// The needle is already trimmed and lowercased by the caller; a name and a
+/// description are compared the same way, so `Sandbox` and `沙箱` both find the
+/// cards that mention them.
+pub(crate) fn tool_matches(needle: &str, name: &str, description: &str) -> bool {
+    needle.is_empty()
+        || name.to_lowercase().contains(needle)
+        || description.to_lowercase().contains(needle)
+}
+
 impl DshFlowApp {
     /// Plugins: what the assistant can call, and which external plugins are on.
     pub(crate) fn render_plugins(&self, palette: Palette, cx: &mut Context<Self>) -> Div {
-        let builtin = [
-            (
-                "read",
-                "读取工作区里的文本文件，带行号，最多 400 行 / 20 万字符",
-            ),
-            ("write", "新建或整体覆盖文件，自动建目录，单次 ≤ 40 万字符"),
-            ("edit", "替换一处或多处只出现一次的文本，支持 edits 批量"),
-            (
-                "replace",
-                "按 glob 选多个文件，批量替换同一段文本；默认每文件唯一",
-            ),
-            ("move", "移动或重命名文件；目标已存在时拒绝，默认执行前确认"),
-            ("delete", "删除单个文件（不删文件夹），默认需确认，不能撤销"),
-            ("list", "列出文件夹的直接子项，目录以 / 结尾，不递归"),
-            (
-                "glob",
-                "按通配符列文件，例如 src/**/*.ts，跳过 .git / node_modules",
-            ),
-            (
-                "tree",
-                "按树形看结构（可设 depth），跳过 .git / node_modules / target，遵守 .gitignore",
-            ),
-            (
-                "grep",
-                "按正则搜内容，可忽略大小写、带上下文；返回「路径:行号: 内容」，最多 200 行",
-            ),
-            (
-                "symbols",
-                "按名字找声明（Rust / TS / JS / Python / Go），首次建索引并缓存，10 分钟内复用；find: references 查整词引用",
-            ),
-            (
-                "git",
-                "只读查看仓库：status / diff / log / show / ls-files 等，不会改动工作区",
-            ),
-            (
-                "shell",
-                "在当前目录运行命令（测试 / 构建 / 格式化）；路径受沙箱约束，默认执行前确认，可给 stdin 或用 background 转为后台任务",
-            ),
-            (
-                "task",
-                "管理后台任务：list 列出、output 看输出尾部、stop 结束一个、stopAll 结束全部",
-            ),
-            (
-                "python",
-                "用 python -c 运行一段 Python 代码；支持多行，默认执行前确认",
-            ),
-            (
-                "node",
-                "用 node -e 运行一段 Node.js 代码；支持多行，默认执行前确认",
-            ),
-            (
-                "http",
-                "发一个 GET / 有限 POST 请求（只允许 http / https，不跟随重定向，不发 authorization / cookie），默认执行前确认",
-            ),
-            (
-                "mcp",
-                "连接并调用 MCP 服务器：list 看 mcpserver 目录，link 按 id 或 command/url 连接，tools 看本次已连接，call 调用工具，disconnect 断开；连接在本次提问内保持",
-            ),
-            (
-                "ask_user_question",
-                "向用户提一个带选项的问题并等待回答；关键方案拿不准时使用",
-            ),
-            (
-                "todo_write",
-                "写入或替换本次对话的待办列表；开始多步任务时列计划，之后更新状态",
-            ),
-            (
-                "exit_plan_mode",
-                "计划模式下提交完整计划，等待用户批准后开始执行",
-            ),
-        ];
-        let planned = [
-            ("approve / pause", "人工确认与 2FA 接管，拒绝则中止并留痕"),
-            ("fetch 录制回放", "离线运行完整流程"),
-            ("use 子流程", "把 login / fetch / parse 拆开复用"),
-            ("state 游标", "第二次运行只处理新增数据"),
-        ];
-        let chat = self.chat();
+        // The filter matches a card's name or description, case-insensitively:
+        // "sandbox", "图片" or "commit" are the words a person actually types.
+        let needle = self.tool_filter.text.trim().to_lowercase();
+        let filtering = !needle.is_empty();
+        let keep =
+            |name: &str, description: &str| -> bool { tool_matches(&needle, name, description) };
         let mut slot = 0usize;
-        let mut builtin_cards: Vec<AnyElement> = Vec::new();
-        for (name, description) in builtin {
-            let writable = matches!(name, "write" | "edit" | "replace");
-            // Commands and destructive file actions ask in every level except
-            // 完全权限.
-            let always = matches!(
-                name,
-                "shell" | "task" | "python" | "node" | "http" | "move" | "delete" | "mcp"
+        let mut builtin_sections: Vec<AnyElement> = Vec::new();
+        for group in ToolGroup::ALL {
+            let mut cards: Vec<AnyElement> = Vec::new();
+            for tool in BUILTIN_TOOLS.iter().filter(|tool| tool.group == group) {
+                // The card shows what the engine says the tool does, once a run has
+                // reported its schemas; the catalogue line covers a page opened
+                // before that. The filter matches whichever text is on screen.
+                let description = shown_description(tool, &self.tool_descriptions);
+                if !keep(tool.name, &description) {
+                    continue;
+                }
+                cards.push(self.builtin_tool_card(tool, &description, slot, palette, cx));
+                slot += 1;
+            }
+            if cards.is_empty() {
+                continue;
+            }
+            builtin_sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .w_full()
+                    .min_w(px(0.))
+                    .child(tool_group_heading(group.label(), palette))
+                    .child(grid(cards))
+                    .into_any_element(),
             );
-            let asks = chat.tools && !chat.auto_actions && (always || (chat.read_only && writable));
-            let trusted = chat.tools && chat.auto_actions && always;
-            let (dot, note, note_colour) = if !chat.tools {
-                (palette.faint, "工具已关", palette.faint)
-            } else if trusted {
-                (palette.failed, "不再询问", palette.failed)
-            } else if asks {
-                (palette.warn, "需确认", palette.warn)
-            } else {
-                (palette.ok, "直接执行", palette.muted)
-            };
-            let status: AnyElement = div()
-                .flex_shrink_0()
-                .text_xs()
-                .text_color(rgb(note_colour))
-                .child(note)
-                .into_any_element();
-            builtin_cards.push(self.plugin_card(
-                name,
-                palette,
-                cx,
-                slot,
-                asks || trusted,
-                Some(dot),
-                name,
-                Some((status, 52.)),
-                description,
-                palette.muted,
-                dot,
-                None,
-            ));
-            slot += 1;
         }
-
-        let mut planned_cards: Vec<AnyElement> = Vec::new();
-        for (name, description) in planned {
-            planned_cards.push(self.plugin_card(
-                name,
-                palette,
-                cx,
-                slot,
-                false,
-                None,
-                name,
-                None,
-                description,
-                palette.muted,
-                palette.border,
-                None,
-            ));
-            slot += 1;
-        }
+        // While a filter is on, "no cards" has to say so instead of looking like
+        // the page failed to load.
+        let no_builtin_match = filtering && builtin_sections.is_empty();
 
         let enabled = self
             .installed_plugins
@@ -246,6 +155,11 @@ impl DshFlowApp {
         }
         let mut external_cards: Vec<AnyElement> = Vec::new();
         for (id, name, version, problem) in entries {
+            // The same filter covers external plugins by their folder name and
+            // display name, so one box searches everything on the page.
+            if !keep(&id, &name) {
+                continue;
+            }
             let on = self.ai.plugin_enabled(&id);
             // What this plugin added to the last request: two folders can look
             // alike and do very different things, so the card says which.
@@ -322,6 +236,7 @@ impl DshFlowApp {
             .h_full()
             .min_w(px(0.))
             .child(page_title("插件", Vec::new(), palette))
+            .child(div().px_6().pt_2().child(self.tool_filter_row(palette, cx)))
             .child(
                 div()
                     .id("plugins-body")
@@ -339,7 +254,16 @@ impl DshFlowApp {
                                 .px_6()
                                 .py_4()
                                 .child(plugin_heading("内置插件", palette))
-                                .child(grid(builtin_cards))
+                                .when(no_builtin_match, |this| {
+                                    this.child(
+                                        div()
+                                            .px_1()
+                                            .text_xs()
+                                            .text_color(rgb(palette.faint))
+                                            .child(format!("没有匹配「{needle}」的工具")),
+                                    )
+                                })
+                                .children(builtin_sections)
                                 .child(
                                     div()
                                         .flex()
@@ -412,22 +336,152 @@ impl DshFlowApp {
                                     )
                                 })
                                 .child(if external_cards.is_empty() {
+                                    let note = if filtering {
+                                        format!("没有匹配「{needle}」的外部插件。")
+                                    } else {
+                                        "还没有外部插件。点「外部插件」旁边的 + 选择一个插件文件夹（里面有 plugin.json），\
+                                         会复制到插件目录并启用；也可以自己建一个文件夹再点刷新图标。"
+                                            .to_string()
+                                    };
                                     div()
                                         .text_xs()
                                         .text_color(rgb(palette.faint))
                                         .whitespace_normal()
-                                        .child(
-                                            "还没有外部插件。点「外部插件」旁边的 + 选择一个插件文件夹（里面有 plugin.json），\
-                                             会复制到插件目录并启用；也可以自己建一个文件夹再点刷新图标。",
-                                        )
+                                        .child(note)
                                         .into_any_element()
                                 } else {
                                     grid(external_cards).into_any_element()
-                                })
-                                .child(plugin_heading("计划中", palette))
-                                .child(grid(planned_cards)),
+                                }),
                     ),
             )
+    }
+
+    /// The filter above the tool cards: a tool name, or a word from a description.
+    ///
+    /// It reuses the same text field machinery as the sidebar's conversation
+    /// search, so Escape empties it and the caret behaves the same way.
+    fn tool_filter_row(&self, palette: Palette, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("tool-filter-row")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(34.))
+            .px_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(palette.border))
+            .cursor_text()
+            .on_click(cx.listener(|view, _, window, cx| {
+                view.focused = Some(Field::ToolFilter);
+                if let Some(field) = view.field(Field::ToolFilter) {
+                    window.focus(&field.focus_handle().clone(), cx);
+                }
+                view.start_caret_blink(cx);
+                cx.notify();
+            }))
+            .child(
+                svg()
+                    .path("icons/search.svg")
+                    .w(px(14.))
+                    .h(px(14.))
+                    .text_color(rgb(palette.muted)),
+            )
+            .child(div().flex_1().min_w(px(0.)).child(self.render_field(
+                Field::ToolFilter,
+                "过滤工具（名字或描述）",
+                palette,
+                cx,
+            )))
+            .when(!self.tool_filter.text.is_empty(), |this| {
+                this.child(
+                    div()
+                        .id("tool-filter-clear")
+                        .flex_shrink_0()
+                        .px_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(palette.faint))
+                        .cursor_pointer()
+                        .hover(move |style| style.bg(rgb(palette.panel_soft)))
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.tool_filter.clear();
+                            cx.notify();
+                        }))
+                        .child("✕"),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One built-in tool card, with the note its permission level produces.
+    ///
+    /// The note is about the conversation, not the tool: the same card says
+    /// 「需确认」 in one level and 「直接执行」 in another, and the automatic
+    /// review rule can turn a must-ask tool into one granted by rule.
+    fn builtin_tool_card(
+        &self,
+        tool: &ToolCard,
+        description: &str,
+        slot: usize,
+        palette: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat = self.chat();
+        let name = tool.name;
+        let writable = tool.writes;
+        // Commands and destructive file actions ask in every level except
+        // 完全权限.
+        let always = tool.always;
+        // `replace` rewrites several files at once, so the automatic review never
+        // grants it by rule; `wait_for` only polls, so it does.
+        let rule_grants = chat.auto_review
+            && !chat.read_only
+            && matches!(
+                name,
+                "write" | "edit" | "copy" | "mkdir" | "shell" | "wait_for"
+            );
+        let rule_asks = chat.auto_review && !chat.read_only && name == "replace";
+        let asks = chat.tools
+            && !chat.auto_actions
+            && !rule_grants
+            && (always || (chat.read_only && writable) || rule_asks);
+        let trusted = chat.tools && chat.auto_actions && always;
+        // With automatic review on, a rule-granted tool is approved by rule rather
+        // than by the person; saying "需确认" for it would be wrong the other way.
+        let by_rule = chat.tools && !chat.auto_actions && !trusted && rule_grants;
+        let (dot, note, note_colour) = if !chat.tools {
+            (palette.faint, "工具已关", palette.faint)
+        } else if trusted {
+            (palette.failed, "不再询问", palette.failed)
+        } else if asks {
+            (palette.warn, "需确认", palette.warn)
+        } else if by_rule {
+            (palette.warn, "按规则", palette.muted)
+        } else {
+            (palette.ok, "直接执行", palette.muted)
+        };
+        let status: AnyElement = div()
+            .flex_shrink_0()
+            .text_xs()
+            .text_color(rgb(note_colour))
+            .child(note)
+            .into_any_element();
+        self.plugin_card(
+            name,
+            palette,
+            cx,
+            slot,
+            asks || trusted,
+            Some(dot),
+            name,
+            Some((status, 52.)),
+            description,
+            palette.muted,
+            dot,
+            None,
+        )
     }
 
     /// One card: a header row built here, then the grey description.
@@ -636,6 +690,18 @@ pub(crate) fn switch(
         .into_any_element()
 }
 
+/// A section heading inside the built-in tools grid.
+fn tool_group_heading(title: &'static str, palette: Palette) -> AnyElement {
+    div()
+        .px_1()
+        .pt_2()
+        .text_xs()
+        .font_weight(gpui::FontWeight::BOLD)
+        .text_color(rgb(palette.muted))
+        .child(title)
+        .into_any_element()
+}
+
 /// A group heading inside the card grid.
 pub(crate) fn plugin_heading(title: &'static str, palette: Palette) -> AnyElement {
     div()
@@ -776,7 +842,22 @@ impl DshFlowApp {
 
 #[cfg(test)]
 mod tests {
-    use super::{CARD_PADDING, CARD_WIDTH, LINE_UNITS, name_width, overflows, text_units};
+    use super::{
+        CARD_PADDING, CARD_WIDTH, LINE_UNITS, name_width, overflows, text_units, tool_matches,
+    };
+
+    #[test]
+    fn the_tool_filter_matches_names_and_descriptions() {
+        // Empty needle keeps everything; the page shows all cards by default.
+        assert!(tool_matches("", "read", "读取文件"));
+        assert!(tool_matches("read", "read", "读取文件"));
+        // Descriptions are searched too, and the needle is already lowercase.
+        assert!(tool_matches("沙箱", "shell", "路径受沙箱约束"));
+        assert!(tool_matches("shell", "SHELL", "任意"));
+        assert!(!tool_matches("沙箱", "read", "读取文件"));
+        // A name that merely contains the needle still matches.
+        assert!(tool_matches("read", "read_image", "x"));
+    }
 
     #[test]
     fn only_long_descriptions_get_an_arrow() {
